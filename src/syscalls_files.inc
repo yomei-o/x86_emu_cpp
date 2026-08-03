@@ -68,10 +68,72 @@ inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             uint64_t path_ptr = at ? a[1] : a[0];
             uint32_t flags = static_cast<uint32_t>(at ? a[2] : a[1]);
             std::string path = e.mem.read_cstring(path_ptr);
-            int fd = e.files.open(path, open_flags_from_linux(flags));
+            // O_DIRECTORY (0200000): the caller wants a directory descriptor to
+            // enumerate with getdents64, which fopen cannot give. opendir(".") is
+            // how a Unix runtime lists a directory, so route it accordingly.
+            int fd = (flags & 0200000)
+                         ? e.files.open_directory(path)
+                         : e.files.open(path, open_flags_from_linux(flags));
             if (e.options().trace_calls)
                 std::fprintf(stderr, "[sys] open(%s, 0%o) = %d\n", path.c_str(), flags, fd);
             return fd;
+        }
+        case Sys::Fcntl: {
+            // fcntl(fd, cmd, arg). A runtime uses this at startup to set FD_CLOEXEC
+            // and to duplicate descriptors; the emulator does not track close-on-exec
+            // (there is no exec), so the flag commands succeed as no-ops.
+            int fd = static_cast<int>(a[0]);
+            int cmd = static_cast<int>(a[1]);
+            if (!e.files.valid(fd) && fd > 2) return -9;  // EBADF
+            switch (cmd) {
+                case 0:      // F_DUPFD
+                case 1030:   // F_DUPFD_CLOEXEC
+                    return e.files.dup(fd, -1);
+                case 1: return 0;   // F_GETFD (no FD_CLOEXEC tracked)
+                case 2: return 0;   // F_SETFD (accept)
+                case 3: return 2;   // F_GETFL -> O_RDWR, no O_NONBLOCK
+                case 4: return 0;   // F_SETFL (accept)
+                default: return 0;  // permissive: startup only sets flags
+            }
+        }
+        case Sys::Getdents64: {
+            // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type;
+            // char d_name[]; } - records padded to 8 bytes, return value the number
+            // of bytes written (0 = end). The cursor lives on the descriptor.
+            int fd = static_cast<int>(a[0]);
+            uint64_t buf = a[1];
+            size_t cap = static_cast<size_t>(a[2]);
+            FileTable::Entry* ent = e.files.get(fd);
+            if (!ent || !ent->is_directory) return -20;  // ENOTDIR
+            if (!ent->dir_loaded) {
+                ent->dir_loaded = true;
+                ent->dir_names = {".", ".."};
+                ent->dir_types = {4, 4};  // DT_DIR
+                for (const auto& de : e.list_directory(ent->path + "/*")) {
+                    ent->dir_names.push_back(de.name);
+                    ent->dir_types.push_back(de.is_dir ? 4 : 8);  // DT_DIR / DT_REG
+                }
+            }
+            size_t written = 0;
+            while (ent->dir_pos < ent->dir_names.size()) {
+                const std::string& name = ent->dir_names[ent->dir_pos];
+                size_t reclen = (19 + name.size() + 1 + 7) & ~static_cast<size_t>(7);
+                if (written + reclen > cap) break;      // caller will read again
+                uint64_t rec = buf + written;
+                e.mem.write64(rec + 0, ent->dir_pos + 1);                      // d_ino (nonzero)
+                e.mem.write64(rec + 8, static_cast<uint64_t>(ent->dir_pos + 1));  // d_off (opaque)
+                e.mem.write16(rec + 16, static_cast<uint16_t>(reclen));        // d_reclen
+                e.mem.write8(rec + 18, ent->dir_types[ent->dir_pos]);          // d_type
+                for (size_t i = 0; i < name.size(); ++i)
+                    e.mem.write8(rec + 19 + i, static_cast<uint8_t>(name[i]));
+                for (size_t i = 19 + name.size(); i < reclen; ++i)
+                    e.mem.write8(rec + i, 0);           // NUL + alignment padding
+                written += reclen;
+                ++ent->dir_pos;
+            }
+            if (written == 0 && ent->dir_pos < ent->dir_names.size())
+                return -22;  // EINVAL: a single entry did not fit the buffer
+            return static_cast<int64_t>(written);
         }
         case Sys::Lseek:
             return e.files.seek(static_cast<int>(a[0]), static_cast<int64_t>(a[1]),
@@ -109,9 +171,15 @@ inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             return FileTable::stat_path(e.mem.read_cstring(a[1]), st);
         }
         case Sys::Getcwd: {
-            // There is one working directory and it is the host's.
-            const char* cwd = ".";
-            std::string s = cwd;
+            // A Unix runtime needs an absolute cwd (CPython's getpath calls abspath,
+            // which fails on a relative "."). Use the host's real directory where it
+            // is already Unix-shaped (emscripten MEMFS, Linux); a Windows host's
+            // drive-letter path is meaningless to a Linux guest, so answer "/".
+            std::string s = "/";
+#if !defined(_WIN32)
+            char buf[4096];
+            if (::getcwd(buf, sizeof buf)) s = buf;
+#endif
             if (a[1] < s.size() + 1) return -34;  // ERANGE
             e.mem.write_cstring(a[0], s);
             return static_cast<int64_t>(s.size() + 1);

@@ -23,3 +23,4 @@ pybundle/
 # overriding the *.exe / build rules above.
 !web/py/
 !web/py/**
+pylinux/

@@ -8,6 +8,9 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <unistd.h>  // getcwd, for the Linux/emscripten host
+#endif
 
 #include "emulator.h"
 
@@ -20,7 +23,7 @@ enum class Sys {
     Unknown,
     Read, Write, Writev, Readv, Close, Fstat, Ioctl,
     Open, Lseek, Stat, Lstat, Newfstatat, Unlink, Unlinkat, Rename,
-    Access, Faccessat, Getcwd, Dup, Dup2, Dup3, Pread, Pwrite, Ftruncate,
+    Access, Faccessat, Getcwd, Getdents64, Fcntl, Dup, Dup2, Dup3, Pread, Pwrite, Ftruncate,
     Mmap, Munmap, Brk,
     Exit, ExitGroup,
     Getpid, Gettid, Uname, ClockGettime, Time,
@@ -72,6 +75,8 @@ Sys map_x86_64(uint64_t nr) {
         case 218: return Sys::SetTidAddress;
         case 228: return Sys::ClockGettime;
         case 231: return Sys::ExitGroup;
+        case 72: return Sys::Fcntl;
+        case 217: return Sys::Getdents64;
         case 257: return Sys::Openat;
         case 262: return Sys::Newfstatat;
         case 263: return Sys::Unlinkat;
@@ -289,8 +294,20 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             return 4242;
         case Sys::GetIds:
             return 0;  // running as root, which nothing here checks
-        case Sys::Readlink:
-            return -22;  // EINVAL: not a symlink
+        case Sys::Readlink: {
+            // A Unix runtime finds its own executable through /proc/self/exe -
+            // CPython's getpath depends on it. There is no real procfs, so answer
+            // it (and /proc/self/cwd) from what the emulator already knows.
+            std::string path = e.mem.read_cstring(a[0]);
+            std::string target;
+            if (path == "/proc/self/exe")
+                target = e.args().empty() ? std::string() : e.args()[0];
+            if (target.empty()) return -22;  // EINVAL: nothing we resolve
+            uint64_t buf = a[1];
+            size_t n = std::min<size_t>(target.size(), static_cast<size_t>(a[2]));
+            for (size_t i = 0; i < n; ++i) e.mem.write8(buf + i, static_cast<uint8_t>(target[i]));
+            return static_cast<int64_t>(n);  // readlink does not NUL-terminate
+        }
         // Signal handling, futexes and memory advice: a static libc sets these up
         // at startup, and since nothing is ever delivered and there is only one
         // thread, reporting success is accurate.
