@@ -95,6 +95,9 @@ RemoveDirectoryA@4 == RemoveDirectoryA
 FindFirstFileA@8 == FindFirstFileA
 FindNextFileA@8 == FindNextFileA
 FindClose@4 == FindClose
+FindFirstFileW@8 == FindFirstFileW
+FindNextFileW@8 == FindNextFileW
+SetLastError@4 == SetLastError
 EOF
 cat > $out/kernel32_64.def <<'EOF'
 LIBRARY kernel32.dll
@@ -128,6 +131,9 @@ RemoveDirectoryA
 FindFirstFileA
 FindNextFileA
 FindClose
+FindFirstFileW
+FindNextFileW
+SetLastError
 EOF
 
 echo "== generating import libraries"

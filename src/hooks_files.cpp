@@ -307,14 +307,17 @@ void Emulator::install_file_hooks() {
         uint32_t access = static_cast<uint32_t>(e.arg_slot(1));
         uint32_t disposition = static_cast<uint32_t>(e.arg_slot(4));
 
-        uint32_t flags_and_attributes = static_cast<uint32_t>(e.arg_slot(5));
-
         // Windows lets a program open a *directory* to ask about its attributes,
         // which is how os.stat works there.  No C library can do that, so such a
         // handle names the path without holding a stream.
+        //
+        // What decides this is whether the path *is* a directory, not whether the
+        // caller passed FILE_FLAG_BACKUP_SEMANTICS: a stat implementation passes
+        // that flag for every path it looks at, files included, precisely so the
+        // one code path covers both.
         FileTable::Stat probe;
         bool is_directory = FileTable::stat_path(path, probe) == 0 && probe.is_dir;
-        if (is_directory || (flags_and_attributes & 0x02000000u) != 0) {
+        if (is_directory) {
             int dir_fd = e.files.open_directory(path);
             if (dir_fd < 0) {
                 e.report_file_error(dir_fd);

@@ -22,6 +22,13 @@ DWORD __stdcall GetFileAttributesA(const char *name);
 BOOL __stdcall CreateDirectoryA(const char *name, void *sa);
 BOOL __stdcall RemoveDirectoryA(const char *name);
 HANDLE __stdcall FindFirstFileA(const char *pattern, void *data);
+/* Windows' wchar_t is 16 bits; spelling it out avoids needing <stddef.h> in a
+   freestanding test. */
+typedef unsigned short WCHAR;
+HANDLE __stdcall FindFirstFileW(const WCHAR *pattern, void *data);
+BOOL __stdcall FindNextFileW(HANDLE h, void *data);
+DWORD __stdcall GetLastError(void);
+DWORD __stdcall SetLastError(DWORD code);
 BOOL __stdcall FindNextFileA(HANDLE h, void *data);
 BOOL __stdcall FindClose(HANDLE h);
 
@@ -45,6 +52,57 @@ struct find_data {
 
 #define DIR "x86emu_dir_test"
 #define MAX_NAMES 16
+
+/* The wide form of the same structure: the fixed part is identical, but both
+   name arrays are twice as wide. */
+struct find_dataw {
+    DWORD attributes;
+    unsigned char times[24];
+    DWORD size_high;
+    DWORD size_low;
+    DWORD reserved0;
+    DWORD reserved1;
+    WCHAR name[260];
+    WCHAR alternate[14];
+};
+
+/* Exactly the sequence a libc's listdir uses on Windows, including the
+   GetLastError contract that says the loop ended because there was nothing left
+   rather than because something failed. */
+static void enumerate_wide(void) {
+    struct find_dataw data;
+    int count = 0;
+    int saw_beta = 0;
+    HANDLE h;
+
+    /* The pattern, spelled out so no wide string literal or locale conversion is
+       involved: "x86emu_dir_test\*.*". */
+    static const WCHAR pattern[] = {'x', '8', '6', 'e', 'm', 'u', '_', 'd', 'i',
+                                    'r', '_', 't', 'e', 's', 't', '\\', '*', '.',
+                                    '*', 0};
+
+    SetLastError(0);
+    h = FindFirstFileW(pattern, &data);
+    if (h == INVALID_HANDLE) {
+        printf("wide: FindFirstFileW failed\n");
+        return;
+    }
+    do {
+        if (data.name[0] == '.' && (data.name[1] == 0 ||
+                                    (data.name[1] == '.' && data.name[2] == 0)))
+            continue;
+        count++;
+        /* Compare against a wide literal, the way real code would. */
+        if (data.name[0] == 'b' && data.name[1] == 'e' && data.name[2] == 't' &&
+            data.name[3] == 'a' && data.name[4] == '.' && data.name[5] == 't' &&
+            data.name[6] == 'x' && data.name[7] == 't' && data.name[8] == 0)
+            saw_beta = 1;
+    } while (FindNextFileW(h, &data));
+    DWORD err = GetLastError();
+    FindClose(h);
+    printf("wide: %d entries, beta seen %d, last error %lu\n", count, saw_beta,
+           (unsigned long)err);
+}
 
 static char g_names[MAX_NAMES][64];
 static int g_count;
@@ -112,6 +170,8 @@ static int run(void) {
 
     collect(DIR "/nothing_matches_*");
     printf("no matches: %d\n", g_count);
+
+    enumerate_wide();
 
     /* Sizes come back in the find data too. */
     struct find_data data;

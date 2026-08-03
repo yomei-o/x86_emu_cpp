@@ -514,7 +514,50 @@ void Emulator::install_win32_hooks() {
         int n = write_utf16(e, e.arg_slot(4), s, static_cast<int>(e.arg_slot(5)));
         e.set_result(static_cast<uint64_t>(n));
     });
-    win32("LCMapStringEx", 9, [](Emulator& e) { e.set_result(0); });
+    // (locale, flags, src, src_len, dest, dest_len, version, reserved, sort handle)
+    // Only the case-mapping flags matter here; a path normaliser uses nothing
+    // else, and returning failure makes it raise instead.
+    win32("LCMapStringEx", 9, [](Emulator& e) {
+        uint32_t flags = static_cast<uint32_t>(e.arg_slot(1));
+        int src_len = static_cast<int>(static_cast<int32_t>(e.arg_slot(3)));
+        std::string text = utf16_to_utf8(e, e.arg_slot(2), src_len);
+        uint64_t dest = e.arg_slot(4);
+        int dest_len = static_cast<int>(static_cast<int32_t>(e.arg_slot(5)));
+
+        constexpr uint32_t kLowercase = 0x00000100;
+        constexpr uint32_t kUppercase = 0x00000200;
+        std::u16string mapped = utf8_to_utf16(text);
+        // A negative source length means "NUL-terminated", and in that case the
+        // result - and the returned count - include the terminator.  Callers rely
+        // on this: CPython asks for the size, allocates it, and then takes the
+        // string as size-1 characters.
+        if (src_len < 0) mapped.push_back(0);
+        for (char16_t& c : mapped) {
+            // ASCII and Latin-1 are as far as this goes; a full case table would
+            // need the host's locale data, which is not what a path comparison
+            // depends on.
+            if (flags & kLowercase) {
+                if ((c >= 'A' && c <= 'Z') || (c >= 0xC0 && c <= 0xDE && c != 0xD7))
+                    c = static_cast<char16_t>(c + 0x20);
+            } else if (flags & kUppercase) {
+                if ((c >= 'a' && c <= 'z') || (c >= 0xE0 && c <= 0xFE && c != 0xF7))
+                    c = static_cast<char16_t>(c - 0x20);
+            }
+        }
+        // A zero destination length asks for the size rather than the result.
+        if (dest_len == 0 || dest == 0) {
+            e.set_result(mapped.size());
+            return;
+        }
+        if (static_cast<int>(mapped.size()) > dest_len) {
+            e.set_last_error(122);  // ERROR_INSUFFICIENT_BUFFER
+            e.set_result(0);
+            return;
+        }
+        for (size_t i = 0; i < mapped.size(); ++i) e.mem.write16(dest + i * 2, mapped[i]);
+        // The count excludes a terminator unless one was in the input.
+        e.set_result(mapped.size());
+    });
     win32("CompareStringW", 6, [](Emulator& e) {
         std::string a = utf16_to_utf8(e, e.arg_slot(2), static_cast<int>(static_cast<int32_t>(e.arg_slot(3))));
         std::string b = utf16_to_utf8(e, e.arg_slot(4), static_cast<int>(static_cast<int32_t>(e.arg_slot(5))));
@@ -711,6 +754,9 @@ void Emulator::install_ucrt_hooks() {
         std::vector<uint8_t> slot(ps, 0);
         uint64_t out = e.alloc_guest_data(slot.data(), slot.size());
         e.mem.write_sized(out, ps, argv);
+        for (size_t i = 0; i < e.args().size(); ++i)
+            e.log_call("__p___wargv[%zu] = '%s' at 0x%llX", i, e.args()[i].c_str(),
+                       (unsigned long long)ptrs[i]);
         e.set_result(out);
     });
     // `environ` and `_wenviron` are variables, so what a guest imports is the

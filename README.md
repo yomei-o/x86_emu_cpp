@@ -290,37 +290,43 @@ misbehaving quietly.
 
 ### Working towards CPython
 
-A stock CPython 3.13 for x64 now gets a long way: `python313.dll` is loaded and
-relocated, static TLS is set up, the interpreter initialises, and it completes its
-whole path configuration from the real installation —
+A stock CPython 3.13 for x64 now runs its own standard library. `python313.dll`
+is loaded and relocated, static TLS is set up, path configuration resolves from
+the real installation, the import machinery finds and loads modules from
+`Lib`, and execution reaches Python code in `site.py`, `os.py`, `collections`
+and `functools`:
 
 ```console
 $ ./x86emu C:/Python313/python.exe -c "print(1)"
-  stdlib dir = 'C:\Python313\Lib'
-  sys.prefix = 'C:\Python313'
-  sys.path = ['C:\Python313\python313.zip', 'C:\Python313\DLLs',
-              'C:\Python313\Lib', 'C:\Python313']
+  File "C:\Python313\Libunctools.py", line 455, in <module>
+    _CacheInfo = namedtuple("CacheInfo", [...])
 ```
 
-— reaching its first real import before stopping at
-`init_fs_encoding: failed to get the Python codec of the filesystem encoding`.
-Directory enumeration and `os.stat` both work at that point (the emulator hands
-back all 189 entries of `Lib`, `traceback.py` among them), so what remains is
-somewhere in the import machinery's own lookup rather than in a missing
-operation.
+What is left is a string-length bug rather than a missing capability: a source
+string CPython builds at runtime and hands to `eval` arrives with a trailing NUL,
+which the compiler rejects. It shows up both in `namedtuple` and in the `-c`
+command itself, so the common factor is a wide-to-narrow conversion returning a
+length that includes a terminator where the caller does not expect one.
 
-Two findings from getting this far were bugs worth naming, because both were
-silent:
+Four bugs found on the way there, all of them silent, and each one a reminder
+that an emulator's failures are rarely where they appear:
 
 - **Hooks were not setting the guest's `errno`.** A libc distinguishes "not
   found" from "permission denied" by errno and nothing else, and CPython's path
   search catches `FileNotFoundError` specifically — so a failed open that left
   errno at zero raised a plain `OSError`, escaped the handler, and killed path
-  resolution 8 million instructions in.
+  resolution eight million instructions in.
 - **`FindFirstFileA` wrote the wide form of `WIN32_FIND_DATA`**, 274 bytes past
   the end of a narrow caller's stack buffer, over the return address. It
-  presented as an inexplicable jump to address zero, and the fault backtrace is
-  what caught it.
+  presented as an inexplicable jump to address zero.
+- **`FILE_FLAG_BACKUP_SEMANTICS` was read as "this is a directory".** It is not:
+  a stat implementation passes that flag for every path it looks at, files
+  included, precisely so that one code path covers both. Every `os.stat` on a
+  file was therefore failing.
+- **`call_guest` aligned the stack after writing the arguments**, which moved the
+  stack pointer away from them. 64-bit calls survived because their first four
+  arguments are in registers; a 32-bit stdcall `DllMain` read its arguments from
+  the wrong offsets and silently did nothing.
 
 `--imports` lists what any given guest still needs.
 
