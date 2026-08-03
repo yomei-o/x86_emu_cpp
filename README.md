@@ -298,7 +298,7 @@ and `functools`:
 
 ```console
 $ ./x86emu C:/Python313/python.exe -c "print(1)"
-  File "C:\Python313\Libunctools.py", line 455, in <module>
+  File "C:/Python313/Lib/functools.py", line 455, in <module>
     _CacheInfo = namedtuple("CacheInfo", [...])
 ```
 
