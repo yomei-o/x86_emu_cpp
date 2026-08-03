@@ -33,6 +33,16 @@ struct LoadedImage {
     uint64_t phnum = 0;
     // Highest mapped address, i.e. where the heap can start.
     uint64_t brk = 0;
+
+    // Dynamic linking (ELF): a PIE/dynamic image is loaded at a bias, names its
+    // dynamic loader in PT_INTERP, and hands control to that loader first. The
+    // loader is mapped separately and control enters at interp_entry with AT_BASE
+    // pointing at interp_base; the real program entry travels in AT_ENTRY.
+    bool is_dynamic = false;
+    uint64_t load_bias = 0;
+    std::string interp;
+    uint64_t interp_base = 0;
+    uint64_t interp_entry = 0;
 };
 
 // Called for every import the loader finds.  Returns the guest address that
@@ -48,6 +58,8 @@ void peek_image(const std::vector<uint8_t>& file, Mode& mode, Os& os, std::strin
 
 // PE images go through map_pe() in pe.h, because the emulator binds their imports
 // itself: whether a DLL should be hooked or actually loaded is its decision.
-LoadedImage load_elf(const std::vector<uint8_t>& file, Memory& mem);
+// load_base is the bias for a position-independent (ET_DYN) image; ignored for
+// ET_EXEC. Defaults to a conventional PIE base.
+LoadedImage load_elf(const std::vector<uint8_t>& file, Memory& mem, uint64_t load_base = 0x555555554000ull);
 
 }  // namespace x86emu

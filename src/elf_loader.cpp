@@ -22,10 +22,11 @@ T rd(const std::vector<uint8_t>& f, size_t off) {
 constexpr uint16_t kEmI386 = 3;
 constexpr uint16_t kEmX8664 = 62;
 constexpr uint32_t kPtLoad = 1;
+constexpr uint32_t kPtInterp = 3;
 
 }  // namespace
 
-LoadedImage load_elf(const std::vector<uint8_t>& f, Memory& mem) {
+LoadedImage load_elf(const std::vector<uint8_t>& f, Memory& mem, uint64_t load_base) {
     if (f.size() < 64 || f[0] != 0x7F || f[1] != 'E' || f[2] != 'L' || f[3] != 'F')
         throw LoadError("not an ELF image");
 
@@ -52,9 +53,12 @@ LoadedImage load_elf(const std::vector<uint8_t>& f, Memory& mem) {
         std::snprintf(buf, sizeof buf, "unsupported ELF (class=%u machine=%u)", cls, machine);
         throw LoadError(buf);
     }
-    if (type != 2)  // ET_EXEC
-        throw LoadError("only statically linked ET_EXEC images are supported "
-                        "(ET_DYN/PIE would need a dynamic loader)");
+    // ET_EXEC (2) loads at its own absolute vaddrs; ET_DYN (3, PIE / shared
+    // object) is position-independent and loads at a bias the caller chooses.
+    if (type != 2 && type != 3) throw LoadError("unsupported ELF type (not ET_EXEC or ET_DYN)");
+    const uint64_t bias = (type == 3) ? load_base : 0;
+    img.is_dynamic = (type == 3);
+    img.load_bias = bias;
 
     uint64_t phoff, entry;
     uint16_t phentsize, phnum;
@@ -69,7 +73,7 @@ LoadedImage load_elf(const std::vector<uint8_t>& f, Memory& mem) {
         phentsize = rd<uint16_t>(f, 42);
         phnum = rd<uint16_t>(f, 44);
     }
-    img.entry = entry;
+    img.entry = entry + bias;
     img.phent_size = phentsize;
     img.phnum = phnum;
 
@@ -77,17 +81,27 @@ LoadedImage load_elf(const std::vector<uint8_t>& f, Memory& mem) {
     for (uint16_t i = 0; i < phnum; ++i) {
         size_t p = static_cast<size_t>(phoff) + i * phentsize;
         uint32_t p_type = rd<uint32_t>(f, p);
+
+        if (p_type == kPtInterp) {  // path of the dynamic loader (ld.so)
+            uint64_t off = is64 ? rd<uint64_t>(f, p + 8) : rd<uint32_t>(f, p + 4);
+            uint64_t sz = is64 ? rd<uint64_t>(f, p + 32) : rd<uint32_t>(f, p + 16);
+            if (off + sz <= f.size()) {
+                const char* s = reinterpret_cast<const char*>(f.data() + off);
+                img.interp.assign(s, strnlen(s, static_cast<size_t>(sz)));
+            }
+            continue;
+        }
         if (p_type != kPtLoad) continue;
 
         uint64_t offset, vaddr, filesz, memsz;
         if (is64) {
             offset = rd<uint64_t>(f, p + 8);
-            vaddr = rd<uint64_t>(f, p + 16);
+            vaddr = rd<uint64_t>(f, p + 16) + bias;
             filesz = rd<uint64_t>(f, p + 32);
             memsz = rd<uint64_t>(f, p + 40);
         } else {
             offset = rd<uint32_t>(f, p + 4);
-            vaddr = rd<uint32_t>(f, p + 8);
+            vaddr = rd<uint32_t>(f, p + 8) + bias;
             filesz = rd<uint32_t>(f, p + 16);
             memsz = rd<uint32_t>(f, p + 20);
         }

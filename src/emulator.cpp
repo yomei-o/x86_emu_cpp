@@ -920,17 +920,21 @@ void Emulator::setup_linux_stack(const std::vector<std::string>& args) {
     struct Aux {
         uint64_t key, val;
     };
-    const std::vector<Aux> auxv = {
+    std::vector<Aux> auxv = {
         {6, 0x1000},                        // AT_PAGESZ
         {3, image_.phdr_addr},              // AT_PHDR
         {4, image_.phent_size},             // AT_PHENT
         {5, image_.phnum},                  // AT_PHNUM
-        {9, image_.entry},                  // AT_ENTRY
+        {9, image_.entry},                  // AT_ENTRY  (the real program, even under ld.so)
         {11, 0}, {12, 0}, {13, 0}, {14, 0}, // AT_UID/EUID/GID/EGID
         {25, at_random},                    // AT_RANDOM
         {23, 0},                            // AT_SECURE
-        {0, 0},                             // AT_NULL
     };
+    // AT_BASE tells the dynamic loader where it was itself mapped, so it can
+    // relocate its own code before doing anything else.
+    if (image_.is_dynamic && image_.interp_entry)
+        auxv.push_back({7, image_.interp_base});   // AT_BASE
+    auxv.push_back({0, 0});                         // AT_NULL
 
     // Total slots: argc + argv + NULL + envp NULL + auxv pairs.
     uint64_t slots = 1 + argv_ptrs.size() + 1 + 1 + auxv.size() * 2;
@@ -1029,6 +1033,16 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         exe_tls_callbacks_ = self_raw->image.tls_callbacks;
     } else {
         image_ = load_elf(file, mem);
+        // A dynamic (PIE) executable names an interpreter (ld.so) in PT_INTERP.
+        // Map it at its own base and enter there first; it relocates the program
+        // and the shared libraries and then jumps to the real entry (AT_ENTRY).
+        if (image_.is_dynamic && !image_.interp.empty()) {
+            const uint64_t interp_base = 0x00007F0000000000ull;
+            std::vector<uint8_t> ld = read_file(FileTable::host_path(image_.interp));
+            LoadedImage li = load_elf(ld, mem, interp_base);
+            image_.interp_base = li.load_bias;
+            image_.interp_entry = li.entry;
+        }
         // The Linux heap sits right after the image, which is only known now.
         choose_layout();
     }
@@ -1051,7 +1065,10 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     else
         setup_linux_stack(args);
 
-    cpu_->rip = image_.entry;
+    // A dynamic executable enters its loader (ld.so) first; the loader jumps to
+    // image_.entry itself once relocation is done. A static one enters directly.
+    cpu_->rip = (image_.is_dynamic && image_.interp_entry) ? image_.interp_entry
+                                                           : image_.entry;
 
     // The program itself is thread 0.  Registering it means the scheduler has a
     // single code path whether or not the guest ever creates another thread.
