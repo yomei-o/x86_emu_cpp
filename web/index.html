@@ -68,18 +68,20 @@
   <div class="panel">
     <h2>CPython</h2>
     <div class="row">
-      <button id="pybundled" class="primary">Windows CPython 3.13 (~10 MB)</button>
-      <button id="pylinux" class="primary">Linux CPython 3.13 (~23 MB)</button>
+      <button id="pybundled" class="primary">Windows CPython (~10 MB)</button>
+      <button id="pylinux" class="primary">Linux — static (~23 MB)</button>
+      <button id="pylinuxdyn" class="primary">Linux — dynamic (~11 MB)</button>
       <button id="pyload">Load your own (Windows)…</button>
       <input id="pyfolder" type="file" webkitdirectory hidden>
       <span id="pystate" style="font-size:.8125rem;color:var(--dim)">not loaded</span>
     </div>
     <p class="pyhint">
-      Two stock CPython 3.13 interpreters are bundled with this page — a
-      <b>Windows</b> one (a PE that reaches the emulator's hooked Win32/CRT) and a
-      <b>Linux</b> one (a static ELF that talks straight to the emulator's syscall layer).
-      Pick either and it downloads into the in-browser filesystem and runs locally; nothing
-      is uploaded. <em>Load your own</em> takes a Windows
+      Three stock CPython 3.13 interpreters are bundled — <b>Windows</b> (a PE that
+      reaches the emulator's hooked Win32/CRT), <b>Linux static</b> (a static ELF
+      straight to the syscall layer), and <b>Linux dynamic</b> (a PIE loaded through
+      its real <code>ld-musl</code> dynamic loader). Pick one and it downloads into
+      the in-browser filesystem and runs locally; nothing is uploaded. <em>Load your
+      own</em> takes a Windows
       <a href="https://www.python.org/downloads/windows/">embeddable CPython</a> folder.
     </p>
     <textarea id="code" spellcheck="false">import sys, hashlib
@@ -251,8 +253,24 @@ print(sum(range(1000)))</textarea>
       $('pystate').textContent = 'unpacking stdlib…';
       const lib = untar(await gunzip(await fetchBytes('pylinux/stdlib.tar.gz')));
       worker.postMessage({ type: 'writeFiles', dir: '/pyl/lib/python3.13', files: lib });
-      selectInterpreter('/pyl/bin/python3.13', [], 'CPython (Linux)', `Linux Python ready (${lib.length} stdlib files)`);
+      selectInterpreter('/pyl/bin/python3.13', [], 'CPython (Linux, static)', `Linux static Python ready (${lib.length} stdlib files)`);
     } catch (err) { $('pystate').textContent = 'failed: ' + err.message; $('pylinux').disabled = false; }
+  });
+
+  // ---- bundled Linux CPython, DYNAMIC (PIE + real ld-musl, gzip'd) -----------
+  $('pylinuxdyn').addEventListener('click', async () => {
+    $('pylinuxdyn').disabled = true;
+    try {
+      // The dynamic loader the PIE names in PT_INTERP; must sit at its absolute path.
+      const ld = await gunzip(await fetchBytes('pylinux-dyn/ld-musl-x86_64.so.1.gz', fetchProgress('ld-musl')));
+      worker.postMessage({ type: 'writeFiles', dir: '/lib', files: [{ name: 'ld-musl-x86_64.so.1', bytes: ld }] });
+      const exe = await gunzip(await fetchBytes('pylinux-dyn/python3.13.gz', fetchProgress('Linux python (dynamic)')));
+      worker.postMessage({ type: 'writeFiles', dir: '/pyd/bin', files: [{ name: 'python3.13', bytes: exe }] });
+      $('pystate').textContent = 'unpacking stdlib…';
+      const lib = untar(await gunzip(await fetchBytes('pylinux-dyn/stdlib.tar.gz')));
+      worker.postMessage({ type: 'writeFiles', dir: '/pyd/lib/python3.13', files: lib });
+      selectInterpreter('/pyd/bin/python3.13', [], 'CPython (Linux, dynamic)', `Linux dynamic Python ready (${lib.length} stdlib files)`);
+    } catch (err) { $('pystate').textContent = 'failed: ' + err.message; $('pylinuxdyn').disabled = false; }
   });
 
   // ---- load your own Windows install (folder) -------------------------------

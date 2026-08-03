@@ -189,13 +189,14 @@ The emulator core has no OS dependencies, so it compiles to WebAssembly as is.
 guest's output to a console view. The emulator runs in a **Web Worker**
 (`web/worker.js`), so a multi-second guest never freezes the tab.
 
-It also runs **CPython in the browser**: point the page's *Load a Python install*
-button at a Windows [embeddable CPython](https://www.python.org/downloads/windows/)
-folder (the one with `python.exe` + `python313.zip`), type Python, and it runs the
-interpreter locally over the in-browser filesystem — nothing is uploaded. This is
-`emu_run_path()`, which loads a program already in MEMFS and passes it a real argv;
-`web/test_python.mjs` proves it headlessly (`python -S -c ...` prints its version and
-a byte-exact `hashlib` digest, ~60M instructions).
+It also runs **CPython in the browser** — three stock 3.13 interpreters are bundled,
+one click each: **Windows** (a PE reaching the hooked Win32/CRT), **Linux static**
+(a static ELF straight to the syscall layer), and **Linux dynamic** (a PIE loaded
+through its real `ld-musl` dynamic loader). They run locally over the in-browser
+filesystem — nothing is uploaded — via `emu_run_path()`, which loads a program from
+MEMFS with a real argv. Each is proven headlessly (`web/test_python*.mjs`): `python
+-c ...` prints its version and a byte-exact `hashlib` digest. You can also point
+*Load your own* at a Windows [embeddable CPython](https://www.python.org/downloads/windows/) folder.
 
 ```sh
 sh web/make_samples.sh                     # bake the test binaries into the page
