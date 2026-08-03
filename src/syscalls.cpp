@@ -203,9 +203,36 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         case Sys::Ioctl:
             return kENOTTY;  // "not a terminal" is a valid answer libc handles
         case Sys::Mmap: {
-            uint64_t len = a[1];
-            uint64_t p = e.alloc_pages(len);
-            return p ? static_cast<int64_t>(p) : -12 /* ENOMEM */;
+            // mmap(addr, len, prot, flags, fd, offset). The host's mmap is never
+            // used: an anonymous mapping is just guest pages, and a file mapping is
+            // the file's bytes read (fopen/fread) into those pages - which is all a
+            // dynamic loader needs to bring a .so into memory.
+            uint64_t addr = a[0], len = a[1];
+            uint32_t flags = static_cast<uint32_t>(a[3]);
+            int fd = static_cast<int>(static_cast<int32_t>(a[4]));
+            uint64_t offset = a[5];
+            constexpr uint32_t kMapFixed = 0x10, kMapAnon = 0x20;
+            if (len == 0) return -22;  // EINVAL
+
+            uint64_t target;
+            if (flags & kMapFixed) {           // ld.so reserves a span, then drops
+                target = addr;                 // each segment at a fixed sub-address
+                e.mem.map(target, len, "mmap");
+            } else {
+                target = e.alloc_pages(len);   // a fresh region (hint addr ignored)
+                if (!target) return -12;       // ENOMEM
+            }
+
+            if (!(flags & kMapAnon) && fd >= 0 && e.files.valid(fd)) {
+                int64_t saved = e.files.tell(fd);   // mmap must not disturb the fd
+                if (e.files.seek(fd, static_cast<int64_t>(offset), 0) >= 0) {
+                    std::vector<uint8_t> buf(static_cast<size_t>(len));
+                    int64_t got = e.files.read(fd, buf.data(), len);   // short at EOF -> rest stays zero
+                    if (got > 0) e.mem.write(target, buf.data(), static_cast<uint64_t>(got));
+                }
+                if (saved >= 0) e.files.seek(fd, saved, 0);
+            }
+            return static_cast<int64_t>(target);
         }
         case Sys::Munmap:
             return 0;
