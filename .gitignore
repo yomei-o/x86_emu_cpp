@@ -17,3 +17,9 @@ x86emu.exe
 gen_elf_tests.exe
 *.obj
 *.log
+pybundle/
+
+# The bundled CPython for the zero-setup browser demo is tracked on purpose,
+# overriding the *.exe / build rules above.
+!web/py/
+!web/py/**

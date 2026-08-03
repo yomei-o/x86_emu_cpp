@@ -68,15 +68,18 @@
   <div class="panel">
     <h2>CPython</h2>
     <div class="row">
-      <button id="pyload">Load a Python install…</button>
+      <button id="pybundled" class="primary">Use bundled Python 3.13 (~10 MB)</button>
+      <button id="pyload">Load your own install…</button>
       <input id="pyfolder" type="file" webkitdirectory hidden>
       <span id="pystate" style="font-size:.8125rem;color:var(--dim)">not loaded</span>
     </div>
     <p class="pyhint">
-      Point this at a Windows <a href="https://www.python.org/downloads/windows/">embeddable
-      CPython</a> folder (the one with <code>python.exe</code> + <code>python313.zip</code>).
-      Nothing is uploaded — the files are copied into the in-browser filesystem and the
-      interpreter runs locally. Then type Python below and run it.
+      A stock CPython 3.13 (Windows embeddable) is bundled with this page — click
+      <em>Use bundled Python</em> and it downloads into the in-browser filesystem, then the
+      interpreter runs locally. Or point <em>Load your own install</em> at a Windows
+      <a href="https://www.python.org/downloads/windows/">embeddable CPython</a> folder
+      (the one with <code>python.exe</code> + <code>python313.zip</code>). Nothing is
+      uploaded either way.
     </p>
     <textarea id="code" spellcheck="false">import sys, hashlib
 print("python", sys.version.split()[0])
@@ -185,23 +188,47 @@ print(sum(range(1000)))</textarea>
                          traceCalls: $('tracecalls').checked, maxInsns: 5e9 });
   }
 
+  // Both loaders end here: hand the files to the worker and enable Run Python.
+  // The embeddable package is flat, so files key by basename and land directly in
+  // /py where CPython's ._pth expects python313.zip.
+  function installPython(files) {
+    worker.postMessage({ type: 'writeFiles', dir: '/py', files });
+    pythonLoaded = true;
+    pyRunBtn.disabled = busy || !ready;
+    $('pystate').textContent = `${files.length} files in /py — ready`;
+  }
+
+  // Zero-setup: fetch the CPython bundled next to the page.
+  $('pybundled').addEventListener('click', async () => {
+    $('pybundled').disabled = true;
+    try {
+      $('pystate').textContent = 'downloading Python…';
+      const names = await (await fetch('py/manifest.json')).json();
+      const files = [];
+      let done = 0;
+      for (const name of names) {
+        const buf = await (await fetch('py/' + name)).arrayBuffer();
+        files.push({ name, bytes: new Uint8Array(buf) });
+        $('pystate').textContent = `downloading Python… ${++done}/${names.length}`;
+      }
+      installPython(files);
+    } catch (err) {
+      $('pystate').textContent = 'download failed: ' + err.message;
+      $('pybundled').disabled = false;
+    }
+  });
+
   $('pyload').addEventListener('click', () => $('pyfolder').click());
   $('pyfolder').addEventListener('change', async () => {
     const list = [...$('pyfolder').files];
     if (!list.length) return;
     $('pystate').textContent = `reading ${list.length} files…`;
-    // The embeddable package is flat; key by basename so python.exe/python313.zip
-    // land directly in /py where CPython's ._pth expects them.
     const files = [];
     for (const f of list) {
-      const name = f.name;
-      if (!name) continue;
-      files.push({ name, bytes: new Uint8Array(await f.arrayBuffer()) });
+      if (!f.name) continue;
+      files.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
     }
-    worker.postMessage({ type: 'writeFiles', dir: '/py', files });
-    pythonLoaded = true;
-    pyRunBtn.disabled = busy || !ready;
-    $('pystate').textContent = `${files.length} files in /py — ready`;
+    installPython(files);
   });
   pyRunBtn.addEventListener('click', runPython);
 

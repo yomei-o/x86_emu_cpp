@@ -2,3 +2,5 @@
 # tests/expected/ files are compared byte for byte against guest output.
 * text=auto eol=lf
 tests/expected/** -text
+# The bundled CPython (browser demo) ships byte-for-byte: never touch line endings.
+web/py/** -text
