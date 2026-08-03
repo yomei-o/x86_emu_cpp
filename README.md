@@ -29,6 +29,8 @@ Verified by diffing emulated output against real native execution, byte for byte
 | Visual Studio 2022, `/MT` (CRT statically linked, runs inside the guest) | ✅ | ✅ |
 | C++ with iostreams, containers and static constructors (`/MT`) | ✅ | ✅ |
 | a program plus its own DLL, loaded for real | ✅ | ✅ |
+| threads, locks, events and per-thread storage | ✅ | ✅ |
+| the Win32 file API (`CreateFile`/`ReadFile`/`WriteFile`) | ✅ | ✅ |
 | gcc + glibc, `-static` (real libc inside the guest, kernel emulated) | — | ✅ |
 | hand-assembled ELF using raw syscalls | ✅ | ✅ |
 
@@ -102,6 +104,15 @@ straight to the kernel. `syscalls.cpp` implements that interface instead, for bo
 `syscall` (x86-64) and `int 0x80` (i386) — the file calls, `brk`, `mmap`,
 `arch_prctl` (which is where glibc's thread-local storage comes from),
 `exit_group` and friends.
+
+**Threads** (`threads.cpp`) are green threads: the emulator interprets one
+instruction stream at a time and switches at a quantum boundary or the moment a
+thread blocks. A guest thread owns a full CPU context, its own stack, its own
+TEB, and its own copy of every module's static thread-local storage — that last
+one being the classic way for threads to appear to work and then quietly corrupt
+each other. Critical sections and SRW locks keep their state in the guest object
+the caller owns, so a contended lock yields and the call is simply re-entered
+when the thread runs again.
 
 **Files, the environment and math** are shared across all of it. `files.h` maps
 the small integer descriptors a guest sees onto host files, and the four
@@ -247,9 +258,8 @@ emulator built for the current host and prints which host that was.
 Each of these fails with a message naming the instruction or import rather than
 misbehaving quietly.
 
-- **No threads yet.** `CreateThread` and `clone` are not implemented, and the
-  synchronisation primitives are the no-ops that are correct for a single thread
-  — an uncontended lock never blocks. This is the next thing to build.
+- **Threads are cooperative, and Windows-only so far.** `CreateThread` works;
+  Linux's `clone` does not. See below for what that costs.
 - **No AVX, and CPUID says so.** The emulator advertises exactly the features it
   implements (SSE2 and CMOV, not SSE4.2 or AVX), because a libc picks its
   `memcpy`/`strlen` from those bits and would otherwise jump into instructions

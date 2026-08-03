@@ -229,6 +229,8 @@ void Emulator::setup_static_tls(Module& module) {
     mem.write32(img.tls_index_address, slot);
     mem.write_sized(tls_array_ + static_cast<uint64_t>(slot) * pointer_size(),
                     pointer_size(), block);
+    // Remember the template: every thread created later needs its own copy.
+    tls_templates_.push_back({slot, img.tls_raw_start, template_size, total});
     log_call("static TLS for %s: slot %u, %llu bytes at 0x%llX", module.name.c_str(), slot,
              (unsigned long long)total, (unsigned long long)block);
 }

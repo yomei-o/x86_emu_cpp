@@ -129,6 +129,12 @@ bool Emulator::dispatch_hook(uint64_t addr) {
 
     h.fn(*this);
     if (cpu_->halted) return true;
+    if (retry_hook_) {
+        // The hook wants to be called again rather than return; leaving RIP where
+        // it is means the next fetch dispatches it afresh.
+        retry_hook_ = false;
+        return true;
+    }
 
     // Perform the return the intercepted function would have done.
     uint64_t ret = cpu_->pop();
@@ -372,17 +378,22 @@ void Emulator::run_atexit() {
 }
 
 uint32_t Emulator::tls_alloc() {
-    tls_slots_.push_back(0);
-    return static_cast<uint32_t>(tls_slots_.size() - 1);
+    // An index is process-wide; the value behind it is per-thread, which is the
+    // whole point of the API.
+    return next_dynamic_tls_slot_++;
 }
 
 uint64_t Emulator::tls_get(uint32_t index) const {
-    return index < tls_slots_.size() ? tls_slots_[index] : 0;
+    if (threads_.empty()) return 0;
+    const auto& slots = threads_[current_thread_]->tls_slots;
+    return index < slots.size() ? slots[index] : 0;
 }
 
 void Emulator::tls_set(uint32_t index, uint64_t value) {
-    if (index >= tls_slots_.size()) tls_slots_.resize(index + 1, 0);
-    tls_slots_[index] = value;
+    if (threads_.empty()) return;
+    auto& slots = threads_[current_thread_]->tls_slots;
+    if (index >= slots.size()) slots.resize(index + 1, 0);
+    slots[index] = value;
 }
 
 void Emulator::seed_environment() {
@@ -586,15 +597,40 @@ uint64_t Emulator::alloc_guest_string(const std::string& s) {
 
 void Emulator::write_raw(int fd, const void* data, size_t len) {
     if (!len) return;
+    // Deliberately does *not* flush the stdio buffer first.  WriteFile knows
+    // nothing about the C runtime's buffer on real Windows either, so a guest
+    // that mixes the two sees its raw writes overtake its buffered ones - and
+    // matching that is the whole point of buffering here.
     if (output_sink)
         output_sink(fd, static_cast<const char*>(data), len);
     else
         std::fwrite(data, 1, len, fd == 2 ? stderr : stdout);
 }
 
+void Emulator::flush_guest_output() {
+    if (stdout_buffer_.empty()) return;
+    std::string out;
+    out.swap(stdout_buffer_);
+    if (output_sink)
+        output_sink(1, out.data(), out.size());
+    else
+        std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
 void Emulator::write_text(int fd, const std::string& data) {
     if (os() != Os::Windows) {
         write_raw(fd, data.data(), data.size());
+        return;
+    }
+    // stderr is never buffered, matching every C runtime.
+    if (fd == 1 && buffer_stdout_) {
+        for (char c : data) {
+            if (c == '\n') stdout_buffer_ += '\r';
+            stdout_buffer_ += c;
+        }
+        // 4 KiB is the usual block size, and holding more than that would only
+        // delay output a guest expects to have written.
+        if (stdout_buffer_.size() >= 4096) flush_guest_output();
         return;
     }
     // A Windows CRT opens the console streams in text mode, so a guest printing
@@ -830,6 +866,13 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     cpu_ = std::make_unique<Cpu>(mem, mode);
     cpu_->trace = opt_.trace;
     files.set_text_translation(os_kind == Os::Windows);
+    // A Windows CRT block-buffers stdout unless it is a terminal.  Matching that
+    // is what makes printf and WriteFile interleave the same way they would on
+    // Windows; a terminal writes straight through so output stays live.
+    if (os_kind == Os::Windows) {
+        auto* out = files.get(1);
+        buffer_stdout_ = out && !out->is_tty;
+    }
 
     choose_layout();
     mem.map(stack_base_, stack_size_, "stack");
@@ -847,6 +890,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     install_file_hooks();
     install_libc_hooks();
     if (os_kind == Os::Windows) {
+        install_thread_hooks();
         install_win32_hooks();
         install_win32_extra_hooks();
         install_ucrt_hooks();
@@ -900,6 +944,23 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
 
     cpu_->rip = image_.entry;
 
+    // The program itself is thread 0.  Registering it means the scheduler has a
+    // single code path whether or not the guest ever creates another thread.
+    {
+        auto main_thread = std::make_unique<GuestThread>();
+        main_thread->id = next_thread_id_++;
+        main_thread->stack_base = stack_base_;
+        main_thread->stack_size = stack_size_;
+        main_thread->teb = teb_base_;
+        main_thread->tls_array = tls_array_;
+        main_thread->handle = create_sync_object(SyncObject::Kind::Thread, true, false, 0);
+        sync_object(main_thread->handle)->owner = main_thread->id;
+        threads_.push_back(std::move(main_thread));
+        current_thread_ = 0;
+        // Its context is whatever the CPU already holds; switch_to_thread saves
+        // that on the way out, so nothing needs copying in now.
+    }
+
     // Now that there is a TEB and a stack, the loaded modules can initialise.
     if (os_kind == Os::Windows) run_pending_module_init();
 
@@ -917,7 +978,53 @@ void Emulator::dump_memory_map() const {
 }
 
 int Emulator::run() {
-    cpu_->run(opt_.max_instructions);
+    struct FlushOnExit {
+        Emulator* e;
+        ~FlushOnExit() { e->flush_guest_output(); }
+    } flush_guard{this};
+
+    // The scheduler: give the running thread a slice, then look for another.
+    // With one thread this is the plain interpreter loop with a counter around
+    // it, which is why the single-threaded path costs nothing.
+    constexpr uint64_t kQuantum = 20000;
+    while (!cpu_->halted) {
+        if (opt_.max_instructions && cpu_->instructions_executed >= opt_.max_instructions)
+            throw CpuError(cpu_->rip, "instruction limit reached (possible infinite loop)");
+
+        uint64_t deadline = cpu_->instructions_executed + kQuantum;
+        reschedule_ = false;
+        while (!cpu_->halted && !reschedule_ && cpu_->instructions_executed < deadline) {
+            cpu_->step();
+            if (opt_.max_instructions && cpu_->instructions_executed >= opt_.max_instructions)
+                throw CpuError(cpu_->rip, "instruction limit reached (possible infinite loop)");
+        }
+        if (cpu_->halted) break;
+        if (threads_.size() <= 1) continue;  // nothing to switch to
+
+        size_t next = pick_runnable();
+        if (next >= threads_.size()) {
+            bool any_alive = false;
+            for (const auto& t : threads_)
+                if (t->state != GuestThread::State::Finished) any_alive = true;
+            if (!any_alive) break;
+
+            // Nothing can run.  If someone is waiting on a timer, the answer is
+            // that time has to pass - and here time *is* the instruction count,
+            // so with every thread idle it can simply be moved forward to the
+            // earliest deadline.  Otherwise the wait can never be satisfied.
+            uint64_t earliest = 0;
+            for (const auto& t : threads_) {
+                if (t->state != GuestThread::State::Blocked || !t->wake_at) continue;
+                if (!earliest || t->wake_at < earliest) earliest = t->wake_at;
+            }
+            if (!earliest) throw CpuError(cpu_->rip, "all threads are blocked: deadlock");
+            cpu_->instructions_executed = earliest;
+            next = pick_runnable();
+            if (next >= threads_.size())
+                throw CpuError(cpu_->rip, "all threads are blocked: deadlock");
+        }
+        switch_to_thread(next);
+    }
     std::fflush(stdout);
     return cpu_->exit_code;
 }

@@ -34,7 +34,12 @@ public:
         bool readable = false;
         bool writable = false;
         bool append = false;
-        bool is_tty = false;   // the three standard streams
+        // Two different questions: whether this is one of the three streams the
+        // emulator must never close, and whether it is actually a terminal.  A
+        // redirected stdout is the first without being the second, and a guest
+        // asking GetFileType deserves the real answer.
+        bool standard_stream = false;
+        bool is_tty = false;
         bool text_mode = false;  // a Windows guest opened it without "b"
         bool closed = false;
         // C forbids reading straight after writing on the same stream without an

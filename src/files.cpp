@@ -43,10 +43,26 @@ int from_errno(int e) {
 }  // namespace
 
 FileTable::FileTable() {
-    // The three standard streams are always present and always the host's.
-    files_[0] = Entry{stdin, "<stdin>", true, false, false, true, false};
-    files_[1] = Entry{stdout, "<stdout>", false, true, false, true, false};
-    files_[2] = Entry{stderr, "<stderr>", false, true, false, true, false};
+    // The three standard streams are always present and always the host's.  Their
+    // terminal-ness is whatever the host's really is, so that a guest asking
+    // GetFileType or isatty gets the truth about where its output is going.
+    auto standard = [](std::FILE* fp, const char* name, bool readable, bool writable) {
+        Entry e;
+        e.fp = fp;
+        e.path = name;
+        e.readable = readable;
+        e.writable = writable;
+        e.standard_stream = true;
+#if defined(_WIN32)
+        e.is_tty = _isatty(_fileno(fp)) != 0;
+#else
+        e.is_tty = isatty(fileno(fp)) != 0;
+#endif
+        return e;
+    };
+    files_[0] = standard(stdin, "<stdin>", true, false);
+    files_[1] = standard(stdout, "<stdout>", false, true);
+    files_[2] = standard(stderr, "<stderr>", false, true);
 }
 
 std::string FileTable::host_path(const std::string& guest_path) {
@@ -125,7 +141,7 @@ FileTable::Entry* FileTable::get(int fd) {
 int FileTable::close(int fd) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (e->is_tty) {
+    if (e->standard_stream) {
         // Closing a standard stream must not close the host's copy; the guest
         // just loses its descriptor.
         files_.erase(fd);
@@ -165,7 +181,7 @@ int64_t FileTable::write(int fd, const void* src, uint64_t len) {
     if (!e) return kEBADF;
     if (!e->writable) return kEBADF;
     if (len == 0) return 0;
-    if (!e->last_was_write && !e->is_tty) {
+    if (!e->last_was_write && !e->standard_stream) {
         // Seeking to the current position is the standard way to switch a stream
         // from reading to writing.
         std::fseek(e->fp, 0, SEEK_CUR);
@@ -191,7 +207,7 @@ int64_t FileTable::write(int fd, const void* src, uint64_t len) {
 int64_t FileTable::seek(int fd, int64_t offset, int whence) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (e->is_tty) return kEINVAL;
+    if (e->standard_stream) return kEINVAL;
     e->last_was_write = false;
     int origin = whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET;
 #if defined(_WIN32)
@@ -243,7 +259,8 @@ int FileTable::dup(int fd, int to) {
     // The two descriptors share one host FILE*, so only the standard streams and
     // the original owner may close it; mark the copy as a shared view.
     Entry copy = *e;
-    copy.is_tty = true;  // "do not fclose on close", which is what is_tty means
+    // Both descriptors share one host stream, so neither may close it.
+    copy.standard_stream = true;
     files_[target] = copy;
     return target;
 }
@@ -272,7 +289,7 @@ int FileTable::stat_path(const std::string& path, Stat& out) {
 int FileTable::stat_fd(int fd, Stat& out) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (e->is_tty && !e->path.empty() && e->path[0] == '<') {
+    if (e->standard_stream) {
         out.is_char_device = true;
         out.size = 0;
         return 0;

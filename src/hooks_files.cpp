@@ -388,7 +388,9 @@ void Emulator::install_file_hooks() {
             e.set_result(0);  // FILE_TYPE_UNKNOWN
             return;
         }
-        e.set_result(entry->is_tty ? 2u /* CHAR */ : 1u /* DISK */);
+        // A redirected standard stream really is a disk file, which is what a
+        // guest choosing its buffering strategy needs to know.
+        e.set_result(entry->is_tty ? 2u /* FILE_TYPE_CHAR */ : 1u /* FILE_TYPE_DISK */);
     });
     auto delete_file = [](Emulator& e, bool wide) {
         std::string path = wide ? utf16_to_utf8(e, e.arg_slot(0), -1)

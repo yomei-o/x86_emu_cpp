@@ -62,48 +62,8 @@ void Emulator::install_win32_extra_hooks() {
         win32(name, nargs, [](Emulator& e) { e.set_result(1); });
     };
 
-    // ---- synchronisation -------------------------------------------------------
-    // Slim reader/writer locks and condition variables are pointer-sized objects
-    // the caller owns; with one thread there is never contention to resolve.
-    for (const char* n : {"InitializeSRWLock", "AcquireSRWLockExclusive",
-                          "ReleaseSRWLockExclusive", "AcquireSRWLockShared",
-                          "ReleaseSRWLockShared", "InitializeConditionVariable",
-                          "WakeConditionVariable", "WakeAllConditionVariable"})
-        win32(n, 1, [](Emulator& e) { e.set_result(0); });
-    ret1("TryAcquireSRWLockExclusive", 1);
-    ret1("TryAcquireSRWLockShared", 1);
-    // A wait that would block forever with one thread is a deadlock; returning
-    // "signalled" keeps a runtime that waits on its own already-set event moving.
-    ret1("SleepConditionVariableSRW", 4);
-    ret1("SleepConditionVariableCS", 3);
-    win32("WaitForSingleObject", 2, [](Emulator& e) { e.set_result(0); });  // WAIT_OBJECT_0
-    win32("WaitForSingleObjectEx", 3, [](Emulator& e) { e.set_result(0); });
-    win32("WaitForMultipleObjects", 4, [](Emulator& e) { e.set_result(0); });
-    win32("WaitForMultipleObjectsEx", 5, [](Emulator& e) { e.set_result(0); });
-    // Events, mutexes and semaphores: handles distinct enough to compare.
-    auto make_object = [](Emulator& e) {
-        static uint64_t next = 0x2000;
-        e.set_result(next += 4);
-    };
-    win32("CreateEventA", 4, make_object);
-    win32("CreateEventW", 4, make_object);
-    win32("CreateEventExW", 4, make_object);
-    win32("OpenEventW", 3, make_object);
-    win32("CreateMutexW", 3, make_object);
-    win32("CreateMutexExW", 4, make_object);
-    win32("OpenMutexW", 3, make_object);
-    win32("CreateSemaphoreA", 4, make_object);
-    win32("CreateSemaphoreW", 4, make_object);
-    win32("CreateSemaphoreExW", 6, make_object);
-    win32("CreateWaitableTimerExW", 4, make_object);
-    ret1("SetEvent", 1);
-    ret1("ResetEvent", 1);
-    ret1("PulseEvent", 1);
-    ret1("ReleaseMutex", 1);
-    ret1("ReleaseSemaphore", 3);
-    ret1("SetWaitableTimerEx", 6);
-    ret1("CancelWaitableTimer", 1);
-    win32("InterlockedFlushSList", 1, [](Emulator& e) { e.set_result(0); });
+    // Synchronisation and thread APIs live in threads.cpp, which owns the
+    // scheduler they have to cooperate with.
 
     // ---- directories and paths --------------------------------------------------
     win32("GetCurrentDirectoryW", 2, [](Emulator& e) {

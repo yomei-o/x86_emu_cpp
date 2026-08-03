@@ -75,6 +75,76 @@ public:
     const Options& options() const { return opt_; }
     int pointer_size() const { return is64() ? 8 : 4; }
 
+    // ---- threads ---------------------------------------------------------------
+    // Guest threads are cooperative: the emulator runs one at a time and switches
+    // at a quantum boundary or when a thread blocks.  That is enough to be
+    // correct - a guest may not assume anything about interleaving - and it means
+    // the whole emulator stays single-threaded on the host.
+    struct GuestThread {
+        uint32_t id = 0;
+        uint64_t handle = 0;
+
+        // The saved context, valid whenever this thread is not the running one.
+        uint64_t regs[16] = {};
+        Cpu::Xmm xmm[16] = {};
+        double st[8] = {};
+        bool st_used[8] = {};
+        int st_top = 0;
+        uint16_t fpu_control = 0x037F, fpu_status = 0;
+        uint32_t mxcsr = 0x1F80;
+        uint64_t rip = 0, rflags = 0x202;
+        uint64_t fs_base = 0, gs_base = 0;
+
+        uint64_t stack_base = 0, stack_size = 0;
+        uint64_t teb = 0;
+        uint64_t tls_array = 0;
+        std::vector<uint64_t> tls_slots;  // the Tls*/Fls* API's per-thread values
+
+        enum class State { Runnable, Blocked, Finished };
+        State state = State::Runnable;
+        uint32_t exit_code = 0;
+
+        // What this thread is blocked on, if anything.
+        uint64_t wait_handle = 0;
+        uint64_t wake_at = 0;  // an instruction count, for Sleep
+    };
+
+    // A Win32 waitable object.  Threads are objects too, which is what makes
+    // joining one the same operation as waiting on an event.
+    struct SyncObject {
+        enum class Kind { Event, Mutex, Semaphore, Thread };
+        Kind kind = Kind::Event;
+        bool manual_reset = false;
+        bool signalled = false;
+        int64_t count = 0;       // a semaphore's remaining permits
+        uint32_t owner = 0;      // a mutex's holder, or a thread's id
+        int64_t recursion = 0;   // a mutex may be taken repeatedly by its owner
+    };
+
+    uint32_t current_thread_id() const;
+    GuestThread* current_thread();
+    // Creates a thread that will call `start` with `argument`; returns its handle.
+    uint64_t create_thread(uint64_t start, uint64_t argument, uint64_t stack_size);
+    void exit_thread(uint32_t exit_code);
+    // Gives up the rest of this thread's slice.  Hooks that block call this after
+    // recording what they are waiting for.
+    void yield_now() { reschedule_ = true; }
+    // Blocks the current thread until `handle` is signalled, or forever if it
+    // never is.  Returns false if the wait could not be set up.
+    bool begin_wait(uint64_t handle, uint64_t timeout_ms);
+    SyncObject* sync_object(uint64_t handle);
+    uint64_t create_sync_object(SyncObject::Kind kind, bool manual_reset, bool signalled,
+                                int64_t count);
+    void signal_object(uint64_t handle);
+    bool try_acquire(uint64_t handle);
+
+    void install_thread_hooks();
+    const std::vector<std::unique_ptr<GuestThread>>& threads() const { return threads_; }
+    // Leaves the current hook without returning to the guest, so that the same
+    // call happens again the next time this thread runs.  That is how a blocking
+    // lock retries: the guest re-enters the hook and finds the lock free.
+    void retry_current_call() { retry_hook_ = true; }
+
     // ---- modules -------------------------------------------------------------
     // A DLL actually loaded into guest memory, as opposed to one whose functions
     // the emulator provides itself.
@@ -191,6 +261,11 @@ public:
     // channel, which is what WriteFile and the Linux write() syscall are.
     void write_text(int fd, const std::string& data);
     void write_raw(int fd, const void* data, size_t len);
+    // Pushes any buffered guest output out.  A Windows CRT block-buffers stdout
+    // when it is not a terminal, so the emulator does too - otherwise a guest
+    // that mixes printf with WriteFile would see its output interleaved
+    // differently here than on Windows.
+    void flush_guest_output();
 
     // ---- files ---------------------------------------------------------------
     FileTable files;
@@ -284,6 +359,11 @@ private:
     // a stack, so initialisation waits until the environment exists - which is
     // also the order the real loader uses.
     void run_pending_module_init();
+    // Saves the running thread's context and makes `index` the running one.
+    void switch_to_thread(size_t index);
+    // The next thread that could run, waking anything whose wait is satisfied.
+    size_t pick_runnable();
+    uint64_t allocate_thread_tls(uint64_t teb);
     // Gives a module its slot in the thread's TLS array and fills that slot with
     // a copy of the module's TLS template.
     void setup_static_tls(Module& module);
@@ -317,6 +397,8 @@ private:
     std::unordered_map<uint64_t, int> guest_file_fds_; // guest FILE* -> fd
     uint64_t last_error_ = 0;
     bool three_digit_exponents_ = false;
+    std::string stdout_buffer_;
+    bool buffer_stdout_ = false;
     uint64_t exit_thunk_ = 0;
     uint64_t nested_return_ = 0;  // sentinel address call_guest() returns to
     std::vector<std::unique_ptr<Module>> modules_;
@@ -324,8 +406,25 @@ private:
     bool guest_env_ready_ = false;
     uint64_t errno_address_ = 0;  // the guest's errno variable
     uint64_t lconv_address_ = 0;  // the guest's struct lconv
-    uint64_t tls_array_ = 0;      // TEB.ThreadLocalStoragePointer
+    uint64_t tls_array_ = 0;      // the main thread's TEB.ThreadLocalStoragePointer
     uint32_t next_tls_slot_ = 0;  // next free index in that array
+    // What a new thread needs to reproduce every module's static TLS.
+    struct TlsTemplate {
+        uint32_t slot;
+        uint64_t source;         // the module's template, in its own image
+        uint64_t template_size;
+        uint64_t total_size;
+    };
+    std::vector<TlsTemplate> tls_templates_;
+
+    std::vector<std::unique_ptr<GuestThread>> threads_;
+    size_t current_thread_ = 0;
+    uint32_t next_thread_id_ = 0x1000;
+    bool reschedule_ = false;
+    bool retry_hook_ = false;
+    uint64_t thread_exit_thunk_ = 0;
+    std::unordered_map<uint64_t, SyncObject> sync_objects_;
+    uint64_t next_sync_handle_ = 0x8000;
     // Handles for libraries answered by hooks; deliberately far from any real
     // mapping so that a stray dereference faults instead of reading a module.
     static constexpr uint64_t kHookedModuleBase = 0x00000000EE000000ull;
@@ -333,7 +432,7 @@ private:
     uint64_t dll_next_base_ = 0;   // where the next real DLL gets mapped
     // Guards against a cycle in DLL dependencies.
     std::vector<std::string> loading_;
-    std::vector<uint64_t> tls_slots_;
+    uint32_t next_dynamic_tls_slot_ = 0;  // TlsAlloc hands these out
     std::vector<uint64_t> atexit_funcs_;
 };
 
