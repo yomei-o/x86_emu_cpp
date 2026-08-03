@@ -254,6 +254,7 @@ public:
     void install_file_hooks();
     void install_libc_hooks();
     void install_win32_hooks();
+    void install_win32_extra_hooks();
     void install_ucrt_hooks();
     void install_syscall_handlers();
 

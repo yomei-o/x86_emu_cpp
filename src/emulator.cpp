@@ -434,9 +434,9 @@ uint64_t Emulator::environment_block(bool wide) {
         flat += k;
         flat += '=';
         flat += v;
-        flat += ' ';
+        flat += '\0';
     }
-    flat += ' ';  // the block ends with an empty string
+    flat += '\0';  // the block ends with an empty string
 
     if (!wide) return alloc_guest_data(flat.data(), flat.size());
 
@@ -848,6 +848,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     install_libc_hooks();
     if (os_kind == Os::Windows) {
         install_win32_hooks();
+        install_win32_extra_hooks();
         install_ucrt_hooks();
     }
 

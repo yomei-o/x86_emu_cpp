@@ -27,6 +27,8 @@ Verified by diffing emulated output against real native execution, byte for byte
 | mingw-w64 gcc, freestanding, imports from `msvcrt.dll` | ✅ | ✅ |
 | Visual Studio 2022, `/MD` (CRT in `ucrtbase.dll`) | ✅ | ✅ |
 | Visual Studio 2022, `/MT` (CRT statically linked, runs inside the guest) | ✅ | ✅ |
+| C++ with iostreams, containers and static constructors (`/MT`) | ✅ | ✅ |
+| a program plus its own DLL, loaded for real | ✅ | ✅ |
 | gcc + glibc, `-static` (real libc inside the guest, kernel emulated) | — | ✅ |
 | hand-assembled ELF using raw syscalls | ✅ | ✅ |
 
@@ -44,11 +46,18 @@ floating-point conversion.
                                              x87.cpp
 ```
 
-**Loading.** `pe_loader.cpp` maps the image at its preferred `ImageBase` (so no
-relocation processing is needed) and `elf_loader.cpp` maps `PT_LOAD` segments and
-builds the System V initial stack. Guest memory (`memory.h`) is a hash map of
-4 KiB pages created on demand; an access to an unmapped address raises a fault
-instead of quietly reading zeroes.
+**Loading.** `pe_loader.cpp` maps a PE image and `elf_loader.cpp` maps `PT_LOAD`
+segments and builds the System V initial stack. Guest memory (`memory.h`) is a
+hash map of 4 KiB pages created on demand; an access to an unmapped address
+raises a fault instead of quietly reading zeroes.
+
+DLLs are loaded for real, not just hooked (`modules.cpp`): mapped wherever they
+fit and relocated to suit, their own imports bound recursively, their static
+thread-local storage set up, and their TLS callbacks and `DllMain` run before the
+program starts. Only the system libraries stay hooked, since loading a real
+kernel32 would mean emulating the kernel underneath it. That distinction is what
+lets a program use both its own DLL's exported *data* and the emulator's `printf`
+in the same run.
 
 **Interpreting.** `cpu.cpp` is a decode-and-execute loop covering the user-mode
 integer subset compilers emit: the ALU group, ModRM/SIB addressing,
@@ -90,9 +99,17 @@ runs a C++ program's static constructors.
 
 **Linux guests** have nothing to hook by name: a statically linked ELF talks
 straight to the kernel. `syscalls.cpp` implements that interface instead, for both
-`syscall` (x86-64) and `int 0x80` (i386) — `write`, `writev`, `brk`, `mmap`,
-`fstat`, `arch_prctl` (which is where glibc's thread-local storage comes from),
+`syscall` (x86-64) and `int 0x80` (i386) — the file calls, `brk`, `mmap`,
+`arch_prctl` (which is where glibc's thread-local storage comes from),
 `exit_group` and friends.
+
+**Files, the environment and math** are shared across all of it. `files.h` maps
+the small integer descriptors a guest sees onto host files, and the four
+interfaces above it — C stdio, the POSIX descriptor calls, the Win32 file API and
+the Linux syscalls — are translations over that one table. The guest inherits the
+host's environment, because a runtime finds its own installation through it. Math
+functions go to the host's libm, which is both simpler and more accurate than
+letting the guest compute them on a double-precision x87 stack.
 
 ## Building
 
@@ -116,7 +133,13 @@ usage: x86emu [options] <program> [guest args...]
   -m, --map            print the guest memory map after loading
   -n, --max-insns N    stop after N instructions (0 = unlimited)
   -d, --dump ADDR[:N]  hex dump N bytes of guest memory after loading
+  -L, --libpath DIR    also look here for DLLs the guest imports
+      --imports        list imports with no implementation, then exit
 ```
+
+`--imports` is how you bring up a new guest: it loads the program, binds every
+import, and prints the ones that resolved to a "not implemented" stub. Working
+through that list beats running and re-running.
 
 `--trace-calls` is usually the fastest way to see what a guest is doing:
 
@@ -149,6 +172,7 @@ Serve `web/` over http and open `index.html`. Nothing leaves the browser.
 ```sh
 sh build.sh
 sh tests/build_pe_tests.sh      # mingw-w64 gcc + dlltool
+sh tests/dll/build.sh           # a program plus a DLL, for the loader
 ./gen_elf_tests tests/bin       # from tools/gen_elf_tests.cpp
 tests\msvc\build.bat            # Visual Studio 2022 (Windows only)
 sh tests/linux/build.sh         # gcc targeting x86 Linux, run on a Linux host
@@ -206,8 +230,14 @@ emulator built for the current host and prints which host that was.
 | `src/emulator.{h,cpp}` | address-space layout, hook dispatch, ABI glue, heap |
 | `src/pe_loader.cpp` | PE32 / PE32+ mapping and IAT binding |
 | `src/elf_loader.cpp` | ELF32 / ELF64 mapping and the initial process stack |
-| `src/hooks.cpp` | libc hooks and the printf engine's callers |
+| `src/modules.cpp` | loading real DLLs: relocation, exports, DllMain, static TLS |
+| `src/files.{h,cpp}` | the guest's file descriptor table |
+| `src/hooks.cpp` | core libc hooks |
+| `src/hooks_libc.cpp` | locale, errno, ctype, wide strings, conversions, qsort |
+| `src/hooks_math.cpp` | the math library and its ABI plumbing |
+| `src/hooks_files.cpp` | stdio, POSIX descriptors and the Win32 file API |
 | `src/hooks_win32.cpp` | Win32 API and Universal CRT hooks |
+| `src/hooks_win32b.cpp` | synchronisation, directories, handles, paths |
 | `src/guest_printf.cpp` | the printf engine and UTF-16 conversion |
 | `src/syscalls.cpp` | the Linux kernel interface |
 | `web/` | the WebAssembly front end and demo page |
@@ -217,6 +247,9 @@ emulator built for the current host and prints which host that was.
 Each of these fails with a message naming the instruction or import rather than
 misbehaving quietly.
 
+- **No threads yet.** `CreateThread` and `clone` are not implemented, and the
+  synchronisation primitives are the no-ops that are correct for a single thread
+  — an uncontended lock never blocks. This is the next thing to build.
 - **No AVX, and CPUID says so.** The emulator advertises exactly the features it
   implements (SSE2 and CMOV, not SSE4.2 or AVX), because a libc picks its
   `memcpy`/`strlen` from those bits and would otherwise jump into instructions
@@ -226,16 +259,34 @@ misbehaving quietly.
   precision on real hardware can differ in its last bits. Loads and stores of an
   80-bit memory operand do convert exactly.
 - **No SEH or C++ exception unwinding.** Installing a handler is fine; actually
-  throwing is not.
+  throwing is not (`tests/msvc/exc_msvc.cpp` is the test waiting for it).
 - **No dynamic linking for ELF.** `ET_DYN`/PIE and anything needing `ld.so` are
-  rejected at load time; statically linked `ET_EXEC` works.
-- **No threads and no real filesystem.** `CreateThread` and `open` are not
-  implemented; the Tls/Fls APIs work because there is exactly one thread.
-- **PE data imports** are bound like function imports, so importing a variable
-  rather than a function from a DLL yields a hook address instead of data.
+  rejected at load time; statically linked `ET_EXEC` works. Windows DLLs *are*
+  loaded for real.
+- **No registry, processes or pipes**, and no directory enumeration.
 - Segmentation is flat: `fs:`/`gs:` resolve to a synthetic TEB/PEB on Windows and
   to whatever `arch_prctl`/`set_thread_area` set on Linux; every other segment
   base is zero.
+
+### Working towards CPython
+
+A stock CPython 3.13 for x64 currently gets through its whole native startup —
+`python313.dll` is loaded, relocated and initialised, static TLS is set up, and
+the interpreter runs far enough to execute its own frozen `getpath` bytecode —
+and then stops with CPython's own `Fatal Python error: error evaluating path`,
+which is its path configuration failing to locate the standard library. So the
+machine underneath works; what is missing is more of the Windows filesystem
+surface it uses to find its files.
+
+`--imports` lists what a given guest still needs:
+
+```console
+$ ./x86emu --imports C:/Python313/python.exe | wc -l
+195
+```
+
+Most of those are imported but never called. The ones that matter next are
+directory enumeration (`FindFirstFileW`), the registry, and threads.
 
 ## License
 

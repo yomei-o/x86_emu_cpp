@@ -15,6 +15,12 @@
 #include "emulator.h"
 #include "guest_printf.h"
 
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace x86emu {
 namespace {
 
@@ -50,6 +56,26 @@ int write_utf16(Emulator& e, uint64_t dst, const std::string& s, int capacity_un
         e.mem.write16(dst + static_cast<uint64_t>(i) * 2,
                       i < static_cast<int>(w.size()) ? w[i] : 0);
     return n;
+}
+
+// The program's path as Windows spells it: absolute, with backslashes.  A
+// runtime locates its own installation from this, so a relative path or the
+// wrong separator sends it looking in the wrong place.
+std::string program_path(const Emulator& e) {
+    std::string path = e.args().empty() ? "program.exe" : e.args()[0];
+    bool absolute = (path.size() > 1 && path[1] == ':') ||
+                    (!path.empty() && (path[0] == '/' || path[0] == '\\'));
+    if (!absolute) {
+        char cwd[4096];
+#if defined(_WIN32)
+        if (_getcwd(cwd, sizeof cwd)) path = std::string(cwd) + "/" + path;
+#else
+        if (getcwd(cwd, sizeof cwd)) path = std::string(cwd) + "/" + path;
+#endif
+    }
+    for (char& c : path)
+        if (c == '/') c = '\\';
+    return path;
 }
 
 std::string command_line(const Emulator& e) {
@@ -108,14 +134,14 @@ void Emulator::install_win32_hooks() {
         e.set_result(1);
     });
     win32("GetModuleFileNameA", 3, [](Emulator& e) {
-        std::string name = e.args().empty() ? "program.exe" : e.args()[0];
+        std::string name = program_path(e);
         uint64_t buf = e.arg_slot(1), size = e.arg_slot(2);
         if (name.size() + 1 > size && size) name.resize(static_cast<size_t>(size - 1));
         if (buf) e.mem.write_cstring(buf, name);
         e.set_result(name.size());
     });
     win32("GetModuleFileNameW", 3, [](Emulator& e) {
-        std::string name = e.args().empty() ? "program.exe" : e.args()[0];
+        std::string name = program_path(e);
         int n = write_utf16(e, e.arg_slot(1), name, static_cast<int>(e.arg_slot(2)));
         e.set_result(static_cast<uint64_t>(n > 0 ? n - 1 : 0));
     });
@@ -557,6 +583,40 @@ void Emulator::install_ucrt_hooks() {
             e.set_result(s.size());
         else
             e.set_result(truncated ? ~0ull : s.size());
+    });
+    ucrt("__stdio_common_vswprintf", [](Emulator& e) {
+        Args a(e, 0);
+        uint64_t options = a.next_int(8);
+        uint64_t buf = a.next_ptr();
+        uint64_t count = a.next_ptr();  // in wide characters
+        uint64_t fmt = a.next_ptr();
+        a.next_ptr();                   // locale
+        uint64_t va = a.next_ptr();
+        Args tail = Args::va_list_at(e, va);
+        std::u16string s = utf8_to_utf16(format_guest(e, fmt, tail, true));
+        bool truncated = count && s.size() >= count;
+        if (buf && count) {
+            size_t n = truncated ? static_cast<size_t>(count - 1) : s.size();
+            for (size_t i = 0; i < n; ++i) e.mem.write16(buf + i * 2, s[i]);
+            e.mem.write16(buf + n * 2, 0);
+        }
+        if (options & 0x10)
+            e.set_result(s.size());
+        else
+            e.set_result(truncated ? ~0ull : s.size());
+    });
+    ucrt("__stdio_common_vfwprintf", [](Emulator& e) {
+        Args a(e, 0);
+        a.next_int(8);                    // options
+        uint64_t stream = a.next_ptr();
+        uint64_t fmt = a.next_ptr();
+        a.next_ptr();                     // locale
+        uint64_t va = a.next_ptr();
+        Args tail = Args::va_list_at(e, va);
+        std::string s = format_guest(e, fmt, tail, true);
+        int fd = e.host_fd(stream);
+        e.write_text(fd == 2 ? 2 : 1, s);
+        e.set_result(s.size());
     });
     ucrt("__acrt_iob_func", [](Emulator& e) {
         e.set_result(e.guest_file(static_cast<int>(e.arg_slot(0))));

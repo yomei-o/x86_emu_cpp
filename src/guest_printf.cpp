@@ -52,9 +52,12 @@ std::string pad(const std::string& s, int width, bool left_align) {
 // rounding match a real libc.
 }  // namespace
 
-std::string format_guest(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va) {
+std::string format_guest(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va, bool wide) {
     if (fmt_ptr == 0) return "(null)";
-    const std::string fmt = e.mem.read_cstring(fmt_ptr);
+    const std::string fmt = wide ? utf16_to_utf8(e, fmt_ptr, -1) : e.mem.read_cstring(fmt_ptr);
+    // In the wide family %s is a wchar_t* and %hs is a char*; in the narrow one
+    // it is the other way round.  `wide_string` tracks which this conversion is.
+    bool default_wide_strings = wide;
     std::string out;
 
     size_t i = 0;
@@ -114,6 +117,7 @@ std::string format_guest(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va) {
 
         // Length modifiers.  `long` is 4 bytes everywhere except 64-bit Linux.
         int int_bytes = 4;
+        bool wide_string = default_wide_strings;
         for (bool more = true; more && i < fmt.size();) {
             if (fmt.compare(i, 2, "hh") == 0) {
                 i += 2;
@@ -128,8 +132,10 @@ std::string format_guest(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va) {
                 int_bytes = 4;
             } else if (fmt[i] == 'h') {
                 ++i;
-            } else if (fmt[i] == 'l') {
+                wide_string = false;  // %hs is narrow even in a wide format
+            } else if (fmt[i] == 'l' || fmt[i] == 'w') {
                 ++i;
+                wide_string = true;   // %ls and %ws are wide even in a narrow one
                 int_bytes = (e.is64() && e.os() == Os::Linux) ? 8 : 4;
             } else if (fmt[i] == 'j' || fmt[i] == 'z' || fmt[i] == 't' || fmt[i] == 'I') {
                 ++i;
@@ -176,14 +182,34 @@ std::string format_guest(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va) {
                 break;
             }
             case 'c': {
-                char ch = static_cast<char>(va.next_int(4));
-                out += pad(std::string(1, ch), has_width ? width : 0,
-                           flags.find('-') != std::string::npos);
+                uint32_t code = static_cast<uint32_t>(va.next_int(4));
+                std::string ch;
+                if (wide_string && code > 0x7F) {
+                    // A wide character has to come back as UTF-8, not one byte.
+                    std::u16string one(1, static_cast<char16_t>(code));
+                    for (char16_t u : one) {
+                        if (u < 0x80) {
+                            ch += static_cast<char>(u);
+                        } else if (u < 0x800) {
+                            ch += static_cast<char>(0xC0 | (u >> 6));
+                            ch += static_cast<char>(0x80 | (u & 0x3F));
+                        } else {
+                            ch += static_cast<char>(0xE0 | (u >> 12));
+                            ch += static_cast<char>(0x80 | ((u >> 6) & 0x3F));
+                            ch += static_cast<char>(0x80 | (u & 0x3F));
+                        }
+                    }
+                } else {
+                    ch = std::string(1, static_cast<char>(code));
+                }
+                out += pad(ch, has_width ? width : 0, flags.find('-') != std::string::npos);
                 break;
             }
             case 's': {
                 uint64_t p = va.next_ptr();
-                std::string s = p ? e.mem.read_cstring(p) : "(null)";
+                std::string s = !p ? std::string("(null)")
+                              : wide_string ? utf16_to_utf8(e, p, -1)
+                                            : e.mem.read_cstring(p);
                 if (has_prec && static_cast<int>(s.size()) > prec)
                     s.resize(static_cast<size_t>(prec));
                 out += pad(s, has_width ? width : 0, flags.find('-') != std::string::npos);
