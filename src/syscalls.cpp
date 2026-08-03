@@ -79,9 +79,8 @@ constexpr int64_t kENOSYS = -38;
 constexpr int64_t kENOTTY = -25;
 constexpr int64_t kEBADF = -9;
 
-void host_write(int fd, const std::string& data) {
-    if (data.empty()) return;
-    std::fwrite(data.data(), 1, data.size(), fd == 2 ? stderr : stdout);
+void host_write(Emulator& e, int fd, const std::string& data) {
+    e.write_raw(fd, data.data(), data.size());
 }
 
 // Fills in just the fields a libc actually looks at after fstat: the file type
@@ -107,7 +106,7 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             uint64_t fd = a[0], buf = a[1], len = a[2];
             std::string data(static_cast<size_t>(len), '\0');
             if (len) e.mem.read(buf, data.data(), len);
-            host_write(static_cast<int>(fd), data);
+            host_write(e, static_cast<int>(fd), data);
             return static_cast<int64_t>(len);
         }
         case Sys::Writev: {
@@ -120,7 +119,7 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
                 uint64_t len = e.mem.read_sized(entry + ps, ps);
                 std::string data(static_cast<size_t>(len), '\0');
                 if (len) e.mem.read(base, data.data(), len);
-                host_write(static_cast<int>(fd), data);
+                host_write(e, static_cast<int>(fd), data);
                 total += len;
             }
             return static_cast<int64_t>(total);

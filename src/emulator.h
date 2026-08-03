@@ -46,6 +46,13 @@ public:
 
     // Loads the executable and prepares the initial guest state.
     void load(const std::string& path, const std::vector<std::string>& args);
+    // Same, for an image already in memory (used by the WebAssembly front end,
+    // which has no filesystem to read from).
+    void load_bytes(const std::vector<uint8_t>& file, const std::vector<std::string>& args);
+
+    // Where guest stdout/stderr bytes go.  Unset means the host's own streams;
+    // a front end that is not a terminal (the browser demo) installs its own.
+    std::function<void(int /*fd*/, const char* /*data*/, size_t /*len*/)> output_sink;
     // Runs until the guest exits.  Returns its exit code.
     int run();
 
@@ -103,6 +110,13 @@ public:
     uint64_t heap_block_size(uint64_t addr) const;
     uint64_t alloc_guest_data(const void* data, uint64_t size);
     uint64_t alloc_guest_string(const std::string& s);
+
+    // ---- guest output ------------------------------------------------------
+    // Writes to a guest stdio stream (fd 1 or 2).  `write_text` goes through the
+    // newline translation a Windows CRT would apply; `write_raw` is a byte
+    // channel, which is what WriteFile and the Linux write() syscall are.
+    void write_text(int fd, const std::string& data);
+    void write_raw(int fd, const void* data, size_t len);
 
     // stdio: guest FILE* values are synthetic objects the emulator owns.
     uint64_t guest_file(int fd);

@@ -216,9 +216,7 @@ std::string format(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va) {
 }
 
 void write_out(Emulator& e, int fd, const std::string& s) {
-    std::FILE* f = fd == 2 ? stderr : stdout;
-    if (!s.empty()) std::fwrite(s.data(), 1, s.size(), f);
-    (void)e;
+    e.write_text(fd, s);
 }
 
 // Resolves a guest FILE* to a host stream, defaulting to stdout when the guest
@@ -467,7 +465,8 @@ void Emulator::install_library_hooks() {
         uint64_t written_ptr = e.arg_slot(3);
         std::string data(static_cast<size_t>(len), '\0');
         if (len) e.mem.read(buf, data.data(), len);
-        write_out(e, handle == 3 ? 2 : 1, data);
+        // WriteFile is a raw byte channel even on Windows: no text translation.
+        e.write_raw(handle == 3 ? 2 : 1, data.data(), data.size());
         if (written_ptr) e.mem.write32(written_ptr, static_cast<uint32_t>(len));
         e.set_result(1);
     };

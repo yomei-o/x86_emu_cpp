@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>x86emu - run an .exe in your browser</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --dim: #8b949e;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --err: #f85149;
+    --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px 48px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h1 code { font-size: 0.95em; color: var(--accent); }
+  .sub { color: var(--dim); margin: 0 0 24px; }
+  .sub a { color: var(--accent); }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--dim); margin: 0 0 12px; font-weight: 600;
+  }
+
+  #drop {
+    border: 1.5px dashed var(--border);
+    border-radius: 8px;
+    padding: 28px 16px;
+    text-align: center;
+    color: var(--dim);
+    transition: border-color .15s, background .15s;
+    cursor: pointer;
+  }
+  #drop.over { border-color: var(--accent); background: #58a6ff14; color: var(--fg); }
+  #drop strong { color: var(--fg); font-weight: 600; }
+
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button {
+    font: inherit; font-size: 0.875rem;
+    background: #21262d; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: #8b949e; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  label.opt { font-size: 0.875rem; color: var(--dim); display: inline-flex; gap: 6px; align-items: center; }
+
+  #term {
+    background: #010409;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    min-height: 260px;
+    max-height: 55vh;
+    overflow: auto;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #term .stderr { color: var(--warn); }
+  #term .note   { color: var(--dim); }
+  #term .fail   { color: var(--err); }
+  #term .done   { color: var(--ok); }
+
+  #status { margin-top: 10px; font-size: 0.8125rem; color: var(--dim); }
+  #status b { color: var(--fg); font-weight: 600; }
+  footer { color: var(--dim); font-size: 0.8125rem; margin-top: 24px; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Run an <code>.exe</code> in your browser</h1>
+  <p class="sub">
+    <a href="https://github.com/yomei-o/x86_emu_cpp">x86emu</a> is a small x86-32/x86-64
+    interpreter in C++, compiled here to WebAssembly. Drop in a Windows PE or a Linux
+    ELF executable and it runs the machine code instruction by instruction — library
+    calls like <code>printf</code> are intercepted and serviced by the emulator, so the
+    output lands in the console below.
+  </p>
+
+  <div class="panel">
+    <h2>Program</h2>
+    <div id="drop">
+      <strong>Drop an .exe here</strong> or click to choose a file<br>
+      <span style="font-size:.875rem">PE32 / PE32+ / ELF32 / ELF64, 32- or 64-bit</span>
+    </div>
+    <input id="file" type="file" hidden>
+    <div class="row" style="margin-top:12px">
+      <span style="font-size:.8125rem;color:var(--dim)">or a sample:</span>
+      <span id="samples" class="row"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Run</h2>
+    <div class="row">
+      <button id="run" class="primary" disabled>Run</button>
+      <button id="clear">Clear console</button>
+      <label class="opt"><input type="checkbox" id="tracecalls"> log intercepted calls</label>
+    </div>
+    <div id="term"></div>
+    <div id="status">Loading WebAssembly module…</div>
+  </div>
+
+  <footer>
+    No files leave your browser: the emulator runs entirely client-side.
+    Guest floating-point arithmetic (x87/SSE) is not emulated yet, and ELF images
+    must be statically linked — see the repository README for the current limits.
+  </footer>
+</main>
+
+<script src="samples.js"></script>
+<script src="x86emu.js"></script>
+<script>
+(function () {
+  const term = document.getElementById('term');
+  const statusEl = document.getElementById('status');
+  const runBtn = document.getElementById('run');
+  const dropEl = document.getElementById('drop');
+  const fileEl = document.getElementById('file');
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+
+  let mod = null;
+  let program = null;      // { name, bytes }
+  let pendingLine = { 1: '', 2: '' };
+
+  function append(text, cls) {
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = text;
+    term.appendChild(span);
+    term.scrollTop = term.scrollHeight;
+  }
+
+  // Guest output arrives as raw bytes, possibly split mid-sequence, so decode
+  // with streaming and drop the CR of a Windows guest's CRLF for display.
+  globalThis.x86emuOutput = function (fd, bytes) {
+    const text = decoder.decode(bytes, { stream: true }).replace(/\r\n?/g, '\n');
+    append(text, fd === 2 ? 'stderr' : null);
+  };
+  globalThis.x86emuLog = function (text) { append(text + '\n', 'note'); };
+
+  function setProgram(name, bytes) {
+    program = { name, bytes };
+    runBtn.disabled = !mod;
+    statusEl.innerHTML = `<b>${name}</b> — ${bytes.length.toLocaleString()} bytes, ready`;
+  }
+
+  function run() {
+    if (!mod || !program) return;
+    term.textContent = '';
+    append(`$ x86emu ${program.name}\n`, 'note');
+
+    const bytes = program.bytes;
+    const ptr = mod._malloc(bytes.length);
+    mod.HEAPU8.set(bytes, ptr);
+    let code;
+    const started = performance.now();
+    try {
+      code = mod.ccall('emu_run', 'number',
+                       ['number', 'number', 'number', 'number'],
+                       [ptr, bytes.length,
+                        document.getElementById('tracecalls').checked ? 1 : 0,
+                        200000000]);
+    } finally {
+      mod._free(ptr);
+    }
+    const ms = performance.now() - started;
+    const insns = mod.ccall('emu_instructions', 'number', [], []);
+    const fmt = mod.ccall('emu_format', 'string', [], []);
+
+    if (code < 0) {
+      const err = mod.ccall('emu_error', 'string', [], []);
+      append('\nx86emu: ' + err + '\n', 'fail');
+      statusEl.innerHTML = `<b>failed</b> — ${err}`;
+    } else {
+      append(`\n[exit ${code}]\n`, 'done');
+      statusEl.innerHTML = `<b>${fmt}</b> — exit ${code}, ` +
+        `${insns.toLocaleString()} instructions in ${ms.toFixed(1)} ms`;
+    }
+  }
+
+  // ---- input sources ------------------------------------------------------
+  function readFile(f) {
+    const reader = new FileReader();
+    reader.onload = () => setProgram(f.name, new Uint8Array(reader.result));
+    reader.readAsArrayBuffer(f);
+  }
+  dropEl.addEventListener('click', () => fileEl.click());
+  fileEl.addEventListener('change', () => { if (fileEl.files[0]) readFile(fileEl.files[0]); });
+  ['dragenter', 'dragover'].forEach(ev => dropEl.addEventListener(ev, e => {
+    e.preventDefault(); dropEl.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach(ev => dropEl.addEventListener(ev, e => {
+    e.preventDefault(); dropEl.classList.remove('over');
+  }));
+  dropEl.addEventListener('drop', e => {
+    const f = e.dataTransfer.files[0];
+    if (f) readFile(f);
+  });
+
+  (globalThis.X86EMU_SAMPLES || []).forEach(s => {
+    const b = document.createElement('button');
+    b.textContent = s.label;
+    b.addEventListener('click', () => {
+      const raw = atob(s.data);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      setProgram(s.key, bytes);
+      run();
+    });
+    document.getElementById('samples').appendChild(b);
+  });
+
+  runBtn.addEventListener('click', run);
+  document.getElementById('clear').addEventListener('click', () => { term.textContent = ''; });
+
+  createX86Emu().then(m => {
+    mod = m;
+    statusEl.textContent = 'Ready — pick a sample or drop in an executable.';
+    if (program) runBtn.disabled = false;
+  }).catch(err => {
+    statusEl.innerHTML = '<b>failed to load WebAssembly module</b>';
+    append(String(err) + '\n', 'fail');
+  });
+})();
+</script>
+</body>
+</html>

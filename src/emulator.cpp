@@ -255,6 +255,35 @@ uint64_t Emulator::alloc_guest_string(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
+// Guest output
+// ---------------------------------------------------------------------------
+
+void Emulator::write_raw(int fd, const void* data, size_t len) {
+    if (!len) return;
+    if (output_sink)
+        output_sink(fd, static_cast<const char*>(data), len);
+    else
+        std::fwrite(data, 1, len, fd == 2 ? stderr : stdout);
+}
+
+void Emulator::write_text(int fd, const std::string& data) {
+    if (os() != Os::Windows) {
+        write_raw(fd, data.data(), data.size());
+        return;
+    }
+    // A Windows CRT opens the console streams in text mode, so a guest printing
+    // "\n" really emits CRLF.  Translating here rather than leaning on the
+    // host's C runtime keeps guest output byte-identical on every host OS.
+    std::string out;
+    out.reserve(data.size() + data.size() / 16 + 8);
+    for (char c : data) {
+        if (c == '\n') out += '\r';
+        out += c;
+    }
+    write_raw(fd, out.data(), out.size());
+}
+
+// ---------------------------------------------------------------------------
 // Synthetic stdio streams
 // ---------------------------------------------------------------------------
 
@@ -381,8 +410,11 @@ void Emulator::setup_linux_stack(const std::vector<std::string>& args) {
 }
 
 void Emulator::load(const std::string& path, const std::vector<std::string>& args) {
+    load_bytes(read_file(path), args);
+}
+
+void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<std::string>& args) {
     args_ = args;
-    std::vector<uint8_t> file = read_file(path);
 
     // The layout and the hook addresses depend on the bitness, and PE import
     // binding needs the hook addresses, so peek at the headers first.
@@ -416,14 +448,11 @@ void Emulator::load(const std::string& path, const std::vector<std::string>& arg
         choose_layout();
     }
 
-    // A Linux guest's write() is a raw byte channel, so on a Windows host the
-    // streams must not translate LF into CRLF.  Windows guests keep the
-    // translation, because that is what the msvcrt printf we replaced would do.
+    // Guest bytes must reach the console exactly as the guest wrote them; any
+    // newline translation a Windows guest needs is done in write_text().
 #if defined(_WIN32)
-    if (os_kind == Os::Linux) {
-        _setmode(_fileno(stdout), _O_BINARY);
-        _setmode(_fileno(stderr), _O_BINARY);
-    }
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
 #endif
 
     cpu_->on_hook_call = [this](uint64_t addr) { return dispatch_hook(addr); };
