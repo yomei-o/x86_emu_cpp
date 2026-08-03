@@ -19,9 +19,24 @@ byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
 The remaining work is breadth, not architecture. Nothing below needs a new
 subsystem except the ELF dynamic linker.
 
-## Next: CPython on Linux
+## Done 2026-08-03 (MSVC, browser CPython, Linux CPython)
 
-The goal. A Linux CPython is a different shape of problem from the Windows one:
+- **Builds cleanly with MSVC** now (cl.exe and the VS 2022 CMake generator, 0/0
+  warnings). The only blocker was two comments holding literal NUL bytes;
+  `CMakeLists.txt` globs `src/*.cpp` and sets `/utf-8 /EHsc` + NOMINMAX.
+- **CPython runs in the browser.** `emu_run_path(path, argv)` runs a program from
+  MEMFS with a real argv; the page (`web/index.html` + `web/worker.js`, off the
+  main thread) has one-click **Windows** and **Linux** CPython, both bundled
+  (`web/py/`, `web/pylinux/*.gz` unpacked client-side). Headless proofs:
+  `web/test_python.mjs`, `web/test_python_linux.mjs`, `web/test_python_linux_bundled.mjs`.
+- **Linux CPython works** (the section below is now DONE). A *static* musl build
+  was the key: no libc.so to supply, musl is linked in, only syscalls are emulated.
+  Gaps closed: SSE2 `PACKSSDW` (0F 6B), `/proc/self/exe` readlink, real `getcwd`,
+  `getdents64` + `openat` O_DIRECTORY routing, `fcntl` (FD_CLOEXEC no-ops).
+
+## Next: CPython on Linux  — DONE 2026-08-03 (kept for the bring-up notes)
+
+A Linux CPython is a different shape of problem from the Windows one:
 there is no import table to hook, so everything goes through the kernel
 interface in `src/syscalls.cpp`.
 
@@ -195,18 +210,74 @@ the output against the same script run by a native CPython. Exactly the check
 that `tests/run_tests.sh` does for the native builds. The DOM wiring is the last
 step, not the first.
 
+## Next: dynamic linking (real libc.so), and the ARM/macOS question
+
+Today's Linux CPython works only because it is *statically* linked (musl in the
+binary, `.so` count = 0, all extension modules builtin, `lib-dynload/` empty).
+That let us skip the dynamic linker entirely and emulate only syscalls. The next
+step is to run *dynamically* linked ELFs — i.e. supply/handle real `libc.so`, so a
+stock distro or python.org Linux Python runs without hunting for a `+static` build.
+
+**Windows is effectively already done** — a program's own DLLs load for real
+(`modules.cpp`: relocation, exports, `DllMain`, static TLS); only the system libc
+(`ucrtbase`/`msvcrt`) is *hooked*, by design, because loading a real `kernel32`
+would mean emulating the NT kernel beneath it. Leave it hooked.
+
+**Linux dynamic linking — the plan.** Two routes (route 2 preferred):
+
+1. *Implement the dynamic linker ourselves* — parse `PT_DYNAMIC`/`DT_NEEDED`, map
+   each `.so` (ET_DYN) at a base, apply relocations (`R_X86_64_RELATIVE`,
+   `GLOB_DAT`, `JUMP_SLOT`), resolve symbols across modules. Bounded, but we own
+   every detail.
+2. *Load the real `ld.so` and let it link* — map `ld-musl-x86_64.so.1` (or
+   `ld-linux-x86-64.so.2`), build a correct **auxv** (`AT_PHDR`, `AT_PHENT`,
+   `AT_PHNUM`, `AT_BASE`, `AT_ENTRY`, `AT_HWCAP`, `AT_RANDOM`, `AT_PAGESZ`), jump to
+   ld.so's entry, and the real loader mmaps + relocates the libraries itself. Gets
+   *every* dynamic binary at once.
+
+Either way, **libc.so's code runs in-guest and the syscall layer built today is
+reused unchanged.** New mechanics needed:
+
+- **Accept `ET_DYN`** in `elf_loader.cpp` (load at a base; apply base relocations).
+- **File-backed `mmap` + `MAP_FIXED` + `mprotect`** — ld.so maps `.so` regions from
+  a file descriptor; today's `mmap` is anonymous-oriented. This is the core piece.
+- **auxv correctness** (route 2) or a **relocation engine** (route 1).
+- **Multi-module TLS** (glibc uses TLS variant II heavily; `arch_prctl` exists but
+  per-module TLS blocks are more).
+
+**Order:** bring up **musl's `ld` first** (small, simple), then glibc (its `ld.so`
+wants IFUNC resolution, `AT_HWCAP` CPU probing, and richer TLS — a step harder).
+A dynamically-linked musl CPython from `python-build-standalone` (the non-`+static`
+`install_only`, which is `ET_DYN` + `PT_INTERP=/lib/ld-musl-x86_64.so.1`) is the
+natural first target; `pylinux/` already has one downloaded to test against.
+
+**The ARM-Mac idea (why it's much bigger).** Running an Apple-Silicon macOS Python
+on Windows is possible *in principle* — the design ("interpret an ISA + supply the
+OS/library layer") generalizes — but it changes three axes at once: **AArch64**
+interpreter (new `cpu`), **Mach-O** loader (incl. fat/universal), and **Darwin**
+(XNU syscalls via `svc #0x80` **plus Mach traps** — `mach_msg`, ports). The killer
+detail ties back to today's discussion: **macOS ships no static libc** — Apple does
+not support static linking, so every macOS binary links `/usr/lib/libSystem.B.dylib`
+(and Python.framework pulls in CoreFoundation). The static shortcut is unavailable,
+so you must do dynamic linking of dylibs — either **hook libSystem** (Windows-style,
+but a huge API surface) or **run dyld + emulate Mach traps** (needs real Apple
+dylibs and the Mach layer). That OS layer is a bigger mountain than the ISA change.
+
+**Recommended stepping stone:** add an **AArch64 interpreter and run a static
+`aarch64-unknown-linux-musl` CPython first.** That reuses today's ELF loader *and*
+syscall layer wholesale and keeps the static shortcut — it is "the ARM version of
+what already works." Mach-O + Darwin/libSystem come only after that, if the macOS
+target is really wanted.
+
 ## Also unfinished
 
 - **C++ and SEH exception unwinding.** Installing a handler works; throwing does
   not. Needs the `.pdata`/`.xdata` tables walked on x64 and the `fs:[0]` chain on
   x86. `tests/msvc/exc_msvc.cpp` is built but excluded from the suite, waiting for
   it.
-- **ELF `ET_DYN`/PIE and dynamic linking.** Rejected at load time today. Two
-  routes: implement the dynamic linker (parse `PT_DYNAMIC`, `DT_NEEDED`,
-  relocations, symbol resolution), or — probably better — load
-  `ld-linux-x86-64.so.2` itself and let it do that work, which mainly requires
-  `mmap` with `MAP_FIXED`, `mprotect`, and the `AT_*` auxiliary vector being
-  right. The second route gets every dynamically linked binary at once.
+- **ELF `ET_DYN`/PIE and dynamic linking.** Rejected at load time today. This is
+  the "real libc.so" work — see the dedicated **Next: dynamic linking** section
+  above for the full plan (routes, mmap/MAP_FIXED, auxv, TLS, musl-first).
 - **Processes and pipes.** `CreateProcess`, `CreatePipe`, `fork`/`execve`. This is
   the one thing CPython on Windows still cannot do: `platform.uname()` wants a
   subprocess.
