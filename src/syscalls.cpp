@@ -21,8 +21,10 @@ enum class Sys {
     Read, Write, Writev, Close, Fstat, Ioctl,
     Mmap, Munmap, Brk,
     Exit, ExitGroup,
-    Getpid, Uname, ClockGettime, Time,
+    Getpid, Gettid, Uname, ClockGettime, Time,
     ArchPrctl, SetTidAddress, RtSigaction, RtSigprocmask, SetThreadArea,
+    Mprotect, Madvise, Futex, GetRandom, Readlink, Openat, SetRobustList,
+    Prlimit64, GetIds, SchedGetaffinity, Ignored, NotImplemented,
 };
 
 Sys map_x86_64(uint64_t nr) {
@@ -38,14 +40,27 @@ Sys map_x86_64(uint64_t nr) {
         case 14: return Sys::RtSigprocmask;
         case 16: return Sys::Ioctl;
         case 20: return Sys::Writev;
+        case 10: return Sys::Mprotect;
+        case 28: return Sys::Madvise;
         case 39: return Sys::Getpid;
         case 60: return Sys::Exit;
         case 63: return Sys::Uname;
         case 96: return Sys::Time;
+        case 89: return Sys::Readlink;
+        case 97: return Sys::Prlimit64;   // getrlimit, close enough
+        case 102: case 104: case 107: case 108: return Sys::GetIds;
         case 158: return Sys::ArchPrctl;
+        case 186: return Sys::Gettid;
+        case 202: return Sys::Futex;
+        case 204: return Sys::SchedGetaffinity;
         case 218: return Sys::SetTidAddress;
         case 228: return Sys::ClockGettime;
         case 231: return Sys::ExitGroup;
+        case 257: return Sys::Openat;
+        case 273: return Sys::SetRobustList;
+        case 302: return Sys::Prlimit64;
+        case 318: return Sys::GetRandom;
+        case 334: return Sys::Ignored;    // rseq
         default: return Sys::Unknown;
     }
 }
@@ -71,6 +86,16 @@ Sys map_i386(uint64_t nr) {
         case 252: return Sys::ExitGroup;
         case 258: return Sys::SetTidAddress;
         case 265: return Sys::ClockGettime;
+        case 125: return Sys::Mprotect;
+        case 219: return Sys::Madvise;
+        case 240: return Sys::Futex;
+        case 224: return Sys::Gettid;
+        case 85: return Sys::Readlink;
+        case 295: return Sys::Openat;
+        case 311: return Sys::SetRobustList;
+        case 340: return Sys::Prlimit64;
+        case 355: return Sys::GetRandom;
+        case 199: case 200: case 201: case 202: return Sys::GetIds;
         default: return Sys::Unknown;
     }
 }
@@ -179,13 +204,73 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             }
             return 0;
         }
-        // Thread/signal setup a static libc performs at startup; pretending it
-        // succeeded is enough because nothing here is ever delivered.
-        case Sys::ArchPrctl:
+        case Sys::ArchPrctl: {
+            // glibc puts its thread-local storage behind fs: on x86-64, so this
+            // one cannot be a stub - ignoring it leaves every TLS access
+            // dereferencing a null segment base.
+            constexpr uint64_t kSetGs = 0x1001, kSetFs = 0x1002;
+            constexpr uint64_t kGetFs = 0x1003, kGetGs = 0x1004;
+            switch (a[0]) {
+                case kSetFs: e.cpu().fs_base = a[1]; return 0;
+                case kSetGs: e.cpu().gs_base = a[1]; return 0;
+                case kGetFs: e.mem.write64(a[1], e.cpu().fs_base); return 0;
+                case kGetGs: e.mem.write64(a[1], e.cpu().gs_base); return 0;
+                default: return -22;  // EINVAL
+            }
+        }
+        case Sys::SetThreadArea: {
+            // The 32-bit equivalent: a struct user_desc whose base_addr becomes
+            // what gs: resolves to.  entry_number -1 means "pick one for me".
+            uint64_t desc = a[0];
+            uint32_t entry = e.mem.read32(desc);
+            if (entry == 0xFFFFFFFFu) e.mem.write32(desc, 12);  // any free slot
+            e.cpu().gs_base = e.mem.read32(desc + 4);           // base_addr
+            return 0;
+        }
+        case Sys::GetRandom: {
+            // Deterministic bytes: reproducible runs beat unpredictability here,
+            // and nothing in the emulator is trying to be cryptographically sound.
+            uint64_t buf = a[0], len = a[1];
+            uint32_t state = 0x12345678u;
+            for (uint64_t i = 0; i < len; ++i) {
+                state = state * 1103515245u + 12345u;
+                e.mem.write8(buf + i, static_cast<uint8_t>(state >> 16));
+            }
+            return static_cast<int64_t>(len);
+        }
+        case Sys::Prlimit64: {
+            // Report a generous, fixed stack and file-descriptor limit.
+            uint64_t out = a[3] ? a[3] : a[1];
+            if (out) {
+                e.mem.write64(out, 8ull << 20);       // rlim_cur
+                e.mem.write64(out + 8, ~0ull);        // rlim_max
+            }
+            return 0;
+        }
+        case Sys::SchedGetaffinity: {
+            uint64_t mask = a[2];
+            if (mask) e.mem.write64(mask, 1);  // one CPU
+            return 8;
+        }
+        case Sys::Gettid:
+            return 4242;
+        case Sys::GetIds:
+            return 0;  // running as root, which nothing here checks
+        case Sys::Readlink:
+            return -22;  // EINVAL: not a symlink
+        case Sys::Openat:
+            return -2;   // ENOENT: there is no filesystem
+        // Signal handling, futexes and memory advice: a static libc sets these up
+        // at startup, and since nothing is ever delivered and there is only one
+        // thread, reporting success is accurate.
         case Sys::SetTidAddress:
         case Sys::RtSigaction:
         case Sys::RtSigprocmask:
-        case Sys::SetThreadArea:
+        case Sys::Mprotect:
+        case Sys::Madvise:
+        case Sys::Futex:
+        case Sys::SetRobustList:
+        case Sys::Ignored:
             return 0;
         default:
             return kENOSYS;

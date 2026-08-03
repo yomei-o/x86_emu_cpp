@@ -3,83 +3,107 @@
 A small user-mode x86 emulator in C++17. It loads a Windows PE or Linux ELF
 executable, interprets the machine code instruction by instruction, and prints
 `hello` — because library calls like `printf` are intercepted and run natively on
-the host instead of being emulated.
+the host.
 
-Both bitnesses are supported: **x86-32** and **x86-64**.
+**Both bitnesses** (x86-32 and x86-64), **both OSes**, and the two are
+independent: a Windows `.exe` runs on Linux and a Linux binary runs on Windows,
+because the emulator supplies the library and kernel interfaces itself. It also
+compiles to WebAssembly, so the same emulator runs an `.exe` in a browser tab.
 
 ```console
-$ ./x86emu tests/bin/hello64.exe
-hello from the guest!
-integers : -42 3000000000 00007 +7 beef BEEF
-strings  : [abc] [       abc] [abc       ] [abc]
-chars    : x86
-loop 1 of 3
-loop 2 of 3
-loop 3 of 3
+$ ./x86emu hello.exe                        # a Visual Studio build, on Linux
+hello
+42 world ! 03.14
 ```
 
-No dependencies beyond a C++17 standard library. The emulator itself is
-host-independent; only the optional CRLF handling is Windows-specific.
+No dependencies beyond a C++17 standard library.
+
+## What actually runs
+
+Verified by diffing emulated output against real native execution, byte for byte:
+
+| guest | 32-bit | 64-bit |
+| --- | --- | --- |
+| mingw-w64 gcc, freestanding, imports from `msvcrt.dll` | ✅ | ✅ |
+| Visual Studio 2022, `/MD` (CRT in `ucrtbase.dll`) | ✅ | ✅ |
+| Visual Studio 2022, `/MT` (CRT statically linked, runs inside the guest) | ✅ | ✅ |
+| gcc + glibc, `-static` (real libc inside the guest, kernel emulated) | — | ✅ |
+| hand-assembled ELF using raw syscalls | ✅ | ✅ |
+
+The Visual Studio and static-glibc cases matter because everything before `main`
+is real: CPU feature probing, TLS setup, locale and stdio initialisation, table
+walks of static initialisers, and the runtime's own `printf` doing its own
+floating-point conversion.
 
 ## How it works
 
 ```
   executable ──► loader ──► guest memory ──► interpreter ──► hook dispatch
    PE / ELF      map        sparse pages     cpu.cpp         host printf()
-                 imports
+                 imports                     sse.cpp         or a syscall
+                                             x87.cpp
 ```
 
 **Loading.** `pe_loader.cpp` maps the image at its preferred `ImageBase` (so no
-relocation processing is needed) and `elf_loader.cpp` maps `PT_LOAD` segments.
-Guest memory (`memory.h`) is a hash map of 4 KiB pages created on demand; an
-access to an unmapped address raises a fault instead of quietly reading zeroes.
+relocation processing is needed) and `elf_loader.cpp` maps `PT_LOAD` segments and
+builds the System V initial stack. Guest memory (`memory.h`) is a hash map of
+4 KiB pages created on demand; an access to an unmapped address raises a fault
+instead of quietly reading zeroes.
 
-**Interpreting.** `cpu.cpp` is a plain decode-and-execute loop covering the
-user-mode integer subset that compilers actually emit: the ALU group, ModRM/SIB
-addressing, `Jcc`/`SETcc`/`CMOVcc`, shifts and rotates, `MUL`/`DIV` in all four
-widths, string operations with `rep`, and the usual `0F` two-byte opcodes.
-Register state is stored 64-bit wide; a mode flag decides the default operand
-size, whether REX prefixes exist, how wide a stack slot is, and whether
-`mod=00 rm=101` means RIP-relative or absolute. Anything unimplemented raises an
-error naming the opcode and address rather than silently doing nothing.
+**Interpreting.** `cpu.cpp` is a decode-and-execute loop covering the user-mode
+integer subset compilers emit: the ALU group, ModRM/SIB addressing,
+`Jcc`/`SETcc`/`CMOVcc`, shifts, rotates and `SHLD`/`SHRD`, `MUL`/`DIV` in all four
+widths, string operations with `rep`, and the `0F` two-byte opcodes. Register
+state is stored 64-bit wide; a mode flag decides the default operand size,
+whether REX prefixes exist, how wide a stack slot is, and whether
+`mod=00 rm=101` means RIP-relative or absolute.
 
-**Hooking.** This is the part that makes a `hello` possible without emulating a
-C runtime. Every function the emulator implements gets a unique fake address in
-an otherwise unused region of the guest address space, and the PE loader writes
-those addresses into the import table. The guest still executes its own
-`jmp [__imp_printf]` thunk — it just lands in the hook region, where the CPU
-notices before fetching an instruction, runs the host implementation, and
-performs the return itself:
+`sse.cpp` adds SSE/SSE2 (plus the few SSE3/SSSE3/SSE4.1 opcodes compilers reach
+for) and `x87.cpp` the floating-point stack. Neither is optional decoration: MSVC
+and glibc both use SSE2 for ordinary `double` arithmetic and inside
+`memcpy`/`strlen`, and a 32-bit CRT formats `%f` on the x87 stack. Anything
+unimplemented raises an error naming the opcode and address rather than silently
+doing nothing — which is what makes bringing up a new guest a matter of following
+the messages.
+
+**Hooking.** This is what makes a `hello` possible without emulating a C runtime.
+Every function the emulator implements gets a unique fake address in an unused
+region of the guest address space, and the PE loader writes those addresses into
+the import table. The guest still executes its own `jmp [__imp_printf]` thunk — it
+just lands in the hook region, where the CPU notices before fetching an
+instruction, runs the host implementation, and performs the return itself:
 
 ```
 guest:  call printf  ──► thunk: jmp [IAT]  ──► 0x7A0000A0   (a hook address)
                                                     │
 host:                              hooks.cpp printf ◄┘  reads args per ABI,
-                                                        formats, fwrite(), sets EAX
+                                                        formats, writes, sets EAX
 ```
 
 Argument reading is ABI-aware (`Emulator::Args`), covering 32-bit cdecl/stdcall,
 Microsoft x64 (`RCX, RDX, R8, R9` plus shadow space) and SysV x64
-(`RDI, RSI, RDX, RCX, R8, R9`). The `printf` conversions are parsed out of the
-guest format string and handed to the host `snprintf`, so padding, precision and
-rounding match a real libc.
+(`RDI, RSI, RDX, RCX, R8, R9`, with floating-point arguments in `XMM0-7`).
+`printf` conversions are parsed out of the guest format string and handed to the
+host `snprintf`, so padding, precision and rounding match a real libc. Hooks can
+also call *back* into the guest (`Emulator::call_guest`), which is how `_initterm`
+runs a C++ program's static constructors.
 
 **Linux guests** have nothing to hook by name: a statically linked ELF talks
-straight to the kernel. `syscalls.cpp` implements that interface instead, for
-both `syscall` (x86-64) and `int 0x80` (i386) — `write`, `writev`, `brk`, `mmap`,
-`fstat`, `exit_group` and friends.
+straight to the kernel. `syscalls.cpp` implements that interface instead, for both
+`syscall` (x86-64) and `int 0x80` (i386) — `write`, `writev`, `brk`, `mmap`,
+`fstat`, `arch_prctl` (which is where glibc's thread-local storage comes from),
+`exit_group` and friends.
 
 ## Building
 
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
 
-Or without CMake:
+or without CMake:
 
 ```sh
-g++ -std=c++17 -O2 -Isrc -o x86emu src/*.cpp
+sh build.sh          # or: g++ -std=c++17 -O2 -Isrc -o x86emu src/*.cpp
 ```
 
 ## Running
@@ -91,6 +115,7 @@ usage: x86emu [options] <program> [guest args...]
   -c, --trace-calls    log intercepted library calls and syscalls
   -m, --map            print the guest memory map after loading
   -n, --max-insns N    stop after N instructions (0 = unlimited)
+  -d, --dump ADDR[:N]  hex dump N bytes of guest memory after loading
 ```
 
 `--trace-calls` is usually the fastest way to see what a guest is doing:
@@ -99,76 +124,116 @@ usage: x86emu [options] <program> [guest args...]
 $ ./x86emu -c tests/bin/hello_elf64
 [sys] 1
 hello from the ELF guest!
-[sys] 1
-count = 1
 ...
 [exit] code 7 after 34 instructions
 ```
 
-## Tests
+## Browser demo
 
-The PE test programs run natively on Windows, so the strongest available check
-is a byte-for-byte diff of emulated output against real execution. `arith.c`
-exists for exactly that: it prints the results of signed and unsigned division,
-shifts of every width, sign extension, 64-bit multiply/divide and bit twiddling,
-so a mistake in flags or sign handling shows up as a differing line.
+The emulator core has no OS dependencies, so it compiles to WebAssembly as is.
+`web/index.html` is a page where dropping in a PE or ELF runs it and prints the
+guest's output to a console view.
 
 ```sh
-sh tests/build_pe_tests.sh      # needs mingw-w64 gcc + dlltool
+sh web/make_samples.sh                     # bake the test binaries into the page
+EMCC=/path/to/emcc sh web/build.sh         # produces a self-contained web/x86emu.js
+node web/test_node.mjs                     # drives the same wasm build headlessly
+```
+
+Serve `web/` over http and open `index.html`. Nothing leaves the browser.
+
+## Tests
+
+```sh
+sh build.sh
+sh tests/build_pe_tests.sh      # mingw-w64 gcc + dlltool
 ./gen_elf_tests tests/bin       # from tools/gen_elf_tests.cpp
+tests\msvc\build.bat            # Visual Studio 2022 (Windows only)
+sh tests/linux/build.sh         # gcc targeting x86 Linux, run on a Linux host
 sh tests/run_tests.sh
 ```
 
 ```
+emulator: ./x86emu on Linux aarch64
 PE guests (emulated output vs. native execution)
   ok    tests/bin/arith32.exe (matches native, exit 0)
-  ok    tests/bin/arith64.exe (matches native, exit 0)
-  ok    tests/bin/hello32.exe (matches native, exit 0)
-  ok    tests/bin/hello64.exe (matches native, exit 0)
+  ...
+MSVC guests (emulated output vs. native execution)
+  ok    tests/msvc/bin/fmt_msvc_MT32.exe (matches native, exit 0)
+  ...
 ELF guests (emulated output vs. recorded expectation)
-  ok    tests/bin/hello_elf32 (matches expectation, exit 7)
-  ok    tests/bin/hello_elf64 (matches expectation, exit 7)
+  ok    tests/bin/hello_gcc64 (matches expectation, exit 3)
+
+17 passed, 0 failed
 ```
 
-The test programs are built freestanding (`-nostdlib`, own entry point) and
-import `printf`/`exit` straight from `msvcrt.dll`, which keeps the import table
-small and skips the CRT startup — so a failure points at the emulator rather than
-at a C runtime. The 32-bit import library is generated on the fly with
-`dlltool`, so no 32-bit libraries need to be installed. The ELF binaries are
-assembled by hand by `tools/gen_elf_tests.cpp`, which avoids needing a Linux
+Where a guest can also run natively, the check is a byte-for-byte diff against
+real execution — the strongest signal available, and the reason the test programs
+print so much:
+
+- `tests/arith.c` — signed and unsigned division, shifts of every width, sign
+  extension, 64-bit multiply/divide, so a mistake in flags or sign handling shows
+  up as a differing line.
+- `tests/insn.c` — inline assembly naming instructions directly (`SHLD`/`SHRD`,
+  rotates, `BSF`/`BSR`, `ADC`/`SBB` chains, all sixteen `SETcc`, `CMPXCHG`,
+  `XADD`, the `BT` group, `REP MOVSB`/`STOSB`/`SCASB`), so a failure says which
+  instruction rather than which program.
+- `tests/msvc/fmt_msvc.cpp` — floating-point formatting through a real Microsoft
+  C runtime. The 32-bit `/MT` build does this on the x87 stack while switching
+  the rounding mode around `FRNDINT`, which is exactly the case an emulator that
+  ignores the control word gets wrong.
+
+The freestanding PE tests are built with `-nostdlib` and their own entry point,
+importing straight from `msvcrt.dll`, so a failure points at the emulator rather
+than at a C runtime. The 32-bit import library is generated on the fly with
+`dlltool`, so no 32-bit libraries need to be installed. The ELF binaries in
+`tools/gen_elf_tests.cpp` are assembled by hand, which avoids needing a Linux
 cross toolchain and keeps the syscall path under test explicit.
+
+Cross-host checks use `tests/run_cross.sh`, which runs every guest under an
+emulator built for the current host and prints which host that was.
 
 ## Layout
 
 | file | what it does |
 | --- | --- |
 | `src/memory.{h,cpp}` | sparse paged guest memory, 64-bit addresses |
-| `src/cpu.{h,cpp}` | the x86-32/x86-64 interpreter |
+| `src/cpu.{h,cpp}` | the x86-32/x86-64 integer interpreter |
+| `src/sse.cpp` | SSE/SSE2 and the XMM register file |
+| `src/x87.cpp` | the x87 floating-point stack |
 | `src/emulator.{h,cpp}` | address-space layout, hook dispatch, ABI glue, heap |
 | `src/pe_loader.cpp` | PE32 / PE32+ mapping and IAT binding |
 | `src/elf_loader.cpp` | ELF32 / ELF64 mapping and the initial process stack |
-| `src/hooks.cpp` | host implementations of libc and Win32 functions |
+| `src/hooks.cpp` | libc hooks and the printf engine's callers |
+| `src/hooks_win32.cpp` | Win32 API and Universal CRT hooks |
+| `src/guest_printf.cpp` | the printf engine and UTF-16 conversion |
 | `src/syscalls.cpp` | the Linux kernel interface |
-| `src/main.cpp` | command line front end |
+| `web/` | the WebAssembly front end and demo page |
 
 ## Current limits
 
-These are the things a guest can hit today; each one fails with a message naming
-the instruction or import rather than misbehaving quietly.
+Each of these fails with a message naming the instruction or import rather than
+misbehaving quietly.
 
-- **No x87 or SSE.** Floating point *arithmetic* in the guest is not emulated.
-  `printf("%f", x)` does work when the value reaches the hook through integer
-  registers or the stack, which is the case for 32-bit cdecl and for Microsoft
-  x64 varargs (the ABI duplicates FP arguments into the integer registers), but
-  not for SysV x64, where they travel in XMM registers.
+- **No AVX, and CPUID says so.** The emulator advertises exactly the features it
+  implements (SSE2 and CMOV, not SSE4.2 or AVX), because a libc picks its
+  `memcpy`/`strlen` from those bits and would otherwise jump into instructions
+  that do not exist.
+- **x87 is double precision.** The register stack holds host doubles rather than
+  true 80-bit extended values, so a computation carried out entirely in extended
+  precision on real hardware can differ in its last bits. Loads and stores of an
+  80-bit memory operand do convert exactly.
+- **No SEH or C++ exception unwinding.** Installing a handler is fine; actually
+  throwing is not.
 - **No dynamic linking for ELF.** `ET_DYN`/PIE and anything needing `ld.so` are
   rejected at load time; statically linked `ET_EXEC` works.
+- **No threads and no real filesystem.** `CreateThread` and `open` are not
+  implemented; the Tls/Fls APIs work because there is exactly one thread.
 - **PE data imports** are bound like function imports, so importing a variable
-  (rather than a function) from a DLL yields a hook address instead of data.
-- **No SEH, no threads, no real filesystem.** `_initterm` is a no-op, so C++
-  static constructors in a CRT-linked binary would not run.
-- Segmentation is flat: `fs:`/`gs:` resolve to a minimal synthetic TEB/PEB, and
-  every other segment base is zero.
+  rather than a function from a DLL yields a hook address instead of data.
+- Segmentation is flat: `fs:`/`gs:` resolve to a synthetic TEB/PEB on Windows and
+  to whatever `arch_prctl`/`set_thread_area` set on Linux; every other segment
+  base is zero.
 
 ## License
 

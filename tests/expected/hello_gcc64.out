@@ -1,0 +1,8 @@
+hello from static glibc
+argc=1 argv0=tests/bin/hello_gcc64
+i=0  half=0.000  sq=0
+i=1  half=1.500  sq=1
+i=2  half=3.000  sq=4
+strlen(heap string)=11
+harmonic(10)=2.9289682540
+done

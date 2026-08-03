@@ -24,6 +24,7 @@ void usage() {
                  "  -c, --trace-calls    log intercepted library calls and syscalls\n"
                  "  -m, --map            print the guest memory map after loading\n"
                  "  -n, --max-insns N    stop after N instructions (0 = unlimited)\n"
+                 "  -d, --dump ADDR[:N]  hex dump N bytes of guest memory after loading\n"
                  "  -h, --help           this text\n");
 }
 
@@ -33,6 +34,7 @@ int main(int argc, char** argv) {
     x86emu::Emulator::Options opt;
     std::string program;
     std::vector<std::string> guest_args;
+    std::vector<std::pair<uint64_t, uint64_t>> dumps;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -49,6 +51,18 @@ int main(int argc, char** argv) {
                 return 2;
             }
             opt.max_instructions = std::strtoull(argv[++i], nullptr, 0);
+        } else if (a == "-d" || a == "--dump") {
+            if (i + 1 >= argc) {
+                usage();
+                return 2;
+            }
+            std::string spec = argv[++i];
+            size_t colon = spec.find(':');
+            uint64_t addr = std::strtoull(spec.substr(0, colon).c_str(), nullptr, 0);
+            uint64_t len = colon == std::string::npos
+                               ? 64
+                               : std::strtoull(spec.substr(colon + 1).c_str(), nullptr, 0);
+            dumps.emplace_back(addr, len);
         } else if (a == "-h" || a == "--help") {
             usage();
             return 0;
@@ -76,6 +90,29 @@ int main(int argc, char** argv) {
     } catch (const x86emu::LoadError& err) {
         std::fprintf(stderr, "x86emu: cannot load %s: %s\n", program.c_str(), err.what());
         return 1;
+    }
+
+    // Dumps happen after loading and before the first instruction, which is
+    // where you want them when checking that an image was mapped correctly.
+    for (const auto& [addr, len] : dumps) {
+        std::fprintf(stderr, "dump 0x%llX:\n", (unsigned long long)addr);
+        for (uint64_t off = 0; off < len; off += 16) {
+            std::fprintf(stderr, "  %012llX ", (unsigned long long)(addr + off));
+            char text[17] = {};
+            for (uint64_t k = 0; k < 16 && off + k < len; ++k) {
+                uint8_t b = 0;
+                try {
+                    b = emu.mem.read8(addr + off + k);
+                } catch (const x86emu::MemoryFault&) {
+                    std::fprintf(stderr, "-- ");
+                    text[k] = '.';
+                    continue;
+                }
+                std::fprintf(stderr, "%02X ", b);
+                text[k] = (b >= 32 && b < 127) ? static_cast<char>(b) : '.';
+            }
+            std::fprintf(stderr, " %s\n", text);
+        }
     }
 
     try {

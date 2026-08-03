@@ -49,6 +49,9 @@ void Emulator::choose_layout() {
         heap_base_ = (image_.brk + 0xFFF) & ~0xFFFull;
         heap_limit_ = heap_base_ + (1ull << 28);
     }
+    // mmap lives above the brk heap so the two can never collide.
+    mmap_next_ = heap_limit_;
+    mmap_limit_ = mmap_next_ + (1ull << 28);
     stack_top_ = stack_base_ + stack_size_;
     heap_next_ = heap_base_;
     misc_next_ = misc_base_;
@@ -130,20 +133,45 @@ uint64_t Emulator::arg_slot(int index) const {
     }
 }
 
+Emulator::Args Emulator::Args::va_list_at(const Emulator& e, uint64_t ptr) {
+    Args a(e);
+    a.va_ = ptr;
+    a.from_memory_ = true;
+    return a;
+}
+
+uint64_t Emulator::Args::next_slot() {
+    if (from_memory_) {
+        int ps = e_->pointer_size();
+        uint64_t v = e_->mem.read_sized(va_, ps);
+        va_ += ps;
+        return v;
+    }
+    return e_->arg_slot(i_++);
+}
+
 uint64_t Emulator::Args::next_int(int bytes) {
-    // In 32-bit code a 64-bit value spans two stack slots; in 64-bit code every
-    // argument occupies exactly one slot.
-    if (!e_.is64() && bytes == 8) {
-        uint64_t lo = e_.arg_slot(i_++) & 0xFFFFFFFFull;
-        uint64_t hi = e_.arg_slot(i_++) & 0xFFFFFFFFull;
+    // In 32-bit code a 64-bit value spans two slots; in 64-bit code every
+    // argument occupies exactly one.
+    if (!e_->is64() && bytes == 8) {
+        uint64_t lo = next_slot() & 0xFFFFFFFFull;
+        uint64_t hi = next_slot() & 0xFFFFFFFFull;
         return (hi << 32) | lo;
     }
-    uint64_t v = e_.arg_slot(i_++);
+    uint64_t v = next_slot();
     return bytes == 4 ? (v & 0xFFFFFFFFull) : v;
 }
 
 double Emulator::Args::next_double() {
-    uint64_t bits = next_int(8);
+    uint64_t bits;
+    // The System V ABI keeps variadic floating-point arguments in XMM0-7, a
+    // separate sequence from the integer ones.  Microsoft's ABI instead
+    // duplicates them into the integer registers, so the normal slot walk works
+    // there, as it does for a va_list already spilled to memory.
+    if (!from_memory_ && e_->abi() == Abi::SysV64 && fp_ < 8)
+        bits = e_->cpu_->xmm[fp_++].q[0];
+    else
+        bits = next_int(8);
     double d;
     std::memcpy(&d, &bits, sizeof d);
     return d;
@@ -159,6 +187,101 @@ void Emulator::set_result(uint64_t v) {
 void Emulator::exit_process(int code) {
     cpu_->exit_code = code;
     cpu_->halted = true;
+}
+
+uint64_t Emulator::call_guest(uint64_t func, const std::vector<uint64_t>& args) {
+    // Save everything the callee may clobber.  Only the mutable register state
+    // needs saving: memory changes are the point of the call.
+    struct Saved {
+        uint64_t regs[16];
+        Cpu::Xmm xmm[16];
+        uint64_t rip, rflags;
+        bool halted;
+    } saved;
+    std::memcpy(saved.regs, cpu_->regs, sizeof saved.regs);
+    std::memcpy(saved.xmm, cpu_->xmm, sizeof saved.xmm);
+    saved.rip = cpu_->rip;
+    saved.rflags = cpu_->rflags;
+    saved.halted = cpu_->halted;
+
+    // Build a fresh frame well clear of the interrupted one.
+    uint64_t rsp = (cpu_->regs[RSP] - 0x200) & ~0xFull;
+
+    switch (abi()) {
+        case Abi::Cdecl32:
+            for (size_t i = args.size(); i-- > 0;) {
+                rsp -= 4;
+                mem.write32(rsp, static_cast<uint32_t>(args[i]));
+            }
+            break;
+        case Abi::MsX64: {
+            static const int kRegs[4] = {RCX, RDX, R8, R9};
+            for (size_t i = args.size(); i-- > 4;) {
+                rsp -= 8;
+                mem.write64(rsp, args[i]);
+            }
+            rsp -= 32;  // shadow space for the register arguments
+            for (size_t i = 0; i < args.size() && i < 4; ++i) cpu_->regs[kRegs[i]] = args[i];
+            break;
+        }
+        default: {  // SysV64
+            static const int kRegs[6] = {RDI, RSI, RDX, RCX, R8, R9};
+            for (size_t i = args.size(); i-- > 6;) {
+                rsp -= 8;
+                mem.write64(rsp, args[i]);
+            }
+            for (size_t i = 0; i < args.size() && i < 6; ++i) cpu_->regs[kRegs[i]] = args[i];
+            cpu_->regs[RAX] = 0;  // no vector arguments
+            break;
+        }
+    }
+    // Both 64-bit ABIs want RSP+8 aligned to 16 on entry, which is what pushing
+    // the return address onto a 16-byte boundary produces.
+    rsp &= ~0xFull;
+    cpu_->regs[RSP] = rsp;
+    cpu_->push(nested_return_);
+    cpu_->rip = func;
+    cpu_->halted = false;
+
+    while (!cpu_->halted && cpu_->rip != nested_return_) cpu_->step();
+    uint64_t result = cpu_->regs[RAX];
+    bool guest_exited = cpu_->halted;
+    int code = cpu_->exit_code;
+
+    std::memcpy(cpu_->regs, saved.regs, sizeof saved.regs);
+    std::memcpy(cpu_->xmm, saved.xmm, sizeof saved.xmm);
+    cpu_->rip = saved.rip;
+    cpu_->rflags = saved.rflags;
+    // If the guest called exit() from inside the initialiser, honour it rather
+    // than resuming a program that asked to stop.
+    cpu_->halted = saved.halted || guest_exited;
+    if (guest_exited) cpu_->exit_code = code;
+    return result;
+}
+
+void Emulator::run_atexit() {
+    // Take the list first: a destructor may register more, and it must not see
+    // itself run twice.
+    std::vector<uint64_t> pending;
+    pending.swap(atexit_funcs_);
+    for (size_t i = pending.size(); i-- > 0;) {
+        if (cpu_->halted) break;
+        call_guest(pending[i], {});
+    }
+}
+
+uint32_t Emulator::tls_alloc() {
+    tls_slots_.push_back(0);
+    return static_cast<uint32_t>(tls_slots_.size() - 1);
+}
+
+uint64_t Emulator::tls_get(uint32_t index) const {
+    return index < tls_slots_.size() ? tls_slots_[index] : 0;
+}
+
+void Emulator::tls_set(uint32_t index, uint64_t value) {
+    if (index >= tls_slots_.size()) tls_slots_.resize(index + 1, 0);
+    tls_slots_[index] = value;
 }
 
 void Emulator::log_call(const char* fmt, ...) {
@@ -196,10 +319,9 @@ uint64_t Emulator::heap_alloc(uint64_t size) {
 
 uint64_t Emulator::alloc_pages(uint64_t size) {
     uint64_t need = (size + 0xFFF) & ~0xFFFull;
-    heap_next_ = (heap_next_ + 0xFFF) & ~0xFFFull;
-    if (heap_next_ + need > heap_limit_) return 0;
-    uint64_t addr = heap_next_;
-    heap_next_ += need;
+    if (mmap_next_ + need > mmap_limit_) return 0;
+    uint64_t addr = mmap_next_;
+    mmap_next_ += need;
     mem.map(addr, need);
     return addr;
 }
@@ -210,7 +332,7 @@ uint64_t Emulator::set_brk(uint64_t addr) {
         if (addr > heap_limit_) return brk_;
         mem.map(brk_, addr - brk_);
         brk_ = addr;
-        if (heap_next_ < brk_) heap_next_ = brk_;
+        if (heap_next_ < brk_) heap_next_ = brk_;  // keep malloc() above the break
     }
     return brk_;
 }
@@ -321,34 +443,93 @@ std::FILE* Emulator::host_stream(uint64_t ptr) const {
 // ---------------------------------------------------------------------------
 
 void Emulator::setup_windows_env(const std::vector<std::string>& args) {
-    // A minimal TEB/PEB so that fs:/gs: reads do not fault.  Real Windows code
-    // reads the stack bounds and the PEB pointer from here.
-    mem.map(teb_base_, 0x3000, "TEB/PEB");
-    uint64_t peb = teb_base_ + 0x2000;
+    // The TEB, the PEB and the process parameters, laid out the way real Windows
+    // does.  A CRT reaches through all three during startup - fs:/gs: to the
+    // TEB, TEB to the PEB, PEB to the parameters - so stopping short at any
+    // level shows up as a null dereference deep inside the runtime.
+    mem.map(teb_base_, 0x10000, "TEB/PEB");
+    const uint64_t peb = teb_base_ + 0x2000;
+    const uint64_t params = teb_base_ + 0x3000;
+    const uint64_t tls_array = teb_base_ + 0x4000;
+    const int ps = pointer_size();
+
+    // Command line and image path, as UNICODE_STRINGs.
+    std::string cmd;
+    for (const auto& a : args) {
+        if (!cmd.empty()) cmd += ' ';
+        cmd += a;
+    }
+    auto put_unicode_string = [&](uint64_t at, const std::string& text) {
+        std::u16string w(text.begin(), text.end());  // ASCII widening is enough here
+        std::vector<uint8_t> raw((w.size() + 1) * 2, 0);
+        for (size_t i = 0; i < w.size(); ++i) {
+            raw[i * 2] = static_cast<uint8_t>(w[i] & 0xFF);
+            raw[i * 2 + 1] = static_cast<uint8_t>(w[i] >> 8);
+        }
+        uint64_t buf = alloc_guest_data(raw.data(), raw.size());
+        mem.write16(at, static_cast<uint16_t>(w.size() * 2));        // Length
+        mem.write16(at + 2, static_cast<uint16_t>((w.size() + 1) * 2));  // MaximumLength
+        mem.write_sized(at + (is64() ? 8 : 4), ps, buf);             // Buffer
+    };
+
     if (!is64()) {
         mem.write32(teb_base_ + 0x00, 0xFFFFFFFFu);  // SEH chain: end of list
         mem.write32(teb_base_ + 0x04, static_cast<uint32_t>(stack_top_));
         mem.write32(teb_base_ + 0x08, static_cast<uint32_t>(stack_base_));
-        mem.write32(teb_base_ + 0x18, static_cast<uint32_t>(teb_base_));  // Self
+        mem.write32(teb_base_ + 0x18, static_cast<uint32_t>(teb_base_));   // Self
+        mem.write32(teb_base_ + 0x2C, static_cast<uint32_t>(tls_array));   // TLS slots
         mem.write32(teb_base_ + 0x30, static_cast<uint32_t>(peb));
         cpu_->fs_base = teb_base_;
+
+        mem.write32(peb + 0x08, static_cast<uint32_t>(image_.image_base));
+        mem.write32(peb + 0x10, static_cast<uint32_t>(params));
+        mem.write32(peb + 0x18, 0x00420000);  // ProcessHeap
+        mem.write32(peb + 0xA4, 10);          // OSMajorVersion
+        mem.write32(peb + 0xA8, 0);           // OSMinorVersion
+        mem.write32(peb + 0xAC, 19045);       // OSBuildNumber
+        mem.write32(peb + 0xB0, 2);           // OSPlatformId = VER_PLATFORM_WIN32_NT
+
+        mem.write32(params + 0x00, 0x1000);   // MaximumLength
+        mem.write32(params + 0x04, 0x1000);   // Length
+        mem.write32(params + 0x08, 0);        // Flags
+        mem.write32(params + 0x10, 1);        // ConsoleHandle
+        mem.write32(params + 0x18, 1);        // StandardInput
+        mem.write32(params + 0x1C, 2);        // StandardOutput
+        mem.write32(params + 0x20, 3);        // StandardError
+        put_unicode_string(params + 0x38, args.empty() ? "program.exe" : args[0]);
+        put_unicode_string(params + 0x40, cmd);
     } else {
         mem.write64(teb_base_ + 0x08, stack_top_);
         mem.write64(teb_base_ + 0x10, stack_base_);
-        mem.write64(teb_base_ + 0x30, teb_base_);  // Self
+        mem.write64(teb_base_ + 0x30, teb_base_);    // Self
+        mem.write64(teb_base_ + 0x58, tls_array);    // TLS slots
         mem.write64(teb_base_ + 0x60, peb);
         cpu_->gs_base = teb_base_;
-    }
-    // PEB.ImageBaseAddress
-    if (!is64())
-        mem.write32(peb + 0x08, static_cast<uint32_t>(image_.image_base));
-    else
-        mem.write64(peb + 0x10, image_.image_base);
 
-    // Stack: the entry point returns into the exit thunk.
-    cpu_->regs[RSP] = stack_top_ & ~0xFull;
+        mem.write64(peb + 0x10, image_.image_base);
+        mem.write64(peb + 0x20, params);
+        mem.write64(peb + 0x30, 0x00420000);  // ProcessHeap
+        mem.write32(peb + 0x118, 10);         // OSMajorVersion
+        mem.write32(peb + 0x11C, 0);          // OSMinorVersion
+        mem.write16(peb + 0x120, 19045);      // OSBuildNumber
+        mem.write32(peb + 0x124, 2);          // OSPlatformId
+
+        mem.write32(params + 0x00, 0x1000);   // MaximumLength
+        mem.write32(params + 0x04, 0x1000);   // Length
+        mem.write32(params + 0x08, 0);        // Flags
+        mem.write64(params + 0x10, 1);        // ConsoleHandle
+        mem.write64(params + 0x20, 1);        // StandardInput
+        mem.write64(params + 0x28, 2);        // StandardOutput
+        mem.write64(params + 0x30, 3);        // StandardError
+        put_unicode_string(params + 0x60, args.empty() ? "program.exe" : args[0]);
+        put_unicode_string(params + 0x70, cmd);
+    }
+
+    // Stack: the entry point returns into the exit thunk.  Start a page below
+    // the top, because the entry function may write to the argument/shadow area
+    // *above* its return address, which is the caller's frame - ours.
+    cpu_->regs[RSP] = (stack_top_ - 0x1000) & ~0xFull;
     cpu_->push(exit_thunk_);
-    (void)args;
 }
 
 void Emulator::setup_linux_stack(const std::vector<std::string>& args) {
@@ -436,7 +617,15 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     exit_thunk_ = add_hook("__emu_exit__", 0, [](Emulator& e) {
         e.exit_process(static_cast<int>(static_cast<int32_t>(e.cpu().regs[RAX])));
     });
+    // call_guest() stops when execution reaches this address; the body never
+    // runs, because the check happens before hook dispatch.
+    nested_return_ = add_hook("__emu_nested_return__", 0, [](Emulator&) {});
+
     install_library_hooks();
+    if (os_kind == Os::Windows) {
+        install_win32_hooks();
+        install_ucrt_hooks();
+    }
 
     if (os_kind == Os::Windows) {
         image_ = load_pe(file, mem, [this](const std::string& dll, const std::string& sym) {

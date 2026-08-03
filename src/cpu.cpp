@@ -599,6 +599,10 @@ void Cpu::execute_0f() {
     uint64_t start = rip - 1;
     uint8_t op = fetch8();
 
+    // SSE shares this opcode space, distinguished by a mandatory prefix; it
+    // returns false for anything that is a general-purpose instruction.
+    if (execute_sse(op)) return;
+
     if (op >= 0x80 && op <= 0x8F) {  // Jcc rel32
         int32_t rel = static_cast<int32_t>(fetch32());
         if (cond(op & 0xF)) rip += static_cast<uint64_t>(static_cast<int64_t>(rel));
@@ -656,20 +660,49 @@ void Cpu::execute_0f() {
             reg_write(RAX, 4, instructions_executed & 0xFFFFFFFFull);
             reg_write(RDX, 4, instructions_executed >> 32);
             return;
-        case 0xA2:  // CPUID - a plain CPU with no optional features
+        case 0xA2: {
+            // CPUID must advertise exactly what this emulator implements and no
+            // more: a libc picks its memcpy/strlen implementation from these
+            // bits, so claiming AVX or SSE4.2 here would make it jump straight
+            // into instructions that do not exist.  SSE2 and CMOV are safe (see
+            // sse.cpp); MMX, FXSR, POPCNT and everything newer are not.
+            enum : uint32_t {
+                EDX_FPU = 1u << 0,
+                EDX_TSC = 1u << 4,
+                EDX_CX8 = 1u << 8,
+                EDX_CMOV = 1u << 15,
+                EDX_SSE = 1u << 25,
+                EDX_SSE2 = 1u << 26,
+            };
             switch (static_cast<uint32_t>(regs[RAX])) {
                 case 0:
+                    // Highest basic leaf 1: nothing here answers leaf 7, and
+                    // saying so keeps a libc from probing for AVX2.
                     regs[RAX] = 1;
                     regs[RBX] = 0x756E6547;  // "Genu"
                     regs[RDX] = 0x49656E69;  // "ineI"
                     regs[RCX] = 0x6C65746E;  // "ntel"
                     break;
-                default:
-                    regs[RAX] = 0x000004;
+                case 1:
+                    regs[RAX] = 0x000306C3;  // a Haswell-era family/model/stepping
+                    regs[RBX] = 0x00000800;  // one logical processor, CLFLUSH 64B
+                    regs[RCX] = 0;           // no SSE3 or later
+                    regs[RDX] = EDX_FPU | EDX_TSC | EDX_CX8 | EDX_CMOV | EDX_SSE | EDX_SSE2;
+                    break;
+                case 0x80000000:
+                    regs[RAX] = 0x80000001;
                     regs[RBX] = regs[RCX] = regs[RDX] = 0;
+                    break;
+                case 0x80000001:
+                    regs[RAX] = regs[RBX] = regs[RCX] = 0;
+                    regs[RDX] = is64() ? (1u << 29) : 0;  // long mode
+                    break;
+                default:
+                    regs[RAX] = regs[RBX] = regs[RCX] = regs[RDX] = 0;
                     break;
             }
             return;
+        }
         case 0xAF: {  // IMUL reg, rm
             RM rm = decode_modrm();
             int64_t a = sign_ext(reg_read(modrm_reg_, opsize_), opsize_);
@@ -750,19 +783,22 @@ void Cpu::execute_0f() {
             return;
         }
         case 0xA4:
-        case 0xAC: {  // SHLD / SHRD, immediate count
-            RM rm = decode_modrm(1);
+        case 0xAC:
+        case 0xA5:
+        case 0xAD: {  // SHLD / SHRD; the count is an immediate or CL
+            bool from_cl = op == 0xA5 || op == 0xAD;
+            bool left = op == 0xA4 || op == 0xA5;
+            RM rm = decode_modrm(from_cl ? 0 : 1);
             uint64_t src = reg_read(modrm_reg_, opsize_);
-            uint64_t count = fetch8() & (opsize_ == 8 ? 63 : 31);
+            uint64_t count = (from_cl ? regs[RCX] : fetch8()) & (opsize_ == 8 ? 63 : 31);
             uint64_t dst = rm_read(rm, opsize_);
             int bits = opsize_ * 8;
             if (count > 0 && count < static_cast<uint64_t>(bits)) {
-                uint64_t r = op == 0xA4
-                                 ? ((dst << count) | (src >> (bits - count)))
-                                 : ((dst >> count) | (src << (bits - count)));
+                uint64_t r = left ? ((dst << count) | (src >> (bits - count)))
+                                  : ((dst >> count) | (src << (bits - count)));
                 r &= mask_of(opsize_);
-                set_flag(FLAG_CF, op == 0xA4 ? ((dst >> (bits - count)) & 1) != 0
-                                             : ((dst >> (count - 1)) & 1) != 0);
+                set_flag(FLAG_CF, left ? ((dst >> (bits - count)) & 1) != 0
+                                       : ((dst >> (count - 1)) & 1) != 0);
                 set_szp(r, opsize_);
                 rm_write(rm, opsize_, r);
             }
@@ -792,9 +828,6 @@ void Cpu::execute_0f() {
             rm_write(rm, size, r);
             return;
         }
-        case 0xAE:  // LFENCE / SFENCE / MFENCE - nothing to order here
-            decode_modrm();
-            return;
         default:
             unsupported("0F opcode", op, start);
     }
@@ -1282,9 +1315,15 @@ void Cpu::step() {
             return;
         }
 
+        case 0x9B:  // FWAIT - no asynchronous FPU exceptions to wait for
+            return;
+
+        case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+        case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+            execute_x87(op);
+            return;
+
         default:
-            if (op >= 0xD8 && op <= 0xDF)
-                unsupported("x87 FPU instruction", op, start);
             unsupported("opcode", op, start);
     }
 }

@@ -17,12 +17,15 @@ require(path.join(here, 'samples.js'));           // defines globalThis.X86EMU_S
 const createX86Emu = require(path.join(here, 'x86emu.js'));
 
 const expected = {
-  hello32: { exit: 0, contains: 'hello from the guest!' },
-  hello64: { exit: 0, contains: 'hello from the guest!' },
-  arith32: { exit: 0, contains: 'div64    : FFFFFFFFB57E6E2F' },
-  arith64: { exit: 0, contains: 'div64    : FFFFFFFFB57E6E2F' },
-  elf32:   { exit: 7, contains: 'hello from the ELF guest!' },
-  elf64:   { exit: 7, contains: 'hello from the ELF guest!' },
+  hello32:  { exit: 0, contains: 'hello from the guest!' },
+  hello64:  { exit: 0, contains: 'hello from the guest!' },
+  arith64:  { exit: 0, contains: 'div64    : FFFFFFFFB57E6E2F' },
+  insn64:   { exit: 0, contains: 'setcc   : 0101010110011010' },
+  elf32:    { exit: 7, contains: 'hello from the ELF guest!' },
+  elf64:    { exit: 7, contains: 'hello from the ELF guest!' },
+  msvc32:   { exit: 0, contains: 'harmonic(10) = 2.9289682540' },
+  msvc64:   { exit: 0, contains: 'harmonic(10) = 2.9289682540' },
+  msvcmt64: { exit: 0, contains: 'harmonic(10) = 2.9289682540' },
 };
 
 let out = '';

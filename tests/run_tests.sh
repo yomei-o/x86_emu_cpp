@@ -7,9 +7,12 @@
 # expectation instead.
 set -e
 cd "$(dirname "$0")/.."
-emu=./x86emu.exe
-[ -x "$emu" ] || emu=./build/x86emu.exe
+# EMU lets you point at a different build, e.g. one compiled for another host.
+emu=${EMU:-}
+[ -n "$emu" ] || { emu=./x86emu; [ -x "$emu" ] || emu=./x86emu.exe; }
+[ -x "$emu" ] || emu=./build/x86emu
 [ -x "$emu" ] || { echo "build the emulator first"; exit 1; }
+echo "emulator: $emu on $(uname -s) $(uname -m)"
 
 tmp="${TMPDIR:-/tmp}"
 pass=0
@@ -49,10 +52,29 @@ for exe in tests/bin/*.exe; do
     check_native "$exe"
 done
 
+# Built by tests/msvc/build.bat: a real Visual Studio toolchain, so the CRT
+# startup runs before main and - with /MT - the C runtime itself executes inside
+# the guest.
+if ls tests/msvc/bin/*.exe >/dev/null 2>&1; then
+    echo "MSVC guests (emulated output vs. native execution)"
+    for exe in tests/msvc/bin/*.exe; do
+        check_native "$exe"
+    done
+fi
+
 echo "ELF guests (emulated output vs. recorded expectation)"
 for exe in tests/bin/hello_elf32 tests/bin/hello_elf64; do
     [ -f "$exe" ] || continue
     check_expected "$exe" 7 tests/expected/hello_elf.out
+done
+# Built by tests/linux/build.sh: gcc against a real glibc, linked statically, so
+# the libc runs inside the guest and only the kernel interface is emulated.
+for bits in 64 32; do
+    exe=tests/bin/hello_gcc$bits
+    want=tests/expected/hello_gcc$bits.out
+    if [ -f "$exe" ] && [ -f "$want" ]; then
+        check_expected "$exe" 3 "$want"
+    fi
 done
 
 echo

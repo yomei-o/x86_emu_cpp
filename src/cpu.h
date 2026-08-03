@@ -49,8 +49,29 @@ class Cpu {
 public:
     Cpu(Memory& mem, Mode mode) : mem_(mem), mode_(mode) {}
 
+    // A 128-bit SSE register, viewed as whatever the current instruction needs.
+    union Xmm {
+        uint8_t b[16];
+        uint16_t w[8];
+        uint32_t d[4];
+        uint64_t q[2];
+        float f32[4];
+        double f64[2];
+    };
+
     // ---- state ----------------------------------------------------------
     uint64_t regs[16] = {};
+    Xmm xmm[16] = {};
+    uint32_t mxcsr = 0x1F80;
+
+    // x87 state.  The register stack is kept as host doubles rather than true
+    // 80-bit extended values: results can therefore differ in the last bits from
+    // real hardware, which is a deliberate trade for a great deal of simplicity.
+    double st[8] = {};
+    bool st_used[8] = {};
+    int st_top = 0;
+    uint16_t fpu_control = 0x037F;
+    uint16_t fpu_status = 0;
     uint64_t rip = 0;
     uint64_t rflags = FLAG_IF | 0x2;  // bit 1 reads as 1 on real hardware
 
@@ -204,6 +225,18 @@ private:
     void group5(const RM& rm, int size, int op);
     void do_string_op(uint8_t opcode, int size);
     void execute_0f();
+    // SSE/SSE2 lives in sse.cpp; returns false if the opcode is not one of its
+    // own, so execute_0f() can fall through to the general-purpose forms.
+    bool execute_sse(uint8_t op);
+    // x87 lives in x87.cpp; handles the 0xD8-0xDF opcode block.
+    void execute_x87(uint8_t op);
+    void fpu_push(double v);
+    double fpu_pop();
+    double& fpu_reg(int i);  // i counts down from the top of the stack
+    Xmm xmm_read(const RM& rm);           // 128-bit operand
+    void xmm_write(const RM& rm, const Xmm& v);
+    uint64_t xmm_read_q(const RM& rm);    // low 64 bits of an operand
+    uint32_t xmm_read_d(const RM& rm);    // low 32 bits of an operand
 
     [[noreturn]] void unsupported(const char* what, uint8_t opcode, uint64_t start_rip);
 

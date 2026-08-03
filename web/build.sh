@@ -12,10 +12,12 @@ EMCC=${EMCC:-emcc}
 command -v "$EMCC" >/dev/null 2>&1 || { echo "emcc not found; set EMCC=/path/to/emcc"; exit 1; }
 
 echo "== building web/x86emu.js"
+# Everything in src/ except the command line front end, which web/wasm_api.cpp
+# replaces.  Globbing keeps this from going stale when a source file is added.
+SOURCES=$(ls src/*.cpp | grep -v '/main\.cpp$')
+
 "$EMCC" -std=c++17 -O2 -Isrc \
-    src/cpu.cpp src/memory.cpp src/emulator.cpp src/loader.cpp \
-    src/pe_loader.cpp src/elf_loader.cpp src/hooks.cpp src/syscalls.cpp \
-    web/wasm_api.cpp \
+    $SOURCES web/wasm_api.cpp \
     -o web/x86emu.js \
     -sMODULARIZE=1 \
     -sEXPORT_NAME=createX86Emu \

@@ -84,19 +84,46 @@ public:
     // walking printf's variadic tail.
     class Args {
     public:
-        Args(const Emulator& e, int start = 0) : e_(e), i_(start) {}
+        Args(const Emulator& e, int start = 0) : e_(&e), i_(start) {}
+
+        // A va_list the guest handed us: the arguments live in memory rather
+        // than in registers.  This is how the UCRT's __stdio_common_* entry
+        // points receive printf's variadic tail.
+        static Args va_list_at(const Emulator& e, uint64_t ptr);
+
         uint64_t next_int(int bytes);  // a 4- or 8-byte C integer
-        uint64_t next_ptr() { return e_.arg_slot(i_++); }
+        uint64_t next_ptr() { return next_slot(); }
         double next_double();
-        int index() const { return i_; }
 
     private:
-        const Emulator& e_;
-        int i_;
+        uint64_t next_slot();
+
+        const Emulator* e_;
+        int i_ = 0;          // register/stack slot index
+        int fp_ = 0;         // SysV keeps float arguments in their own registers
+        uint64_t va_ = 0;    // cursor when reading from a va_list
+        bool from_memory_ = false;
     };
 
     void set_result(uint64_t v);
     void exit_process(int code);
+
+    // Calls a function *in the guest* from inside a hook and returns its result.
+    // The C runtime's _initterm walks a table of initialisers and calls each
+    // one, so a hook for it has to be able to re-enter guest code; without this
+    // a C++ program's static constructors would silently never run.
+    uint64_t call_guest(uint64_t func, const std::vector<uint64_t>& args);
+
+    // Thread-local storage slots for the Tls*/Fls* APIs (single-threaded, so one
+    // set of slots is the whole story).
+    uint32_t tls_alloc();
+    uint64_t tls_get(uint32_t index) const;
+    void tls_set(uint32_t index, uint64_t value);
+
+    // atexit / static destructors: the C runtime registers them with us, and we
+    // run them, newest first, when the guest exits.
+    void add_atexit(uint64_t func) { atexit_funcs_.push_back(func); }
+    void run_atexit();
 
     // ---- guest services ----------------------------------------------------
     uint64_t heap_alloc(uint64_t size);
@@ -128,8 +155,10 @@ public:
     uint64_t last_error() const { return last_error_; }
     void set_last_error(uint64_t e) { last_error_ = e; }
 
-    // Installed by hooks.cpp / syscalls.cpp.
+    // Installed by hooks.cpp, hooks_win32.cpp and syscalls.cpp.
     void install_library_hooks();
+    void install_win32_hooks();
+    void install_ucrt_hooks();
     void install_syscall_handlers();
 
 private:
@@ -163,6 +192,9 @@ private:
     uint64_t hook_base_ = 0;
     uint64_t stack_base_ = 0, stack_size_ = 0, stack_top_ = 0;
     uint64_t heap_base_ = 0, heap_next_ = 0, heap_limit_ = 0;
+    // mmap gets its own region: it must not hand out addresses that a later
+    // brk() would also claim.
+    uint64_t mmap_next_ = 0, mmap_limit_ = 0;
     uint64_t misc_base_ = 0, misc_next_ = 0;
     uint64_t teb_base_ = 0;
 
@@ -171,6 +203,9 @@ private:
     uint64_t guest_files_[3] = {};
     uint64_t last_error_ = 0;
     uint64_t exit_thunk_ = 0;
+    uint64_t nested_return_ = 0;  // sentinel address call_guest() returns to
+    std::vector<uint64_t> tls_slots_;
+    std::vector<uint64_t> atexit_funcs_;
 };
 
 }  // namespace x86emu
