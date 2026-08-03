@@ -186,7 +186,16 @@ hello from the ELF guest!
 
 The emulator core has no OS dependencies, so it compiles to WebAssembly as is.
 `web/index.html` is a page where dropping in a PE or ELF runs it and prints the
-guest's output to a console view.
+guest's output to a console view. The emulator runs in a **Web Worker**
+(`web/worker.js`), so a multi-second guest never freezes the tab.
+
+It also runs **CPython in the browser**: point the page's *Load a Python install*
+button at a Windows [embeddable CPython](https://www.python.org/downloads/windows/)
+folder (the one with `python.exe` + `python313.zip`), type Python, and it runs the
+interpreter locally over the in-browser filesystem — nothing is uploaded. This is
+`emu_run_path()`, which loads a program already in MEMFS and passes it a real argv;
+`web/test_python.mjs` proves it headlessly (`python -S -c ...` prints its version and
+a byte-exact `hashlib` digest, ~60M instructions).
 
 ```sh
 sh web/make_samples.sh                     # bake the test binaries into the page

@@ -3,25 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>x86emu - run an .exe in your browser</title>
+<title>x86emu - run an .exe (and CPython) in your browser</title>
 <style>
   :root {
-    --bg: #0d1117;
-    --panel: #161b22;
-    --border: #30363d;
-    --fg: #c9d1d9;
-    --dim: #8b949e;
-    --accent: #58a6ff;
-    --ok: #3fb950;
-    --err: #f85149;
-    --warn: #d29922;
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #c9d1d9;
+    --dim: #8b949e; --accent: #58a6ff; --ok: #3fb950; --err: #f85149; --warn: #d29922;
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0;
-    padding: 24px 16px 48px;
-    background: var(--bg);
-    color: var(--fg);
+    margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--fg);
     font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   }
   main { max-width: 900px; margin: 0 auto; }
@@ -29,60 +19,22 @@
   h1 code { font-size: 0.95em; color: var(--accent); }
   .sub { color: var(--dim); margin: 0 0 24px; }
   .sub a { color: var(--accent); }
-
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-    margin-bottom: 16px;
-  }
-  .panel h2 {
-    font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em;
-    color: var(--dim); margin: 0 0 12px; font-weight: 600;
-  }
-
-  #drop {
-    border: 1.5px dashed var(--border);
-    border-radius: 8px;
-    padding: 28px 16px;
-    text-align: center;
-    color: var(--dim);
-    transition: border-color .15s, background .15s;
-    cursor: pointer;
-  }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin: 0 0 12px; font-weight: 600; }
+  #drop { border: 1.5px dashed var(--border); border-radius: 8px; padding: 28px 16px; text-align: center; color: var(--dim); transition: border-color .15s, background .15s; cursor: pointer; }
   #drop.over { border-color: var(--accent); background: #58a6ff14; color: var(--fg); }
   #drop strong { color: var(--fg); font-weight: 600; }
-
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  button {
-    font: inherit; font-size: 0.875rem;
-    background: #21262d; color: var(--fg);
-    border: 1px solid var(--border); border-radius: 6px;
-    padding: 6px 12px; cursor: pointer;
-  }
+  button { font: inherit; font-size: 0.875rem; background: #21262d; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
   button:hover:not(:disabled) { border-color: #8b949e; }
   button:disabled { opacity: .5; cursor: default; }
   button.primary { background: #238636; border-color: #2ea043; color: #fff; }
   label.opt { font-size: 0.875rem; color: var(--dim); display: inline-flex; gap: 6px; align-items: center; }
-
-  #term {
-    background: #010409;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 14px 16px;
-    min-height: 260px;
-    max-height: 55vh;
-    overflow: auto;
-    font: 13px/1.55 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  #term .stderr { color: var(--warn); }
-  #term .note   { color: var(--dim); }
-  #term .fail   { color: var(--err); }
-  #term .done   { color: var(--ok); }
-
+  textarea#code { width: 100%; margin-top: 10px; background: #010409; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; min-height: 76px; }
+  .pyhint { font-size: 0.8125rem; color: var(--dim); margin: 4px 0 0; }
+  .pyhint a { color: var(--accent); }
+  #term { background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; min-height: 240px; max-height: 55vh; overflow: auto; font: 13px/1.55 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  #term .stderr { color: var(--warn); } #term .note { color: var(--dim); } #term .fail { color: var(--err); } #term .done { color: var(--ok); }
   #status { margin-top: 10px; font-size: 0.8125rem; color: var(--dim); }
   #status b { color: var(--fg); font-weight: 600; }
   footer { color: var(--dim); font-size: 0.8125rem; margin-top: 24px; }
@@ -96,10 +48,8 @@
     <a href="https://github.com/yomei-o/x86_emu_cpp">x86emu</a> is a small x86-32/x86-64
     interpreter in C++, compiled here to WebAssembly. Drop in a Windows PE or a Linux
     ELF executable and it runs the machine code instruction by instruction — library
-    calls like <code>printf</code> are intercepted and serviced by the emulator, so the
-    output lands in the console below. The Visual Studio samples are ordinary
-    <code>cl /O2</code> builds: everything the C runtime does before
-    <code>main</code> runs here too.
+    calls like <code>printf</code> are intercepted and serviced by the emulator. It runs
+    off the main thread, so even a multi-second guest keeps the page responsive.
   </p>
 
   <div class="panel">
@@ -116,10 +66,32 @@
   </div>
 
   <div class="panel">
-    <h2>Run</h2>
+    <h2>CPython</h2>
     <div class="row">
-      <button id="run" class="primary" disabled>Run</button>
-      <button id="clear">Clear console</button>
+      <button id="pyload">Load a Python install…</button>
+      <input id="pyfolder" type="file" webkitdirectory hidden>
+      <span id="pystate" style="font-size:.8125rem;color:var(--dim)">not loaded</span>
+    </div>
+    <p class="pyhint">
+      Point this at a Windows <a href="https://www.python.org/downloads/windows/">embeddable
+      CPython</a> folder (the one with <code>python.exe</code> + <code>python313.zip</code>).
+      Nothing is uploaded — the files are copied into the in-browser filesystem and the
+      interpreter runs locally. Then type Python below and run it.
+    </p>
+    <textarea id="code" spellcheck="false">import sys, hashlib
+print("python", sys.version.split()[0])
+print("sha256(b'abc') =", hashlib.sha256(b"abc").hexdigest())
+print(sum(range(1000)))</textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="pyrun" class="primary" disabled>Run Python</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Console</h2>
+    <div class="row">
+      <button id="run" class="primary" disabled>Run program</button>
+      <button id="clear">Clear</button>
       <label class="opt"><input type="checkbox" id="tracecalls"> log intercepted calls</label>
     </div>
     <div id="term"></div>
@@ -127,29 +99,27 @@
   </div>
 
   <footer>
-    No files leave your browser: the emulator runs entirely client-side.
-    Programs built by a stock Visual Studio or gcc toolchain work, including the
-    C runtime startup that runs before <code>main</code>. There is no AVX, no
-    exception unwinding, and ELF images must be statically linked — see the
-    <a href="https://github.com/yomei-o/x86_emu_cpp#current-limits">README</a>
-    for the full list.
+    No files leave your browser: the emulator runs entirely client-side. There is no AVX,
+    no exception unwinding, and ELF images must be statically linked — see the
+    <a href="https://github.com/yomei-o/x86_emu_cpp#current-limits">README</a> for the list.
   </footer>
 </main>
 
 <script src="samples.js"></script>
-<script src="x86emu.js"></script>
 <script>
 (function () {
-  const term = document.getElementById('term');
-  const statusEl = document.getElementById('status');
-  const runBtn = document.getElementById('run');
-  const dropEl = document.getElementById('drop');
-  const fileEl = document.getElementById('file');
+  const $ = (id) => document.getElementById(id);
+  const term = $('term'), statusEl = $('status');
+  const runBtn = $('run'), pyRunBtn = $('pyrun');
+  const dropEl = $('drop'), fileEl = $('file');
   const decoder = new TextDecoder('utf-8', { fatal: false });
 
-  let mod = null;
+  let ready = false, busy = false;
   let program = null;      // { name, bytes }
-  let pendingLine = { 1: '', 2: '' };
+  let pythonLoaded = false;
+  let runStart = 0, runLabel = '';
+
+  const worker = new Worker('worker.js');
 
   function append(text, cls) {
     const span = document.createElement('span');
@@ -158,56 +128,84 @@
     term.appendChild(span);
     term.scrollTop = term.scrollHeight;
   }
+  function setBusy(b) {
+    busy = b;
+    runBtn.disabled = b || !ready || !program;
+    pyRunBtn.disabled = b || !ready || !pythonLoaded;
+  }
 
-  // Guest output arrives as raw bytes, possibly split mid-sequence, so decode
-  // with streaming and drop the CR of a Windows guest's CRLF for display.
-  globalThis.x86emuOutput = function (fd, bytes) {
-    const text = decoder.decode(bytes, { stream: true }).replace(/\r\n?/g, '\n');
-    append(text, fd === 2 ? 'stderr' : null);
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'ready') {
+      ready = true;
+      statusEl.textContent = 'Ready — pick a sample, drop in an executable, or load Python.';
+      setBusy(false);
+    } else if (m.type === 'output') {
+      const text = decoder.decode(m.bytes, { stream: true }).replace(/\r\n?/g, '\n');
+      append(text, m.fd === 2 ? 'stderr' : null);
+    } else if (m.type === 'log') {
+      append(m.text + '\n', 'note');
+    } else if (m.type === 'done') {
+      if (m.code < 0) {
+        append('\nx86emu: ' + m.error + '\n', 'fail');
+        statusEl.innerHTML = `<b>failed</b> — ${m.error}`;
+      } else {
+        append(`\n[exit ${m.code}]\n`, 'done');
+        statusEl.innerHTML = `<b>${m.format || runLabel}</b> — exit ${m.code}, ` +
+          `${Math.round(m.insns).toLocaleString()} instructions in ${m.secs.toFixed(1)} s`;
+      }
+      setBusy(false);
+    }
   };
-  globalThis.x86emuLog = function (text) { append(text + '\n', 'note'); };
 
+  // ---- run an image ---------------------------------------------------------
   function setProgram(name, bytes) {
     program = { name, bytes };
-    runBtn.disabled = !mod;
+    runBtn.disabled = busy || !ready;
     statusEl.innerHTML = `<b>${name}</b> — ${bytes.length.toLocaleString()} bytes, ready`;
   }
-
-  function run() {
-    if (!mod || !program) return;
-    term.textContent = '';
+  function runProgram() {
+    if (!ready || !program || busy) return;
+    term.textContent = ''; runLabel = program.name;
     append(`$ x86emu ${program.name}\n`, 'note');
-
-    const bytes = program.bytes;
-    const ptr = mod._malloc(bytes.length);
-    mod.HEAPU8.set(bytes, ptr);
-    let code;
-    const started = performance.now();
-    try {
-      code = mod.ccall('emu_run', 'number',
-                       ['number', 'number', 'number', 'number'],
-                       [ptr, bytes.length,
-                        document.getElementById('tracecalls').checked ? 1 : 0,
-                        200000000]);
-    } finally {
-      mod._free(ptr);
-    }
-    const ms = performance.now() - started;
-    const insns = mod.ccall('emu_instructions', 'number', [], []);
-    const fmt = mod.ccall('emu_format', 'string', [], []);
-
-    if (code < 0) {
-      const err = mod.ccall('emu_error', 'string', [], []);
-      append('\nx86emu: ' + err + '\n', 'fail');
-      statusEl.innerHTML = `<b>failed</b> — ${err}`;
-    } else {
-      append(`\n[exit ${code}]\n`, 'done');
-      statusEl.innerHTML = `<b>${fmt}</b> — exit ${code}, ` +
-        `${insns.toLocaleString()} instructions in ${ms.toFixed(1)} ms`;
-    }
+    setBusy(true);
+    worker.postMessage({ type: 'runBytes', bytes: program.bytes,
+                         traceCalls: $('tracecalls').checked, maxInsns: 200000000 });
   }
 
-  // ---- input sources ------------------------------------------------------
+  // ---- run Python -----------------------------------------------------------
+  function runPython() {
+    if (!ready || !pythonLoaded || busy) return;
+    const code = $('code').value;
+    term.textContent = ''; runLabel = 'CPython';
+    append('$ python -S -c <editor>\n', 'note');
+    setBusy(true);
+    worker.postMessage({ type: 'runPath', path: '/py/python.exe',
+                         argv: ['/py/python.exe', '-S', '-c', code],
+                         traceCalls: $('tracecalls').checked, maxInsns: 5e9 });
+  }
+
+  $('pyload').addEventListener('click', () => $('pyfolder').click());
+  $('pyfolder').addEventListener('change', async () => {
+    const list = [...$('pyfolder').files];
+    if (!list.length) return;
+    $('pystate').textContent = `reading ${list.length} files…`;
+    // The embeddable package is flat; key by basename so python.exe/python313.zip
+    // land directly in /py where CPython's ._pth expects them.
+    const files = [];
+    for (const f of list) {
+      const name = f.name;
+      if (!name) continue;
+      files.push({ name, bytes: new Uint8Array(await f.arrayBuffer()) });
+    }
+    worker.postMessage({ type: 'writeFiles', dir: '/py', files });
+    pythonLoaded = true;
+    pyRunBtn.disabled = busy || !ready;
+    $('pystate').textContent = `${files.length} files in /py — ready`;
+  });
+  pyRunBtn.addEventListener('click', runPython);
+
+  // ---- input sources --------------------------------------------------------
   function readFile(f) {
     const reader = new FileReader();
     reader.onload = () => setProgram(f.name, new Uint8Array(reader.result));
@@ -215,16 +213,9 @@
   }
   dropEl.addEventListener('click', () => fileEl.click());
   fileEl.addEventListener('change', () => { if (fileEl.files[0]) readFile(fileEl.files[0]); });
-  ['dragenter', 'dragover'].forEach(ev => dropEl.addEventListener(ev, e => {
-    e.preventDefault(); dropEl.classList.add('over');
-  }));
-  ['dragleave', 'drop'].forEach(ev => dropEl.addEventListener(ev, e => {
-    e.preventDefault(); dropEl.classList.remove('over');
-  }));
-  dropEl.addEventListener('drop', e => {
-    const f = e.dataTransfer.files[0];
-    if (f) readFile(f);
-  });
+  ['dragenter', 'dragover'].forEach(ev => dropEl.addEventListener(ev, e => { e.preventDefault(); dropEl.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => dropEl.addEventListener(ev, e => { e.preventDefault(); dropEl.classList.remove('over'); }));
+  dropEl.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) readFile(f); });
 
   (globalThis.X86EMU_SAMPLES || []).forEach(s => {
     const b = document.createElement('button');
@@ -234,22 +225,13 @@
       const bytes = new Uint8Array(raw.length);
       for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
       setProgram(s.key, bytes);
-      run();
+      runProgram();
     });
-    document.getElementById('samples').appendChild(b);
+    $('samples').appendChild(b);
   });
 
-  runBtn.addEventListener('click', run);
-  document.getElementById('clear').addEventListener('click', () => { term.textContent = ''; });
-
-  createX86Emu().then(m => {
-    mod = m;
-    statusEl.textContent = 'Ready — pick a sample or drop in an executable.';
-    if (program) runBtn.disabled = false;
-  }).catch(err => {
-    statusEl.innerHTML = '<b>failed to load WebAssembly module</b>';
-    append(String(err) + '\n', 'fail');
-  });
+  runBtn.addEventListener('click', runProgram);
+  $('clear').addEventListener('click', () => { term.textContent = ''; });
 })();
 </script>
 </body>
