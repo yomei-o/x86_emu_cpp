@@ -193,9 +193,14 @@ void read_tls(Memory& mem, const std::vector<uint8_t>& f, const Headers& h, PeIm
     if (!rva) return;
     uint64_t dir = img.base + rva;
     int ps = h.plus ? 8 : 4;
-    // IMAGE_TLS_DIRECTORY: start, end, index address, callbacks array.
+    // IMAGE_TLS_DIRECTORY: raw data start and end, index address, callbacks
+    // array, then the zero-fill size.  The first four are addresses, not RVAs,
+    // and have already been relocated along with everything else.
+    img.tls_raw_start = mem.read_sized(dir, ps);
+    img.tls_raw_end = mem.read_sized(dir + static_cast<uint64_t>(ps), ps);
     img.tls_index_address = mem.read_sized(dir + static_cast<uint64_t>(ps) * 2, ps);
     uint64_t callbacks = mem.read_sized(dir + static_cast<uint64_t>(ps) * 3, ps);
+    img.tls_zero_fill = mem.read32(dir + static_cast<uint64_t>(ps) * 4);
     if (!callbacks) return;
     for (int i = 0; i < 64; ++i) {
         uint64_t fn = mem.read_sized(callbacks + static_cast<uint64_t>(i) * ps, ps);

@@ -165,16 +165,66 @@ void Emulator::install_win32_hooks() {
         std::memcpy(raw.data(), w.data(), w.size() * 2);
         e.set_result(e.alloc_guest_data(raw.data(), raw.size()));
     });
-    win32("GetEnvironmentStringsW", 0, [](Emulator& e) {
-        const uint8_t empty[4] = {0, 0, 0, 0};  // an empty double-NUL block
-        e.set_result(e.alloc_guest_data(empty, sizeof empty));
-    });
-    win32("GetEnvironmentStrings", 0, [](Emulator& e) {
-        const uint8_t empty[2] = {0, 0};
-        e.set_result(e.alloc_guest_data(empty, sizeof empty));
-    });
+    win32("GetEnvironmentStringsW", 0,
+          [](Emulator& e) { e.set_result(e.environment_block(true)); });
+    win32("GetEnvironmentStrings", 0,
+          [](Emulator& e) { e.set_result(e.environment_block(false)); });
+    win32("GetEnvironmentStringsA", 0,
+          [](Emulator& e) { e.set_result(e.environment_block(false)); });
     ret1("FreeEnvironmentStringsW", 1);
     ret1("FreeEnvironmentStringsA", 1);
+    // (name, buffer, size) -> characters written, or the size needed, or 0.
+    auto get_environment_variable = [](Emulator& e, bool wide) {
+        std::string name = wide ? utf16_to_utf8(e, e.arg_slot(0), -1)
+                                : e.mem.read_cstring(e.arg_slot(0));
+        uint64_t buf = e.arg_slot(1);
+        uint64_t size = e.arg_slot(2);
+        const std::string* value = e.getenv(name);
+        if (!value) {
+            e.set_last_error(203);  // ERROR_ENVVAR_NOT_FOUND
+            e.set_result(0);
+            return;
+        }
+        if (wide) {
+            std::u16string w = utf8_to_utf16(*value);
+            if (w.size() + 1 > size || !buf) {
+                e.set_result(w.size() + 1);  // the size the caller must provide
+                return;
+            }
+            for (size_t i = 0; i <= w.size(); ++i)
+                e.mem.write16(buf + i * 2, i < w.size() ? w[i] : 0);
+            e.set_result(w.size());
+        } else {
+            if (value->size() + 1 > size || !buf) {
+                e.set_result(value->size() + 1);
+                return;
+            }
+            e.mem.write_cstring(buf, *value);
+            e.set_result(value->size());
+        }
+    };
+    win32("GetEnvironmentVariableA", 3,
+          [get_environment_variable](Emulator& e) { get_environment_variable(e, false); });
+    win32("GetEnvironmentVariableW", 3,
+          [get_environment_variable](Emulator& e) { get_environment_variable(e, true); });
+    auto set_environment_variable = [](Emulator& e, bool wide) {
+        std::string name = wide ? utf16_to_utf8(e, e.arg_slot(0), -1)
+                                : e.mem.read_cstring(e.arg_slot(0));
+        uint64_t value_ptr = e.arg_slot(1);
+        if (!value_ptr) {
+            e.unsetenv(name);
+        } else {
+            e.setenv(name, wide ? utf16_to_utf8(e, value_ptr, -1)
+                                : e.mem.read_cstring(value_ptr));
+        }
+        e.set_result(1);
+    };
+    win32("SetEnvironmentVariableA", 2,
+          [set_environment_variable](Emulator& e) { set_environment_variable(e, false); });
+    win32("SetEnvironmentVariableW", 2,
+          [set_environment_variable](Emulator& e) { set_environment_variable(e, true); });
+    win32("ExpandEnvironmentStringsA", 3, [](Emulator& e) { e.set_result(0); });
+    win32("ExpandEnvironmentStringsW", 3, [](Emulator& e) { e.set_result(0); });
     win32("GetStartupInfoA", 1, [](Emulator& e) {
         uint64_t p = e.arg_slot(0);
         zero_fill(e, p, e.is64() ? 104 : 68);
@@ -584,6 +634,54 @@ void Emulator::install_ucrt_hooks() {
         e.mem.write_sized(out, ps, argv);
         e.set_result(out);
     });
+    ucrt("__p___wargv", [](Emulator& e) {
+        // A wchar_t*[] of the arguments, and a pointer to that array.
+        int ps = e.pointer_size();
+        std::vector<uint64_t> ptrs;
+        for (const auto& a : e.args()) {
+            std::u16string w = utf8_to_utf16(a);
+            std::vector<uint8_t> raw((w.size() + 1) * 2, 0);
+            std::memcpy(raw.data(), w.data(), w.size() * 2);
+            ptrs.push_back(e.alloc_guest_data(raw.data(), raw.size()));
+        }
+        std::vector<uint8_t> table((ptrs.size() + 1) * ps, 0);
+        uint64_t argv = e.alloc_guest_data(table.data(), table.size());
+        for (size_t i = 0; i < ptrs.size(); ++i)
+            e.mem.write_sized(argv + i * ps, ps, ptrs[i]);
+        std::vector<uint8_t> slot(ps, 0);
+        uint64_t out = e.alloc_guest_data(slot.data(), slot.size());
+        e.mem.write_sized(out, ps, argv);
+        e.set_result(out);
+    });
+    // `environ` and `_wenviron` are variables, so what a guest imports is the
+    // address of a pointer to the block.
+    ucrt("__p__environ", [](Emulator& e) {
+        int ps = e.pointer_size();
+        std::vector<uint8_t> slot(ps, 0);
+        uint64_t out = e.alloc_guest_data(slot.data(), slot.size());
+        e.mem.write_sized(out, ps, e.environment_vector());
+        e.set_result(out);
+    });
+    ucrt("__p__wenviron", [](Emulator& e) {
+        int ps = e.pointer_size();
+        std::vector<uint64_t> ptrs;
+        for (const auto& [k, v] : e.environment()) {
+            std::u16string w = utf8_to_utf16(k + "=" + v);
+            std::vector<uint8_t> raw((w.size() + 1) * 2, 0);
+            std::memcpy(raw.data(), w.data(), w.size() * 2);
+            ptrs.push_back(e.alloc_guest_data(raw.data(), raw.size()));
+        }
+        std::vector<uint8_t> table((ptrs.size() + 1) * ps, 0);
+        uint64_t block = e.alloc_guest_data(table.data(), table.size());
+        for (size_t i = 0; i < ptrs.size(); ++i)
+            e.mem.write_sized(block + i * ps, ps, ptrs[i]);
+        std::vector<uint8_t> slot(ps, 0);
+        uint64_t out = e.alloc_guest_data(slot.data(), slot.size());
+        e.mem.write_sized(out, ps, block);
+        e.set_result(out);
+    });
+    ucrt("_get_initial_wide_environment", [](Emulator& e) { e.set_result(0); });
+
     ucrt("_get_narrow_winmain_command_line", [](Emulator& e) {
         e.set_result(e.alloc_guest_string(command_line(e)));
     });

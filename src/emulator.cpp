@@ -1,11 +1,15 @@
 #include "emulator.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstring>
 
 #if defined(_WIN32)
 #include <fcntl.h>
 #include <io.h>
+#include <stdlib.h>  // _environ
+#else
+extern "C" char** environ;
 #endif
 
 namespace x86emu {
@@ -381,6 +385,91 @@ void Emulator::tls_set(uint32_t index, uint64_t value) {
     tls_slots_[index] = value;
 }
 
+void Emulator::seed_environment() {
+    // A language runtime finds its own installation through the environment, so
+    // the guest inherits the host's rather than starting empty.
+#if defined(_WIN32)
+    char** block = _environ;
+#else
+    char** block = environ;
+#endif
+    for (char** p = block; p && *p; ++p) {
+        std::string entry = *p;
+        size_t eq = entry.find('=');
+        // A leading '=' marks Windows's hidden per-drive current directories,
+        // which mean nothing here.
+        if (eq == std::string::npos || eq == 0) continue;
+        env_.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+    }
+}
+
+const std::string* Emulator::getenv(const std::string& name) const {
+    for (const auto& [k, v] : env_)
+        if (k == name) return &v;
+    return nullptr;
+}
+
+void Emulator::setenv(const std::string& name, const std::string& value) {
+    for (auto& [k, v] : env_) {
+        if (k == name) {
+            v = value;
+            return;
+        }
+    }
+    env_.emplace_back(name, value);
+}
+
+void Emulator::unsetenv(const std::string& name) {
+    for (size_t i = 0; i < env_.size(); ++i) {
+        if (env_[i].first == name) {
+            env_.erase(env_.begin() + static_cast<long>(i));
+            return;
+        }
+    }
+}
+
+uint64_t Emulator::environment_block(bool wide) {
+    std::string flat;
+    for (const auto& [k, v] : env_) {
+        flat += k;
+        flat += '=';
+        flat += v;
+        flat += ' ';
+    }
+    flat += ' ';  // the block ends with an empty string
+
+    if (!wide) return alloc_guest_data(flat.data(), flat.size());
+
+    std::vector<uint8_t> raw;
+    raw.reserve(flat.size() * 2);
+    for (char c : flat) {
+        raw.push_back(static_cast<uint8_t>(c));
+        raw.push_back(0);
+    }
+    return alloc_guest_data(raw.data(), raw.size());
+}
+
+uint64_t Emulator::environment_vector() {
+    int ps = pointer_size();
+    std::vector<uint64_t> pointers;
+    for (const auto& [k, v] : env_) pointers.push_back(alloc_guest_string(k + "=" + v));
+    std::vector<uint8_t> table((pointers.size() + 1) * ps, 0);
+    uint64_t base = alloc_guest_data(table.data(), table.size());
+    for (size_t i = 0; i < pointers.size(); ++i)
+        mem.write_sized(base + i * ps, ps, pointers[i]);
+    return base;
+}
+
+std::vector<std::string> Emulator::unimplemented_imports() const {
+    std::vector<std::string> names;
+    // resolve_import() names a stub "DLL!symbol"; a real hook is named after the
+    // function alone, so the separator is what tells them apart.
+    for (const auto& h : hooks_)
+        if (h.name.find('!') != std::string::npos) names.push_back(h.name);
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
 std::string Emulator::describe_address(uint64_t addr) const {
     if (addr >= hook_base_ && addr < hook_base_ + hooks_.size() * kHookStride) {
         size_t idx = static_cast<size_t>((addr - hook_base_) / kHookStride);
@@ -580,6 +669,7 @@ void Emulator::setup_windows_env(const std::vector<std::string>& args) {
     const uint64_t peb = teb_base_ + 0x2000;
     const uint64_t params = teb_base_ + 0x3000;
     const uint64_t tls_array = teb_base_ + 0x4000;
+    tls_array_ = tls_array;
     const int ps = pointer_size();
 
     // Command line and image path, as UNICODE_STRINGs.
@@ -725,6 +815,7 @@ void Emulator::load(const std::string& path, const std::vector<std::string>& arg
 
 void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<std::string>& args) {
     args_ = args;
+    seed_environment();
 
     // The layout and the hook addresses depend on the bitness, and PE import
     // binding needs the hook addresses, so peek at the headers first.
@@ -754,6 +845,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     install_library_hooks();
     install_math_hooks();
     install_file_hooks();
+    install_libc_hooks();
     if (os_kind == Os::Windows) {
         install_win32_hooks();
         install_ucrt_hooks();
@@ -793,6 +885,9 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
 #endif
+
+    // Reporting imports needs them bound but nothing run.
+    if (opt_.imports_only) return;
 
     cpu_->on_hook_call = [this](uint64_t addr) { return dispatch_hook(addr); };
     install_syscall_handlers();

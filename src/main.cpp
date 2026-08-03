@@ -25,6 +25,8 @@ void usage() {
                  "  -m, --map            print the guest memory map after loading\n"
                  "  -n, --max-insns N    stop after N instructions (0 = unlimited)\n"
                  "  -d, --dump ADDR[:N]  hex dump N bytes of guest memory after loading\n"
+                 "  -L, --libpath DIR    also look here for DLLs the guest imports\n"
+                 "      --imports        list imports with no implementation, then exit\n"
                  "  -h, --help           this text\n");
 }
 
@@ -51,6 +53,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
             opt.max_instructions = std::strtoull(argv[++i], nullptr, 0);
+        } else if (a == "--imports") {
+            opt.imports_only = true;
         } else if (a == "-L" || a == "--libpath") {
             if (i + 1 >= argc) {
                 usage();
@@ -101,7 +105,17 @@ int main(int argc, char** argv) {
         // possible and belongs in a message rather than escaping as a crash.
         std::fflush(stdout);
         std::fprintf(stderr, "x86emu: while loading %s: %s\n", program.c_str(), err.what());
+        if (const auto* fault = dynamic_cast<const x86emu::MemoryFault*>(&err)) {
+            std::string what = emu.describe_address(fault->addr);
+            if (!what.empty()) std::fprintf(stderr, "  %s\n", what.c_str());
+        }
+        std::fprintf(stderr, "  %s\n", emu.cpu().state_line().c_str());
         return 1;
+    }
+
+    if (opt.imports_only) {
+        for (const auto& name : emu.unimplemented_imports()) std::printf("%s\n", name.c_str());
+        return 0;
     }
 
     // Dumps happen after loading and before the first instruction, which is

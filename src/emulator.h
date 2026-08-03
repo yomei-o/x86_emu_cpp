@@ -42,6 +42,10 @@ public:
         // Where to look for DLLs the guest imports, beyond the program's own
         // directory and the working directory.
         std::vector<std::string> library_paths;
+        // Stop after binding imports, so they can be reported without running
+        // anything.  Bringing up a new guest is mostly a matter of reading this
+        // list and implementing what is on it.
+        bool imports_only = false;
     };
 
     // No default argument: a nested type's default member initializers are not
@@ -208,12 +212,32 @@ public:
                    : -1;
     }
 
+    // Imports that resolved to a "not implemented" stub rather than to a real
+    // hook or a loaded DLL.  Calling one of these is what fails.
+    std::vector<std::string> unimplemented_imports() const;
+
     // Explains what lives at an address, for fault reporting.  Returns an empty
     // string if there is nothing useful to say.
     std::string describe_address(uint64_t addr) const;
 
     void log_call(const char* fmt, ...);
     const std::vector<std::string>& args() const { return args_; }
+
+    // ---- environment -----------------------------------------------------
+    // Seeded from the host's environment, because a guest like a language
+    // runtime reads PATH and its own *HOME variables to find its files.
+    const std::string* getenv(const std::string& name) const;
+    void setenv(const std::string& name, const std::string& value);
+    void unsetenv(const std::string& name);
+    const std::vector<std::pair<std::string, std::string>>& environment() const {
+        return env_;
+    }
+    // The environment as a guest-memory block: "NAME=VALUE ...  ", narrow or
+    // wide.  Rebuilt on demand, since a guest may have changed it.
+    uint64_t environment_block(bool wide);
+    // A char*[] terminated by NULL, which is what `environ` and main's third
+    // argument are.
+    uint64_t environment_vector();
     uint64_t last_error() const { return last_error_; }
     void set_last_error(uint64_t e) { last_error_ = e; }
 
@@ -228,6 +252,7 @@ public:
     void install_library_hooks();
     void install_math_hooks();
     void install_file_hooks();
+    void install_libc_hooks();
     void install_win32_hooks();
     void install_ucrt_hooks();
     void install_syscall_handlers();
@@ -248,6 +273,7 @@ private:
     static constexpr uint64_t kFileObjectSize = 64;
 
     void choose_layout();
+    void seed_environment();
     bool dispatch_hook(uint64_t addr);
     // Fills in one image's import table, loading real DLLs where that is the
     // better answer and falling back to hooks otherwise.
@@ -257,6 +283,9 @@ private:
     // a stack, so initialisation waits until the environment exists - which is
     // also the order the real loader uses.
     void run_pending_module_init();
+    // Gives a module its slot in the thread's TLS array and fills that slot with
+    // a copy of the module's TLS template.
+    void setup_static_tls(Module& module);
     std::string find_library_file(const std::string& name) const;
     void setup_windows_env(const std::vector<std::string>& args);
     void setup_linux_stack(const std::vector<std::string>& args);
@@ -266,6 +295,7 @@ private:
     LoadedImage image_;
     std::unique_ptr<Cpu> cpu_;
     std::vector<std::string> args_;
+    std::vector<std::pair<std::string, std::string>> env_;
 
     std::vector<Hook> hooks_;
     std::unordered_map<std::string, uint64_t> hook_by_name_;
@@ -291,6 +321,10 @@ private:
     std::vector<std::unique_ptr<Module>> modules_;
     std::vector<uint64_t> exe_tls_callbacks_;
     bool guest_env_ready_ = false;
+    uint64_t errno_address_ = 0;  // the guest's errno variable
+    uint64_t lconv_address_ = 0;  // the guest's struct lconv
+    uint64_t tls_array_ = 0;      // TEB.ThreadLocalStoragePointer
+    uint32_t next_tls_slot_ = 0;  // next free index in that array
     // Handles for libraries answered by hooks; deliberately far from any real
     // mapping so that a stray dereference faults instead of reading a module.
     static constexpr uint64_t kHookedModuleBase = 0x00000000EE000000ull;

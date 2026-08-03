@@ -239,6 +239,35 @@ void Emulator::install_library_hooks() {
             static_cast<int64_t>(std::atoi(e.mem.read_cstring(e.arg_slot(0)).c_str()))));
     });
 
+    // ---- environment ---------------------------------------------------------
+    libc("getenv", [](Emulator& e) {
+        const std::string* v = e.getenv(e.mem.read_cstring(e.arg_slot(0)));
+        e.set_result(v ? e.alloc_guest_string(*v) : 0);
+    });
+    libc("_putenv", [](Emulator& e) {
+        // The argument is a single "NAME=VALUE" string; no '=' means remove.
+        std::string entry = e.mem.read_cstring(e.arg_slot(0));
+        size_t eq = entry.find('=');
+        if (eq == std::string::npos)
+            e.unsetenv(entry);
+        else if (eq + 1 == entry.size())
+            e.unsetenv(entry.substr(0, eq));
+        else
+            e.setenv(entry.substr(0, eq), entry.substr(eq + 1));
+        e.set_result(0);
+    });
+    libc("setenv", [](Emulator& e) {
+        std::string name = e.mem.read_cstring(e.arg_slot(0));
+        std::string value = e.mem.read_cstring(e.arg_slot(1));
+        bool overwrite = e.arg_slot(2) != 0;
+        if (overwrite || !e.getenv(name)) e.setenv(name, value);
+        e.set_result(0);
+    });
+    libc("unsetenv", [](Emulator& e) {
+        e.unsetenv(e.mem.read_cstring(e.arg_slot(0)));
+        e.set_result(0);
+    });
+
     // ---- misc runtime ------------------------------------------------------
     libc("time", [](Emulator& e) {
         auto now = static_cast<uint64_t>(std::time(nullptr));

@@ -209,8 +209,35 @@ void Emulator::bind_imports(PeImage& img) {
     }
 }
 
+void Emulator::setup_static_tls(Module& module) {
+    const PeImage& img = module.image;
+    if (!img.tls_index_address || img.tls_raw_end < img.tls_raw_start) return;
+
+    uint32_t slot = next_tls_slot_++;
+    uint64_t template_size = img.tls_raw_end - img.tls_raw_start;
+    uint64_t total = template_size + img.tls_zero_fill;
+    if (total == 0) total = 16;  // a module can declare TLS and use none of it
+
+    uint64_t block = heap_alloc(total);
+    if (!block) return;
+    std::vector<uint8_t> bytes(static_cast<size_t>(total), 0);
+    if (template_size) mem.read(img.tls_raw_start, bytes.data(), template_size);
+    mem.write(block, bytes.data(), bytes.size());
+
+    // The code compiled from __declspec(thread) reads the slot number from the
+    // module's own data and indexes the thread's array with it.
+    mem.write32(img.tls_index_address, slot);
+    mem.write_sized(tls_array_ + static_cast<uint64_t>(slot) * pointer_size(),
+                    pointer_size(), block);
+    log_call("static TLS for %s: slot %u, %llu bytes at 0x%llX", module.name.c_str(), slot,
+             (unsigned long long)total, (unsigned long long)block);
+}
+
 void Emulator::run_pending_module_init() {
     guest_env_ready_ = true;
+    // Every module's TLS block has to exist before any of them runs, because an
+    // initialiser in one may touch thread-local data in another.
+    for (auto& m : modules_) setup_static_tls(*m);
     // Dependencies were appended after their dependents, so initialise in reverse
     // to give each module its imports already live.
     for (size_t i = modules_.size(); i-- > 0;) run_module_init(*modules_[i]);

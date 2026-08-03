@@ -42,9 +42,15 @@ struct PeImage {
     std::unordered_map<uint32_t, uint64_t> exports_by_ordinal;
     std::unordered_map<std::string, std::string> forwarders;
 
-    // TLS callbacks the guest expects to run at load time.
+    // Static thread-local storage.  The image carries a template that the loader
+    // copies into a per-thread block, and stores that block's slot number where
+    // the code expects to find it - which is how `__declspec(thread)` compiles
+    // down to gs:[0x58] plus an index.
     std::vector<uint64_t> tls_callbacks;
-    uint64_t tls_index_address = 0;
+    uint64_t tls_index_address = 0;  // where to write the slot number
+    uint64_t tls_raw_start = 0;      // the template's bounds, as addresses
+    uint64_t tls_raw_end = 0;
+    uint64_t tls_zero_fill = 0;      // extra zeroed bytes after the template
 };
 
 // Reads just enough of the headers to know the CPU mode; throws LoadError if the
