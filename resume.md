@@ -108,6 +108,93 @@ Two need real behaviour rather than a plausible answer:
   sharing memory is what we already do; `fork` (no `CLONE_VM`) is not supportable
   and should say so.
 
+## Also next: our CPython, in the browser
+
+The other goal. The WebAssembly build already runs every other guest, so this is
+not a new port - it is plumbing files and argv through to it, and getting a
+multi-second run off the main thread.
+
+**The one thing that had to be true is true.** `web/build.sh` now passes
+`-sFORCE_FILESYSTEM=1` and exports `FS`, and with that the emulator's whole file
+layer works over the emscripten filesystem: `tests/bin/fileio64.exe` - a guest
+that creates, writes, seeks, reads back and deletes its own file - runs to
+completion under the wasm build and prints `file io ok`. So `fopen`, `fread`,
+`fseek` and `unlink` inside the guest reach MEMFS, which means `load_library()`
+can find a DLL there too.
+
+### 1. Which CPython to put in the page
+
+The **Windows embeddable package** is the right choice, and it is small:
+
+- `python.exe`, `python313.dll`, `python313.zip`, `python313._pth`
+- the standard library is *already* a zip, and CPython's `sys.path` includes
+  `<prefix>/python313.zip` by default, so zipimport does the rest - no thousands
+  of small files to materialise
+- around 10 MB uncompressed, roughly 5 MB over the wire
+- the PSF license file has to ship with it
+
+Everything needed to load it already works: PE loading, DLL relocation, static
+TLS, threads, and now a filesystem.
+
+### 2. Getting the files in
+
+`FS.writeFile('/py/python313.dll', bytes)` from JS, before running. Two ways to
+obtain the bytes, and both are worth having:
+
+- **fetched** from a prepared bundle next to the page, so it works on a first
+  visit with no setup
+- **dropped**, with `<input type="file" webkitdirectory>` - the visitor points at
+  their own Python install and it runs. Nothing leaves the browser, which is the
+  demo's whole character.
+
+Preloading with `--preload-file` also works but bakes the download into the page
+and makes the "drop your own" case impossible.
+
+### 3. Two API changes
+
+`emu_run(data, len, ...)` takes a single image in memory and hardcodes
+`argv = {"program"}`. Both have to go:
+
+- **`emu_run_path(path, argv_json, ...)`** - run a program already in the
+  filesystem, with a real argument list, so the page can do `python -c "..."` or
+  run a script. `Emulator::load()` already takes a path and an argv vector; the
+  wasm entry point is what is narrow, not the emulator.
+- keep the existing byte-array entry point for the small samples.
+
+### 4. Off the main thread
+
+CPython's startup is roughly 80 million instructions - about 3.6 s natively here,
+and slower under wasm. A synchronous call that long freezes the tab.
+
+**A Web Worker is the way**: `-sENVIRONMENT=web,worker,node` is already set, so
+the module loads in a worker unchanged. The worker owns the emulator, the page
+posts commands, `x86emuOutput` posts output lines back, and the console stays
+live while the guest runs. That is also the natural place to put a "stop" button,
+since the worker can be terminated.
+
+The alternative - an `emu_step(max_insns)` that returns "still running" and is
+driven from `requestAnimationFrame` - is more code and gives worse throughput,
+but it does keep everything on one thread if that matters.
+
+### 5. A REPL needs more than that
+
+Interactive Python needs to *block* on stdin, which a worker cannot do without
+either `SharedArrayBuffer` plus `Atomics.wait` (needs COOP/COEP response
+headers - **GitHub Pages cannot set them**, so this route means self-hosting) or
+Asyncify (`-sASYNCIFY`, which costs size and speed everywhere).
+
+So: non-interactive first. `-c`, a script, or a textarea whose whole contents are
+fed as a file. The emulator side needs an `input_source` callback next to
+`output_sink` for that - `Emulator::write_raw` is the model.
+
+### 6. Verify before touching the DOM
+
+`web/test_node.mjs` drives the same wasm build headlessly and is where this
+should be proven: populate MEMFS from node, call the new entry point, and diff
+the output against the same script run by a native CPython. Exactly the check
+that `tests/run_tests.sh` does for the native builds. The DOM wiring is the last
+step, not the first.
+
 ## Also unfinished
 
 - **C++ and SEH exception unwinding.** Installing a handler works; throwing does
