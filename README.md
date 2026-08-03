@@ -130,6 +130,8 @@ hello from the ELF guest!
 
 ## Browser demo
 
+**[Try it: yomei-o.github.io/x86_emu_cpp](https://yomei-o.github.io/x86_emu_cpp/)**
+
 The emulator core has no OS dependencies, so it compiles to WebAssembly as is.
 `web/index.html` is a page where dropping in a PE or ELF runs it and prints the
 guest's output to a console view.
