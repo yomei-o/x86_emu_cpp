@@ -4,3 +4,4 @@
 tests/expected/** -text
 # The bundled CPython (browser demo) ships byte-for-byte: never touch line endings.
 web/py/** -text
+web/pylinux/** -text

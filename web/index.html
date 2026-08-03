@@ -68,18 +68,19 @@
   <div class="panel">
     <h2>CPython</h2>
     <div class="row">
-      <button id="pybundled" class="primary">Use bundled Python 3.13 (~10 MB)</button>
-      <button id="pyload">Load your own install…</button>
+      <button id="pybundled" class="primary">Windows CPython 3.13 (~10 MB)</button>
+      <button id="pylinux" class="primary">Linux CPython 3.13 (~23 MB)</button>
+      <button id="pyload">Load your own (Windows)…</button>
       <input id="pyfolder" type="file" webkitdirectory hidden>
       <span id="pystate" style="font-size:.8125rem;color:var(--dim)">not loaded</span>
     </div>
     <p class="pyhint">
-      A stock CPython 3.13 (Windows embeddable) is bundled with this page — click
-      <em>Use bundled Python</em> and it downloads into the in-browser filesystem, then the
-      interpreter runs locally. Or point <em>Load your own install</em> at a Windows
-      <a href="https://www.python.org/downloads/windows/">embeddable CPython</a> folder
-      (the one with <code>python.exe</code> + <code>python313.zip</code>). Nothing is
-      uploaded either way.
+      Two stock CPython 3.13 interpreters are bundled with this page — a
+      <b>Windows</b> one (a PE that reaches the emulator's hooked Win32/CRT) and a
+      <b>Linux</b> one (a static ELF that talks straight to the emulator's syscall layer).
+      Pick either and it downloads into the in-browser filesystem and runs locally; nothing
+      is uploaded. <em>Load your own</em> takes a Windows
+      <a href="https://www.python.org/downloads/windows/">embeddable CPython</a> folder.
     </p>
     <textarea id="code" spellcheck="false">import sys, hashlib
 print("python", sys.version.split()[0])
@@ -119,8 +120,8 @@ print(sum(range(1000)))</textarea>
 
   let ready = false, busy = false;
   let program = null;      // { name, bytes }
-  let pythonLoaded = false;
-  let runStart = 0, runLabel = '';
+  let pyExe = null, pyArgs = [], pyLabel = '';   // loaded interpreter: path + flags before -c
+  let runLabel = '';
 
   const worker = new Worker('worker.js');
 
@@ -134,7 +135,7 @@ print(sum(range(1000)))</textarea>
   function setBusy(b) {
     busy = b;
     runBtn.disabled = b || !ready || !program;
-    pyRunBtn.disabled = b || !ready || !pythonLoaded;
+    pyRunBtn.disabled = b || !ready || !pyExe;
   }
 
   worker.onmessage = (e) => {
@@ -178,57 +179,92 @@ print(sum(range(1000)))</textarea>
 
   // ---- run Python -----------------------------------------------------------
   function runPython() {
-    if (!ready || !pythonLoaded || busy) return;
+    if (!ready || !pyExe || busy) return;
     const code = $('code').value;
-    term.textContent = ''; runLabel = 'CPython';
-    append('$ python -S -c <editor>\n', 'note');
+    term.textContent = ''; runLabel = pyLabel;
+    append(`$ ${pyExe.split('/').pop()} ${pyArgs.join(' ')} -c <editor>\n`, 'note');
     setBusy(true);
-    worker.postMessage({ type: 'runPath', path: '/py/python.exe',
-                         argv: ['/py/python.exe', '-S', '-c', code],
+    worker.postMessage({ type: 'runPath', path: pyExe,
+                         argv: [pyExe, ...pyArgs, '-c', code],
                          traceCalls: $('tracecalls').checked, maxInsns: 5e9 });
   }
 
-  // Both loaders end here: hand the files to the worker and enable Run Python.
-  // The embeddable package is flat, so files key by basename and land directly in
-  // /py where CPython's ._pth expects python313.zip.
-  function installPython(files) {
-    worker.postMessage({ type: 'writeFiles', dir: '/py', files });
-    pythonLoaded = true;
+  function selectInterpreter(exe, args, label, note) {
+    pyExe = exe; pyArgs = args; pyLabel = label;
     pyRunBtn.disabled = busy || !ready;
-    $('pystate').textContent = `${files.length} files in /py — ready`;
+    $('pystate').textContent = note;
+  }
+  function fetchProgress(what) {
+    return (loaded, total) => { $('pystate').textContent =
+      `downloading ${what}… ${(loaded/1e6).toFixed(1)}${total ? '/' + (total/1e6).toFixed(1) : ''} MB`; };
+  }
+  async function fetchBytes(url, onp) {
+    const res = await fetch(url);
+    const total = +res.headers.get('content-length') || 0;
+    const reader = res.body.getReader(); const chunks = []; let loaded = 0;
+    for (;;) { const { done, value } = await reader.read(); if (done) break;
+      chunks.push(value); loaded += value.length; if (onp) onp(loaded, total); }
+    const out = new Uint8Array(loaded); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+  async function gunzip(u8) {
+    const ds = new DecompressionStream('gzip');
+    const buf = await new Response(new Blob([u8]).stream().pipeThrough(ds)).arrayBuffer();
+    return new Uint8Array(buf);
+  }
+  // Minimal ustar reader: 512-byte headers, octal size at 124, type at 156.
+  function untar(buf) {
+    const files = []; const s = (o, n) => { let r = ''; for (let i = 0; i < n && buf[o+i]; i++) r += String.fromCharCode(buf[o+i]); return r; };
+    for (let o = 0; o + 512 <= buf.length;) {
+      let name = s(o, 100); if (!name) break;
+      const prefix = s(o + 345, 155); if (prefix) name = prefix + '/' + name;
+      let sz = 0; for (let i = 0; i < 11 && buf[o+124+i]; i++) sz = sz*8 + (buf[o+124+i]-48);
+      const type = buf[o + 156]; o += 512;
+      if (type === 0x30 || type === 0) files.push({ name: name.replace(/^\.\//, ''), bytes: buf.subarray(o, o+sz) });
+      o += Math.ceil(sz/512)*512;
+    }
+    return files;
   }
 
-  // Zero-setup: fetch the CPython bundled next to the page.
+  // ---- bundled Windows CPython (a flat embeddable package) -------------------
   $('pybundled').addEventListener('click', async () => {
     $('pybundled').disabled = true;
     try {
-      $('pystate').textContent = 'downloading Python…';
       const names = await (await fetch('py/manifest.json')).json();
       const files = [];
       let done = 0;
       for (const name of names) {
-        const buf = await (await fetch('py/' + name)).arrayBuffer();
-        files.push({ name, bytes: new Uint8Array(buf) });
-        $('pystate').textContent = `downloading Python… ${++done}/${names.length}`;
+        files.push({ name, bytes: await fetchBytes('py/' + name) });
+        $('pystate').textContent = `downloading Windows Python… ${++done}/${names.length}`;
       }
-      installPython(files);
-    } catch (err) {
-      $('pystate').textContent = 'download failed: ' + err.message;
-      $('pybundled').disabled = false;
-    }
+      worker.postMessage({ type: 'writeFiles', dir: '/py', files });
+      selectInterpreter('/py/python.exe', ['-S'], 'CPython (Windows)', `Windows Python ready (${files.length} files)`);
+    } catch (err) { $('pystate').textContent = 'failed: ' + err.message; $('pybundled').disabled = false; }
   });
 
+  // ---- bundled Linux CPython (static ELF + stdlib, gzip'd, unpacked here) ----
+  $('pylinux').addEventListener('click', async () => {
+    $('pylinux').disabled = true;
+    try {
+      const exe = await gunzip(await fetchBytes('pylinux/python3.13.gz', fetchProgress('Linux python')));
+      worker.postMessage({ type: 'writeFiles', dir: '/pyl/bin', files: [{ name: 'python3.13', bytes: exe }] });
+      $('pystate').textContent = 'unpacking stdlib…';
+      const lib = untar(await gunzip(await fetchBytes('pylinux/stdlib.tar.gz')));
+      worker.postMessage({ type: 'writeFiles', dir: '/pyl/lib/python3.13', files: lib });
+      selectInterpreter('/pyl/bin/python3.13', [], 'CPython (Linux)', `Linux Python ready (${lib.length} stdlib files)`);
+    } catch (err) { $('pystate').textContent = 'failed: ' + err.message; $('pylinux').disabled = false; }
+  });
+
+  // ---- load your own Windows install (folder) -------------------------------
   $('pyload').addEventListener('click', () => $('pyfolder').click());
   $('pyfolder').addEventListener('change', async () => {
     const list = [...$('pyfolder').files];
     if (!list.length) return;
     $('pystate').textContent = `reading ${list.length} files…`;
     const files = [];
-    for (const f of list) {
-      if (!f.name) continue;
-      files.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
-    }
-    installPython(files);
+    for (const f of list) { if (!f.name) continue; files.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) }); }
+    worker.postMessage({ type: 'writeFiles', dir: '/py', files });
+    selectInterpreter('/py/python.exe', ['-S'], 'CPython (Windows)', `Windows Python ready (${files.length} files)`);
   });
   pyRunBtn.addEventListener('click', runPython);
 

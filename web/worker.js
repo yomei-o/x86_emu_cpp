@@ -49,8 +49,12 @@ function mkdirp(dir) {
 
 function writeFiles(msg) {
   mkdirp(msg.dir);
-  for (const f of msg.files)
-    mod.FS.writeFile(msg.dir + '/' + f.name, new Uint8Array(f.bytes));
+  for (const f of msg.files) {
+    const full = msg.dir + '/' + f.name;      // f.name may contain subdirectories
+    const slash = full.lastIndexOf('/');
+    if (slash > 0) mkdirp(full.slice(0, slash));
+    mod.FS.writeFile(full, new Uint8Array(f.bytes));
+  }
   self.postMessage({ type: 'log', text: `loaded ${msg.files.length} files into ${msg.dir}` });
 }
 
