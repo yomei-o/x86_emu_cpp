@@ -1,0 +1,4 @@
+# Keep LF endings on checkout everywhere: the shell scripts need it, and
+# tests/expected/ files are compared byte for byte against guest output.
+* text=auto eol=lf
+tests/expected/** -text
