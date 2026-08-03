@@ -502,6 +502,26 @@ bool Cpu::execute_sse(uint8_t op) {
         }
 
         // ---- integer SIMD ---------------------------------------------------
+        case 0x63: case 0x67: case 0x6B: {  // PACKSSWB / PACKUSWB / PACKSSDW (signed/unsigned saturate)
+            if (sel != Sel::P66) return false;   // MMX form (no 66) unsupported
+            RM rm = decode_modrm();
+            Xmm a = xmm[modrm_reg_], b = xmm_read(rm), r{};
+            auto sat_sb = [](int32_t v) -> uint8_t { return v < -128 ? 0x80 : v > 127 ? 0x7F : static_cast<uint8_t>(v); };
+            auto sat_ub = [](int32_t v) -> uint8_t { return v < 0 ? 0 : v > 255 ? 0xFF : static_cast<uint8_t>(v); };
+            auto sat_sw = [](int32_t v) -> uint16_t { return v < -32768 ? 0x8000 : v > 32767 ? 0x7FFF : static_cast<uint16_t>(v); };
+            if (op == 0x6B) {  // PACKSSDW: 4 dwords from each -> 8 signed-saturated words
+                for (int i = 0; i < 4; ++i) r.w[i] = sat_sw(static_cast<int32_t>(a.d[i]));
+                for (int i = 0; i < 4; ++i) r.w[4 + i] = sat_sw(static_cast<int32_t>(b.d[i]));
+            } else {  // PACKSSWB (0x63) / PACKUSWB (0x67): 8 words from each -> 16 bytes
+                for (int i = 0; i < 8; ++i) {
+                    int16_t av = static_cast<int16_t>(a.w[i]), bv = static_cast<int16_t>(b.w[i]);
+                    r.b[i]     = op == 0x63 ? sat_sb(av) : sat_ub(av);
+                    r.b[8 + i] = op == 0x63 ? sat_sb(bv) : sat_ub(bv);
+                }
+            }
+            xmm[modrm_reg_] = r;
+            return true;
+        }
         case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A:
         case 0x6C: case 0x6D: {  // PUNPCK{L,H}{BW,WD,DQ,QDQ}
             if (sel != Sel::P66) return false;
