@@ -1,0 +1,199 @@
+# Where this is, and what to do next
+
+Working notes for picking the project back up. The README describes what the
+emulator *is*; this describes what is unfinished and what is known about it.
+
+## State
+
+Everything below is verified by diffing emulated output against native execution,
+byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
+33 tests):
+
+- x86-32 and x86-64 integer, SSE/SSE2, x87
+- PE32/PE32+ and ELF32/ELF64 loading; real DLLs with relocation, exports,
+  forwarders, `DllMain`, static TLS
+- libc, math, files, Win32, UCRT hooks across three ABIs
+- threads (Windows), with per-thread stacks, TEBs and TLS
+- **a stock CPython 3.13 for Windows runs its own standard library**
+
+The remaining work is breadth, not architecture. Nothing below needs a new
+subsystem except the ELF dynamic linker.
+
+## Next: CPython on Linux
+
+The goal. A Linux CPython is a different shape of problem from the Windows one:
+there is no import table to hook, so everything goes through the kernel
+interface in `src/syscalls.cpp`.
+
+**Two concrete gaps, both measured.** A statically linked probe built with
+`x86_64-linux-gnu-gcc -static` shows exactly what fails today:
+
+```
+readlink /proc/self/exe = -1        # we return -EINVAL
+readdir entries = 0                 # openat(".", O_DIRECTORY) = -13
+```
+
+### 1. Directory descriptors and `getdents64`
+
+`opendir(".")` issues `openat(AT_FDCWD, ".", O_RDONLY|O_DIRECTORY|O_CLOEXEC)`,
+which `FileTable::open` rejects because `fopen` cannot open a directory. The
+machinery for this already exists — `FileTable::open_directory()` was written for
+Windows' `os.stat`, which has the same problem — so this is wiring, not design:
+
+- in `open_flags_from_linux` (`src/syscalls_files.inc`), notice `O_DIRECTORY`
+  (0200000) and route to `open_directory()`
+- implement `getdents64` (x86-64 syscall 217, i386 220) over
+  `Emulator::list_directory()`, which already exists and sorts for
+  reproducibility. The `struct linux_dirent64` layout is
+  `{u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]}`, records
+  padded to 8 bytes, and the return value is the number of bytes written — zero
+  means the end. The cursor is per-descriptor, so `FileTable::Entry` needs a
+  listing plus an index, the way `find_handles_` does on the Windows side.
+- `d_type` matters: `DT_DIR` is 4 and `DT_REG` is 8, and a libc that gets
+  `DT_UNKNOWN` will `stat` every entry, which works but is slow.
+
+### 2. A small virtual `/proc`
+
+`readlink("/proc/self/exe")` is how a Unix runtime finds its own executable, and
+CPython's `getpath` depends on it. On a Windows host that path does not exist at
+all, so this cannot be passed through to the filesystem — it needs answering
+inside the emulator.
+
+Worth handling as a tiny table of synthetic paths rather than a special case in
+`readlink`, because several of them come up:
+
+| path | answer |
+| --- | --- |
+| `/proc/self/exe` | the program path (see `program_path()` in hooks_win32.cpp) |
+| `/proc/self/cwd` | the working directory |
+| `/proc/self/maps` | generated from `mem.regions()` |
+| `/proc/self/fd/N` | the path behind descriptor N |
+| `/proc/cpuinfo`, `/proc/meminfo` | short fixed text |
+| `/dev/urandom`, `/dev/random` | the deterministic generator `getrandom` uses |
+| `/dev/null` | discard on write, EOF on read |
+
+The natural place is a check at the top of `FileTable::open`/`stat_path` plus a
+`readlink` case in `syscalls_files.inc`.
+
+### 3. Which CPython to try
+
+In rough order of how much has to work first:
+
+1. **A statically linked CPython** — fewest moving parts, and the only one that
+   needs no dynamic linker. `python-build-standalone` publishes musl static
+   builds; a self-built `--disable-shared` CPython with its extension modules
+   listed in `Modules/Setup` as `*static*` also works. Try this first: if the two
+   gaps above are closed it may simply run.
+2. **A distribution CPython** — dynamically linked, so it needs the loader work
+   below.
+
+### 4. Syscalls a real CPython will want beyond those
+
+Cheap to add, and most of them only need a plausible answer:
+`statx` (newer glibc prefers it over `stat`), `pipe2`, `dup3`, `sigaltstack`,
+`rt_sigreturn`, `membarrier`, `sched_yield`, `sysinfo`, `getcwd` (currently
+returns `"."` — it should return the real one), `fchdir`, `renameat2`,
+`utimensat`, `poll`/`ppoll`, `eventfd2`, `clock_nanosleep`.
+
+Two need real behaviour rather than a plausible answer:
+
+- **`futex`** currently returns 0. Once threads exist on Linux it has to block
+  and wake, which the scheduler already supports — `begin_wait`/`signal_object`
+  in `src/threads.cpp` are the model. A futex is a wait queue keyed by a guest
+  address.
+- **`clone`** creates a thread. `Emulator::create_thread()` does the work
+  already; the syscall needs to map the `CLONE_*` flags onto it, honour
+  `CLONE_SETTLS` (which is where the new thread's `fs_base` comes from) and write
+  the child tid to both `parent_tid` and `child_tid` pointers when asked. Threads
+  sharing memory is what we already do; `fork` (no `CLONE_VM`) is not supportable
+  and should say so.
+
+## Also unfinished
+
+- **C++ and SEH exception unwinding.** Installing a handler works; throwing does
+  not. Needs the `.pdata`/`.xdata` tables walked on x64 and the `fs:[0]` chain on
+  x86. `tests/msvc/exc_msvc.cpp` is built but excluded from the suite, waiting for
+  it.
+- **ELF `ET_DYN`/PIE and dynamic linking.** Rejected at load time today. Two
+  routes: implement the dynamic linker (parse `PT_DYNAMIC`, `DT_NEEDED`,
+  relocations, symbol resolution), or — probably better — load
+  `ld-linux-x86-64.so.2` itself and let it do that work, which mainly requires
+  `mmap` with `MAP_FIXED`, `mprotect`, and the `AT_*` auxiliary vector being
+  right. The second route gets every dynamically linked binary at once.
+- **Processes and pipes.** `CreateProcess`, `CreatePipe`, `fork`/`execve`. This is
+  the one thing CPython on Windows still cannot do: `platform.uname()` wants a
+  subprocess.
+- **`msvcp140.dll` and `/MD` C++.** The DLL loads and its `DllMain` runs, but
+  `std::cout` is never constructed, so `tests/msvc/cpp_msvc_MD*` are excluded
+  from the suite. `/MT` works fully. Not investigated; the trail starts with the
+  `_initterm` calls made from that DLL's initialisation.
+- **AVX.** `CPUID` deliberately does not advertise it, so nothing uses it. A guest
+  built with `-march=native` on a modern machine would need it.
+- **Performance.** A plain decode-and-execute switch, roughly 3.6 s for
+  `sum(range(100000))` in CPython. A decoded-instruction cache keyed by address
+  would be the first thing to try, then threaded dispatch.
+
+## Practical notes
+
+### Building and testing
+
+```sh
+sh build.sh                    # or cmake -B build && cmake --build build
+sh tests/run_tests.sh          # 33 tests; PYTHON=... to point at an interpreter
+EMU=/path/to/other/x86emu sh tests/run_tests.sh   # test a different build
+sh tests/run_cross.sh          # every guest under one build, reporting the host
+```
+
+Test binaries are generated, not committed. Regenerate with
+`tests/build_pe_tests.sh`, `tests/dll/build.sh`, `./gen_elf_tests tests/bin`,
+`tests\msvc\build.bat` (Windows only), and `tests/linux/build.sh` (on Linux).
+
+The browser demo needs `sh web/make_samples.sh` then
+`EMCC=/path/to/emcc sh web/build.sh`; `node web/test_node.mjs` drives the same
+wasm build headlessly. `web/x86emu.js` is committed so GitHub Pages can serve it,
+so **rebuild and recommit it whenever `src/` changes**.
+
+### This machine
+
+- Windows 11 on **ARM64** — x86 binaries run natively through Windows' own
+  emulation, which is what makes the native-diff tests possible.
+- mingw-w64 g++ 14.2 (`w64devkit`), Visual Studio 2022 Community, emsdk at
+  `/c/prog/emsdk/emsdk`, CPython 3.13 **x64** at `C:\Python313`.
+- WSL `Ubuntu-20.04` is **aarch64**, with `x86_64-linux-gnu-gcc` for
+  cross-compiling Linux guests. There is no `i686-linux-gnu-gcc`, so 32-bit Linux
+  guests are not built and `tests/expected/hello_gcc32.out` does not exist.
+- System32 holds ARM64 DLLs; the x64 CRT redistributable is under
+  `VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT` if a real `msvcp140.dll` is needed.
+
+### Debugging, in order of usefulness
+
+1. `--imports` — lists imports that resolved to a "not implemented" stub. This is
+   how to bring up a new guest: read the list, implement what is on it.
+2. `--trace-calls` — logs intercepted calls and syscalls. Several hooks log their
+   arguments here (paths, in particular), which is usually what you want.
+3. The fault report — names what the address was (null, a hook for an imported
+   variable, inside the stack) and lists stack slots that look like return
+   addresses. That crude backtrace found a buffer overrun in the emulator's own
+   `FindFirstFileA`.
+4. `--dump ADDR[:N]` — hex dump after loading, before the first instruction.
+   Good for checking an image was mapped correctly.
+5. `--map` — the guest memory map and the hook region's extent.
+6. `--trace` — every instruction. Only for the last few hundred.
+
+For a guest that prints its own diagnostics, use them: `PYTHONVERBOSE=2` was what
+finally located CPython's import failure, and CPython's own traceback identified
+the `getpath` line number.
+
+### The lesson worth keeping
+
+Every bug in this project was silent, and none of them surfaced where it was
+made. `strchr(s, '\0')` returning NULL instead of the terminator presented as
+"source code cannot contain null bytes" on source containing none. Not setting
+`errno` presented as path resolution dying eight million instructions later.
+Aligning the stack after writing arguments presented as a 32-bit `DllMain`
+silently doing nothing.
+
+What caught them was, in every case, the same two things: **diffing against
+native execution byte for byte**, and **making the emulator name its own
+failures** instead of guessing. When adding anything, add the test that would
+have caught it being subtly wrong — not just absent.
