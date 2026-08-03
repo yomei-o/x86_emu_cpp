@@ -71,18 +71,22 @@ if ls tests/msvc/bin/*.exe >/dev/null 2>&1; then
 fi
 
 echo "ELF guests (emulated output vs. recorded expectation)"
-for exe in tests/bin/hello_elf32 tests/bin/hello_elf64; do
+# These cannot run natively on a Windows host, so each has a recorded output and
+# a recorded exit code in tests/expected/.  hello_elf* are hand-assembled by
+# tools/gen_elf_tests.cpp; *_gcc* are gcc builds against a real static glibc,
+# produced by tests/linux/build.sh.
+for exe in tests/bin/hello_elf32 tests/bin/hello_elf64 tests/bin/*_gcc32 tests/bin/*_gcc64; do
     [ -f "$exe" ] || continue
-    check_expected "$exe" 7 tests/expected/hello_elf.out
-done
-# Built by tests/linux/build.sh: gcc against a real glibc, linked statically, so
-# the libc runs inside the guest and only the kernel interface is emulated.
-for bits in 64 32; do
-    exe=tests/bin/hello_gcc$bits
-    want=tests/expected/hello_gcc$bits.out
-    if [ -f "$exe" ] && [ -f "$want" ]; then
-        check_expected "$exe" 3 "$want"
+    name=$(basename "$exe")
+    want=tests/expected/$name.out
+    want_rc_file=tests/expected/$name.exit
+    if [ ! -f "$want" ]; then
+        echo "  skip  $exe (no recorded output at $want)"
+        continue
     fi
+    want_rc=0
+    [ -f "$want_rc_file" ] && want_rc=$(cat "$want_rc_file")
+    check_expected "$exe" "$want_rc" "$want"
 done
 
 echo

@@ -1,0 +1,13 @@
+fwrite 17
+  1: alpha
+  2: beta
+  3: gamma
+slice [beta]
+write 6
+size 23
+fstat size 23
+read 23: alpha|beta|gamma|delta|
+stat size 23
+unlink 0
+access after unlink -1
+linux file io ok

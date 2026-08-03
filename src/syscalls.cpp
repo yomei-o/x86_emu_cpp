@@ -18,7 +18,9 @@ namespace {
 // architectures can share one implementation.
 enum class Sys {
     Unknown,
-    Read, Write, Writev, Close, Fstat, Ioctl,
+    Read, Write, Writev, Readv, Close, Fstat, Ioctl,
+    Open, Lseek, Stat, Lstat, Newfstatat, Unlink, Unlinkat, Rename,
+    Access, Faccessat, Getcwd, Dup, Dup2, Dup3, Pread, Pwrite, Ftruncate,
     Mmap, Munmap, Brk,
     Exit, ExitGroup,
     Getpid, Gettid, Uname, ClockGettime, Time,
@@ -40,7 +42,21 @@ Sys map_x86_64(uint64_t nr) {
         case 14: return Sys::RtSigprocmask;
         case 16: return Sys::Ioctl;
         case 20: return Sys::Writev;
+        case 2: return Sys::Open;
+        case 4: return Sys::Stat;
+        case 6: return Sys::Lstat;
+        case 8: return Sys::Lseek;
         case 10: return Sys::Mprotect;
+        case 17: return Sys::Pread;
+        case 18: return Sys::Pwrite;
+        case 19: return Sys::Readv;
+        case 21: return Sys::Access;
+        case 32: return Sys::Dup;
+        case 33: return Sys::Dup2;
+        case 77: return Sys::Ftruncate;
+        case 79: return Sys::Getcwd;
+        case 82: return Sys::Rename;
+        case 87: return Sys::Unlink;
         case 28: return Sys::Madvise;
         case 39: return Sys::Getpid;
         case 60: return Sys::Exit;
@@ -57,6 +73,10 @@ Sys map_x86_64(uint64_t nr) {
         case 228: return Sys::ClockGettime;
         case 231: return Sys::ExitGroup;
         case 257: return Sys::Openat;
+        case 262: return Sys::Newfstatat;
+        case 263: return Sys::Unlinkat;
+        case 269: return Sys::Faccessat;
+        case 292: return Sys::Dup3;
         case 273: return Sys::SetRobustList;
         case 302: return Sys::Prlimit64;
         case 318: return Sys::GetRandom;
@@ -86,7 +106,28 @@ Sys map_i386(uint64_t nr) {
         case 252: return Sys::ExitGroup;
         case 258: return Sys::SetTidAddress;
         case 265: return Sys::ClockGettime;
+        case 5: return Sys::Open;
+        case 19: return Sys::Lseek;
+        case 10: return Sys::Unlink;
+        case 33: return Sys::Access;
+        case 38: return Sys::Rename;
+        case 41: return Sys::Dup;
+        case 63: return Sys::Dup2;
+        case 93: return Sys::Ftruncate;
+        case 106: return Sys::Stat;
+        case 107: return Sys::Lstat;
         case 125: return Sys::Mprotect;
+        case 140: return Sys::Lseek;   // llseek
+        case 145: return Sys::Readv;
+        case 183: return Sys::Getcwd;
+        case 195: return Sys::Stat;    // stat64
+        case 196: return Sys::Lstat;   // lstat64
+        case 180: return Sys::Pread;
+        case 181: return Sys::Pwrite;
+        case 300: return Sys::Newfstatat;  // fstatat64
+        case 301: return Sys::Unlinkat;
+        case 307: return Sys::Faccessat;
+        case 330: return Sys::Dup3;
         case 219: return Sys::Madvise;
         case 240: return Sys::Futex;
         case 224: return Sys::Gettid;
@@ -108,31 +149,21 @@ void host_write(Emulator& e, int fd, const std::string& data) {
     e.write_raw(fd, data.data(), data.size());
 }
 
-// Fills in just the fields a libc actually looks at after fstat: the file type
-// (so it can pick line vs. block buffering) and the block size.
-void fake_stat(Emulator& e, uint64_t buf, bool is64, bool tty) {
-    uint32_t mode = (tty ? 0020000u : 0100000u) | 0666u;  // S_IFCHR / S_IFREG
-    if (is64) {
-        std::vector<uint8_t> zeros(144, 0);
-        e.mem.write(buf, zeros.data(), zeros.size());
-        e.mem.write32(buf + 24, mode);      // st_mode
-        e.mem.write64(buf + 56, 4096);      // st_blksize
-    } else {
-        std::vector<uint8_t> zeros(96, 0);
-        e.mem.write(buf, zeros.data(), zeros.size());
-        e.mem.write32(buf + 16, mode);      // st_mode
-        e.mem.write32(buf + 52, 4096);      // st_blksize
-    }
-}
+#include "syscalls_files.inc"
 
 int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
     switch (sys) {
         case Sys::Write: {
-            uint64_t fd = a[0], buf = a[1], len = a[2];
-            std::string data(static_cast<size_t>(len), '\0');
-            if (len) e.mem.read(buf, data.data(), len);
-            host_write(e, static_cast<int>(fd), data);
-            return static_cast<int64_t>(len);
+            int fd = static_cast<int>(a[0]);
+            std::string data(static_cast<size_t>(a[2]), '\0');
+            if (a[2]) e.mem.read(a[1], data.data(), a[2]);
+            // The standard streams go through the emulator's output path so a
+            // front end can capture them; anything else is a real file.
+            if (fd == 1 || fd == 2) {
+                host_write(e, fd, data);
+                return static_cast<int64_t>(a[2]);
+            }
+            return e.files.write(fd, data.data(), data.size());
         }
         case Sys::Writev: {
             uint64_t fd = a[0], iov = a[1], cnt = a[2];
@@ -150,18 +181,20 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             return static_cast<int64_t>(total);
         }
         case Sys::Read: {
-            uint64_t fd = a[0], buf = a[1], len = a[2];
-            if (fd != 0) return kEBADF;
-            std::vector<char> tmp(static_cast<size_t>(len));
-            size_t got = len ? std::fread(tmp.data(), 1, static_cast<size_t>(len), stdin) : 0;
-            if (got) e.mem.write(buf, tmp.data(), got);
-            return static_cast<int64_t>(got);
+            std::vector<uint8_t> tmp(static_cast<size_t>(a[2]));
+            int64_t got = a[2] ? e.files.read(static_cast<int>(a[0]), tmp.data(), a[2]) : 0;
+            if (got > 0) e.mem.write(a[1], tmp.data(), static_cast<uint64_t>(got));
+            return got;
         }
         case Sys::Close:
+            return e.files.close(static_cast<int>(a[0]));
+        case Sys::Fstat: {
+            FileTable::Stat st;
+            int r = e.files.stat_fd(static_cast<int>(a[0]), st);
+            if (r != 0) return r;
+            write_stat(e, a[1], st, e.is64());
             return 0;
-        case Sys::Fstat:
-            fake_stat(e, a[1], e.is64(), a[0] <= 2);
-            return 0;
+        }
         case Sys::Ioctl:
             return kENOTTY;  // "not a terminal" is a valid answer libc handles
         case Sys::Mmap: {
@@ -258,8 +291,6 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             return 0;  // running as root, which nothing here checks
         case Sys::Readlink:
             return -22;  // EINVAL: not a symlink
-        case Sys::Openat:
-            return -2;   // ENOENT: there is no filesystem
         // Signal handling, futexes and memory advice: a static libc sets these up
         // at startup, and since nothing is ever delivered and there is only one
         // thread, reporting success is accurate.
@@ -273,7 +304,9 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         case Sys::Ignored:
             return 0;
         default:
-            return kENOSYS;
+            // The file-related calls live in their own translation unit's worth of
+            // code, included below.
+            return do_file_syscall(e, sys, a);
     }
 }
 

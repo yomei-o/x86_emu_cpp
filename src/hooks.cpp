@@ -21,7 +21,12 @@ namespace {
 // ---------------------------------------------------------------------------
 
 void write_out(Emulator& e, int fd, const std::string& s) {
-    e.write_text(fd, s);
+    // The standard streams go through the emulator's output path (and its
+    // newline translation); anything else is a real file.
+    if (fd >= 0 && fd <= 2)
+        e.write_text(fd, s);
+    else if (fd > 2)
+        e.files.write(fd, s.data(), s.size());
 }
 
 // Resolves a guest FILE* to a host stream, defaulting to stdout when the guest

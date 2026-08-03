@@ -504,32 +504,46 @@ void Emulator::write_text(int fd, const std::string& data) {
 // ---------------------------------------------------------------------------
 
 uint64_t Emulator::guest_file(int fd) {
-    if (fd < 0 || fd > 2) return 0;
-    if (guest_files_[fd] == 0) {
-        // A small opaque object; the guest only ever passes the pointer back.
-        uint8_t blob[32] = {};
-        blob[0] = 'E';
-        blob[1] = 'M';
-        blob[2] = 'U';
-        blob[3] = static_cast<uint8_t>(fd);
-        guest_files_[fd] = alloc_guest_data(blob, sizeof blob);
+    auto it = guest_files_.find(fd);
+    if (it != guest_files_.end()) return it->second;
+
+    // The first three are allocated as one contiguous block, because a guest may
+    // reach them through an imported _iob[] array rather than one at a time.
+    if (guest_files_.empty()) {
+        std::vector<uint8_t> blob(3 * kFileObjectSize, 0);
+        uint64_t base = alloc_guest_data(blob.data(), blob.size());
+        for (int i = 0; i < 3; ++i) {
+            uint64_t obj = base + static_cast<uint64_t>(i) * kFileObjectSize;
+            mem.write32(obj, 0x554D4546);  // 'FEMU', so a stray pointer is obvious
+            mem.write32(obj + 4, static_cast<uint32_t>(i));
+            guest_files_[i] = obj;
+            guest_file_fds_[obj] = i;
+        }
+        if (fd >= 0 && fd <= 2) return guest_files_[fd];
     }
-    return guest_files_[fd];
+
+    std::vector<uint8_t> blob(kFileObjectSize, 0);
+    uint64_t obj = alloc_guest_data(blob.data(), blob.size());
+    mem.write32(obj, 0x554D4546);
+    mem.write32(obj + 4, static_cast<uint32_t>(fd));
+    guest_files_[fd] = obj;
+    guest_file_fds_[obj] = fd;
+    return obj;
 }
 
 int Emulator::host_fd(uint64_t ptr) const {
-    for (int fd = 0; fd < 3; ++fd)
-        if (guest_files_[fd] && guest_files_[fd] == ptr) return fd;
-    return -1;
-}
-
-std::FILE* Emulator::host_stream(uint64_t ptr) const {
-    switch (host_fd(ptr)) {
-        case 0: return stdin;
-        case 1: return stdout;
-        case 2: return stderr;
-        default: return nullptr;
+    auto it = guest_file_fds_.find(ptr);
+    if (it != guest_file_fds_.end()) return it->second;
+    // A guest that got its FILE* from something the emulator does not model (an
+    // imported _iob array, say) still deserves an answer; the object carries its
+    // descriptor, so read it back if the magic matches.
+    if (ptr) {
+        try {
+            if (mem.read32(ptr) == 0x554D4546) return static_cast<int>(mem.read32(ptr + 4));
+        } catch (const MemoryFault&) {
+        }
     }
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +717,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
 
     cpu_ = std::make_unique<Cpu>(mem, mode);
     cpu_->trace = opt_.trace;
+    files.set_text_translation(os_kind == Os::Windows);
 
     choose_layout();
     mem.map(stack_base_, stack_size_, "stack");
@@ -717,6 +732,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
 
     install_library_hooks();
     install_math_hooks();
+    install_file_hooks();
     if (os_kind == Os::Windows) {
         install_win32_hooks();
         install_ucrt_hooks();

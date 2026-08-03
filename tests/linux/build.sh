@@ -16,28 +16,26 @@ CC64=${CC64:-x86_64-linux-gnu-gcc}
 CC32=${CC32:-i686-linux-gnu-gcc}
 built=0
 
-if command -v "$CC64" >/dev/null 2>&1; then
-    if $CC64 -static -O1 -o $out/hello_gcc64 tests/linux/hello_gcc.c 2>$out/gcc64.log; then
-        echo "   $out/hello_gcc64"
-        rm -f $out/gcc64.log
-        built=$((built + 1))
-    else
-        echo "   skip hello_gcc64 (no static x86-64 libc?); see $out/gcc64.log"
+# Every .c here is built for whichever targets have a static libc available.
+build_one() {                   # build_one <compiler> <suffix> <source> <name>
+    cc=$1; suffix=$2; src=$3; name=$4
+    if ! command -v "$cc" >/dev/null 2>&1; then
+        echo "   skip $name$suffix ($cc not found)"
+        return 1
     fi
-else
-    echo "   skip hello_gcc64 ($CC64 not found)"
-fi
+    if $cc -static -O1 -o "$out/$name$suffix" "$src" 2>"$out/$name$suffix.log"; then
+        echo "   $out/$name$suffix"
+        rm -f "$out/$name$suffix.log"
+        return 0
+    fi
+    echo "   skip $name$suffix (no static libc for this target); see $out/$name$suffix.log"
+    return 1
+}
 
-if command -v "$CC32" >/dev/null 2>&1; then
-    if $CC32 -static -O1 -o $out/hello_gcc32 tests/linux/hello_gcc.c 2>$out/gcc32.log; then
-        echo "   $out/hello_gcc32"
-        rm -f $out/gcc32.log
-        built=$((built + 1))
-    else
-        echo "   skip hello_gcc32 (no static i686 libc?); see $out/gcc32.log"
-    fi
-else
-    echo "   skip hello_gcc32 ($CC32 not found)"
-fi
+for src in tests/linux/*.c; do
+    name=$(basename "$src" _gcc.c)
+    build_one "$CC64" 64 "$src" "${name}_gcc" && built=$((built + 1))
+    build_one "$CC32" 32 "$src" "${name}_gcc" && built=$((built + 1))
+done
 
 echo "built $built"

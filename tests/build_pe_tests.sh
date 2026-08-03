@@ -46,6 +46,17 @@ fmod
 ldexp
 frexp
 modf
+fopen
+fclose
+fread
+fwrite
+fseek
+ftell
+fputs
+fgets
+feof
+remove
+rename
 EOF
 
 echo "== generating import libraries"

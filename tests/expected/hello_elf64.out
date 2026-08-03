@@ -1,0 +1,4 @@
+hello from the ELF guest!
+count = 1
+count = 2
+count = 3

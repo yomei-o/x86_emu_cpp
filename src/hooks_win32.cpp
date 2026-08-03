@@ -209,44 +209,27 @@ void Emulator::install_win32_hooks() {
         });
     }
 
-    // ---- console and files ---------------------------------------------------
-    win32("GetStdHandle", 1, [](Emulator& e) {
-        // STD_INPUT/OUTPUT/ERROR_HANDLE are -10/-11/-12.
-        int32_t which = static_cast<int32_t>(e.arg_slot(0));
-        e.set_result(which == -10 ? 1 : which == -11 ? 2 : which == -12 ? 3 : 0);
-    });
+    // ---- console -------------------------------------------------------------
+    // The file-handle side of the console (GetStdHandle, WriteFile, GetFileType)
+    // lives in hooks_files.cpp, since those are the same operations a guest
+    // performs on any file.
     ret1("SetStdHandle", 2);
-    auto write_file = [](Emulator& e) {
-        uint64_t handle = e.arg_slot(0), buf = e.arg_slot(1), len = e.arg_slot(2);
-        uint64_t written_ptr = e.arg_slot(3);
+    win32("WriteConsoleA", 5, [](Emulator& e) {
+        uint64_t buf = e.arg_slot(1), len = e.arg_slot(2), written_ptr = e.arg_slot(3);
         std::string data(static_cast<size_t>(len), '\0');
         if (len) e.mem.read(buf, data.data(), len);
-        // WriteFile is a raw byte channel even on Windows: no text translation.
-        e.write_raw(handle == 3 ? 2 : 1, data.data(), data.size());
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        e.write_raw(fd == 2 ? 2 : 1, data.data(), data.size());
         if (written_ptr) e.mem.write32(written_ptr, static_cast<uint32_t>(len));
         e.set_result(1);
-    };
-    win32("WriteFile", 5, write_file);
-    win32("WriteConsoleA", 5, write_file);
+    });
     win32("WriteConsoleW", 5, [](Emulator& e) {
-        uint64_t handle = e.arg_slot(0), buf = e.arg_slot(1), units = e.arg_slot(2);
-        uint64_t written_ptr = e.arg_slot(3);
+        uint64_t buf = e.arg_slot(1), units = e.arg_slot(2), written_ptr = e.arg_slot(3);
         std::string utf8 = utf16_to_utf8(e, buf, static_cast<int>(units));
-        e.write_raw(handle == 3 ? 2 : 1, utf8.data(), utf8.size());
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        e.write_raw(fd == 2 ? 2 : 1, utf8.data(), utf8.size());
         if (written_ptr) e.mem.write32(written_ptr, static_cast<uint32_t>(units));
         e.set_result(1);
-    });
-    win32("ReadFile", 5, [](Emulator& e) {
-        uint64_t buf = e.arg_slot(1), len = e.arg_slot(2), read_ptr = e.arg_slot(3);
-        std::vector<char> tmp(static_cast<size_t>(len));
-        size_t got = len ? std::fread(tmp.data(), 1, tmp.size(), stdin) : 0;
-        if (got) e.mem.write(buf, tmp.data(), got);
-        if (read_ptr) e.mem.write32(read_ptr, static_cast<uint32_t>(got));
-        e.set_result(1);
-    });
-    win32("GetFileType", 1, [](Emulator& e) {
-        uint64_t h = e.arg_slot(0);
-        e.set_result(h >= 1 && h <= 3 ? 2u /* FILE_TYPE_CHAR */ : 0u);
     });
     // Failing here is deliberate: the CRT then treats stdout as a plain byte
     // stream and writes through WriteFile, which is a much simpler path than
@@ -254,11 +237,6 @@ void Emulator::install_win32_hooks() {
     ret0("GetConsoleMode", 2);
     ret0("SetConsoleMode", 2);
     ret0("GetConsoleOutputCP", 0);
-    ret1("FlushFileBuffers", 1);
-    ret1("SetFilePointerEx", 5);
-    ret1("CloseHandle", 1);
-    ret0("CreateFileW", 7);
-    ret0("CreateFileA", 7);
 
     // ---- memory --------------------------------------------------------------
     win32("GetProcessHeap", 0, [](Emulator& e) { e.set_result(0x00420000); });

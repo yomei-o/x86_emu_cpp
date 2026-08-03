@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "cpu.h"
+#include "files.h"
 #include "loader.h"
 #include "memory.h"
 
@@ -157,10 +158,25 @@ public:
     void write_text(int fd, const std::string& data);
     void write_raw(int fd, const void* data, size_t len);
 
-    // stdio: guest FILE* values are synthetic objects the emulator owns.
+    // ---- files ---------------------------------------------------------------
+    FileTable files;
+
+    // A guest FILE* is a small synthetic object the emulator owns, holding the
+    // descriptor it stands for; guest_file() creates one on demand.
     uint64_t guest_file(int fd);
-    std::FILE* host_stream(uint64_t guest_file_ptr) const;
     int host_fd(uint64_t guest_file_ptr) const;
+
+    // Win32 HANDLEs for files are descriptors in disguise.  The offset keeps them
+    // clear of 0 (NULL) and of the small integers a guest might treat specially.
+    static constexpr uint64_t kHandleBase = 0x1000;
+    static uint64_t handle_from_fd(int fd) {
+        return kHandleBase + static_cast<uint64_t>(fd);
+    }
+    static int fd_from_handle(uint64_t handle) {
+        return handle >= kHandleBase && handle < kHandleBase + 4096
+                   ? static_cast<int>(handle - kHandleBase)
+                   : -1;
+    }
 
     // Explains what lives at an address, for fault reporting.  Returns an empty
     // string if there is nothing useful to say.
@@ -181,6 +197,7 @@ public:
     // Installed by hooks.cpp, hooks_win32.cpp and syscalls.cpp.
     void install_library_hooks();
     void install_math_hooks();
+    void install_file_hooks();
     void install_win32_hooks();
     void install_ucrt_hooks();
     void install_syscall_handlers();
@@ -197,6 +214,8 @@ private:
     };
 
     static constexpr uint64_t kHookStride = 16;
+    // Big enough that a guest poking at "FILE internals" stays inside it.
+    static constexpr uint64_t kFileObjectSize = 64;
 
     void choose_layout();
     bool dispatch_hook(uint64_t addr);
@@ -224,7 +243,8 @@ private:
 
     uint64_t brk_ = 0;
     std::unordered_map<uint64_t, HeapBlock> heap_blocks_;
-    uint64_t guest_files_[3] = {};
+    std::unordered_map<int, uint64_t> guest_files_;   // fd -> guest FILE*
+    std::unordered_map<uint64_t, int> guest_file_fds_; // guest FILE* -> fd
     uint64_t last_error_ = 0;
     bool three_digit_exponents_ = false;
     uint64_t exit_thunk_ = 0;
