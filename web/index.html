@@ -97,7 +97,9 @@
     interpreter in C++, compiled here to WebAssembly. Drop in a Windows PE or a Linux
     ELF executable and it runs the machine code instruction by instruction — library
     calls like <code>printf</code> are intercepted and serviced by the emulator, so the
-    output lands in the console below.
+    output lands in the console below. The Visual Studio samples are ordinary
+    <code>cl /O2</code> builds: everything the C runtime does before
+    <code>main</code> runs here too.
   </p>
 
   <div class="panel">
@@ -126,8 +128,11 @@
 
   <footer>
     No files leave your browser: the emulator runs entirely client-side.
-    Guest floating-point arithmetic (x87/SSE) is not emulated yet, and ELF images
-    must be statically linked — see the repository README for the current limits.
+    Programs built by a stock Visual Studio or gcc toolchain work, including the
+    C runtime startup that runs before <code>main</code>. There is no AVX, no
+    exception unwinding, and ELF images must be statically linked — see the
+    <a href="https://github.com/yomei-o/x86_emu_cpp#current-limits">README</a>
+    for the full list.
   </footer>
 </main>
 
