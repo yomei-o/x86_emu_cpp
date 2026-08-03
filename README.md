@@ -11,10 +11,13 @@ because the emulator supplies the library and kernel interfaces itself. It also
 compiles to WebAssembly, so the same emulator runs an `.exe` in a browser tab.
 
 ```console
-$ ./x86emu hello.exe                        # a Visual Studio build, on Linux
-hello
-42 world ! 03.14
+$ ./x86emu C:/Python313/python.exe -c "print('hello from CPython')"
+hello from CPython
 ```
+
+That is a stock CPython 3.13 for Windows, interpreted instruction by instruction
+- and it runs the same way on Linux, on an ARM64 host, where neither the guest's
+OS nor its architecture is the host's.
 
 No dependencies beyond a C++17 standard library.
 
@@ -32,6 +35,7 @@ Verified by diffing emulated output against real native execution, byte for byte
 | threads, locks, events and per-thread storage | ✅ | ✅ |
 | the Win32 file API (`CreateFile`/`ReadFile`/`WriteFile`) | ✅ | ✅ |
 | directory enumeration (`FindFirstFile`/`FindNextFile`) | ✅ | ✅ |
+| **a stock CPython 3.13**, running its own standard library | — | ✅ |
 | gcc + glibc, `-static` (real libc inside the guest, kernel emulated) | — | ✅ |
 | hand-assembled ELF using raw syscalls | ✅ | ✅ |
 
@@ -39,6 +43,12 @@ The Visual Studio and static-glibc cases matter because everything before `main`
 is real: CPU feature probing, TLS setup, locale and stdio initialisation, table
 walks of static initialisers, and the runtime's own `printf` doing its own
 floating-point conversion.
+
+CPython is the case that ties everything together. `tests/python/smoke.py` runs
+under the emulator and is diffed against the same interpreter running natively -
+bigint arithmetic, SHA-256 and MD5 digests, float formatting, regular
+expressions, `namedtuple`, `lru_cache`, and file I/O all come out byte for byte
+identical.
 
 ## How it works
 
@@ -288,45 +298,54 @@ misbehaving quietly.
   to whatever `arch_prctl`/`set_thread_area` set on Linux; every other segment
   base is zero.
 
-### Working towards CPython
+### Running CPython
 
-A stock CPython 3.13 for x64 now runs its own standard library. `python313.dll`
-is loaded and relocated, static TLS is set up, path configuration resolves from
-the real installation, the import machinery finds and loads modules from
-`Lib`, and execution reaches Python code in `site.py`, `os.py`, `collections`
-and `functools`:
+A stock CPython 3.13 for x64 runs its own standard library:
 
 ```console
-$ ./x86emu C:/Python313/python.exe -c "print(1)"
-  File "C:/Python313/Lib/functools.py", line 455, in <module>
-    _CacheInfo = namedtuple("CacheInfo", [...])
+$ ./x86emu C:/Python313/python.exe tests/python/smoke.py
+version (3, 13, 7)
+bigint 1606938044258990275541962092341162602522202993782792835301376 886041711
+sha256 6d193b3da23041e26c65260e971964dfc229864f70a01881fbd7a6b5f7af5d3e
+namedtuple Point(x=3, y=4) 5.0
+fib 1548008755920
+regex [('a', '1'), ('bb', '22'), ('ccc', '333')]
+...
 ```
 
-What is left is a string-length bug rather than a missing capability: a source
-string CPython builds at runtime and hands to `eval` arrives with a trailing NUL,
-which the compiler rejects. It shows up both in `namedtuple` and in the `-c`
-command itself, so the common factor is a wide-to-narrow conversion returning a
-length that includes a terminator where the caller does not expect one.
+Byte for byte what the same interpreter prints natively. Getting there needed
+`python313.dll` loaded and relocated, static TLS, the import machinery reading
+real `.pyc` files, C extension modules compiled into the DLL, and threads for the
+runtime's own locking.
 
-Four bugs found on the way there, all of them silent, and each one a reminder
-that an emulator's failures are rarely where they appear:
+Five bugs stood in the way, and every one of them was silent - which is the
+recurring lesson of this project: an emulator's mistakes surface a long way from
+where they are made.
 
+- **`strchr(s, '\0')` returned NULL** instead of a pointer to the terminator.
+  Searching for the terminator is defined to *find* it - it is how a caller asks
+  where a string ends - and CPython's tokeniser uses exactly that idiom. The
+  symptom was `SyntaxError: source code cannot contain null bytes` from `compile`,
+  `eval`, `exec` and `-c`, on source that contained no null bytes.
 - **Hooks were not setting the guest's `errno`.** A libc distinguishes "not
   found" from "permission denied" by errno and nothing else, and CPython's path
-  search catches `FileNotFoundError` specifically — so a failed open that left
+  search catches `FileNotFoundError` specifically - so a failed open that left
   errno at zero raised a plain `OSError`, escaped the handler, and killed path
   resolution eight million instructions in.
-- **`FindFirstFileA` wrote the wide form of `WIN32_FIND_DATA`**, 274 bytes past
-  the end of a narrow caller's stack buffer, over the return address. It
-  presented as an inexplicable jump to address zero.
 - **`FILE_FLAG_BACKUP_SEMANTICS` was read as "this is a directory".** It is not:
   a stat implementation passes that flag for every path it looks at, files
   included, precisely so that one code path covers both. Every `os.stat` on a
-  file was therefore failing.
-- **`call_guest` aligned the stack after writing the arguments**, which moved the
+  file failed, which the import machinery reported as "module not found".
+- **`FindFirstFileA` wrote the wide form of `WIN32_FIND_DATA`**, 274 bytes past
+  the end of a narrow caller's stack buffer, over the return address. It
+  presented as an inexplicable jump to address zero.
+- **`call_guest` aligned the stack after writing the arguments**, moving the
   stack pointer away from them. 64-bit calls survived because their first four
   arguments are in registers; a 32-bit stdcall `DllMain` read its arguments from
   the wrong offsets and silently did nothing.
+
+What CPython still cannot do here is start a subprocess: `platform.uname()` wants
+`CreatePipe` and `CreateProcess`, which are not implemented.
 
 `--imports` lists what any given guest still needs.
 

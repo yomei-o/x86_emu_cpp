@@ -98,6 +98,31 @@ for exe in tests/bin/hello_elf32 tests/bin/hello_elf64 tests/bin/*_gcc32 tests/b
     check_expected "$exe" "$want_rc" "$want"
 done
 
+# A real CPython, if one is installed for the guest architecture: the strongest
+# test there is, since the same interpreter runs natively for comparison.  Set
+# PYTHON to point at one, or let this find the usual place.
+python_exe=${PYTHON:-}
+if [ -z "$python_exe" ]; then
+    for candidate in /c/Python313/python.exe /c/Python312/python.exe                      "$LOCALAPPDATA/Programs/Python/Python313/python.exe"; do
+        [ -x "$candidate" ] && python_exe=$candidate && break
+    done
+fi
+if [ -n "$python_exe" ] && [ -x "$python_exe" ]; then
+    echo "CPython (emulated output vs. native execution)"
+    nrc=0; "$python_exe" tests/python/smoke.py > "$tmp/native.out" 2>&1 || nrc=$?
+    erc=0; "$emu" "$python_exe" tests/python/smoke.py > "$tmp/emu.out" 2>&1 || erc=$?
+    if cmp -s "$tmp/native.out" "$tmp/emu.out" && [ "$nrc" = "$erc" ]; then
+        echo "  ok    tests/python/smoke.py (matches native, exit $nrc)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  tests/python/smoke.py (native exit $nrc, emulated exit $erc)"
+        diff "$tmp/native.out" "$tmp/emu.out" | head -20 || true
+        fail=$((fail + 1))
+    fi
+else
+    echo "CPython: skipped (no interpreter found; set PYTHON=/path/to/python.exe)"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

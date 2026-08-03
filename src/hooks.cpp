@@ -225,6 +225,14 @@ void Emulator::install_library_hooks() {
         uint64_t p = e.arg_slot(0);
         char c = static_cast<char>(e.arg_slot(1));
         std::string s = e.mem.read_cstring(p);
+        // Searching for the terminator is defined to find it, not to fail: it is
+        // how a caller asks "where does this string end?".  Returning NULL here
+        // is a real difference in behaviour - CPython's tokeniser uses exactly
+        // this idiom to find the end of a line of source.
+        if (c == '\0') {
+            e.set_result(p + s.size());
+            return;
+        }
         size_t pos = s.find(c);
         e.set_result(pos == std::string::npos ? 0 : p + pos);
     });

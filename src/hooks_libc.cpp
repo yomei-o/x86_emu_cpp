@@ -139,6 +139,7 @@ void Emulator::install_libc_hooks() {
         uint64_t p = e.arg_slot(0);
         std::string s = e.mem.read_cstring(p);
         char c = static_cast<char>(e.arg_slot(1));
+        // As with strchr, searching for the terminator finds it.
         size_t pos = c ? s.rfind(c) : s.size();
         e.set_result(pos == std::string::npos ? 0 : p + pos);
     });
@@ -201,7 +202,11 @@ void Emulator::install_libc_hooks() {
     libc("strncasecmp", [case_insensitive_compare](Emulator& e) { case_insensitive_compare(e, true); });
 
     // ---- wide strings -----------------------------------------------------------
-    libc("wcslen", [](Emulator& e) { e.set_result(read_wide(e, e.arg_slot(0)).size()); });
+    libc("wcslen", [](Emulator& e) {
+        size_t n = read_wide(e, e.arg_slot(0)).size();
+        e.log_call("wcslen(0x%llX) = %zu", (unsigned long long)e.arg_slot(0), n);
+        e.set_result(n);
+    });
     libc("wcscpy", [](Emulator& e) {
         uint64_t dst = e.arg_slot(0);
         write_wide(e, dst, read_wide(e, e.arg_slot(1)));

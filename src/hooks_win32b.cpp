@@ -155,6 +155,10 @@ void Emulator::install_win32_extra_hooks() {
                 while (skip < s.size() && !is_sep(s[skip])) ++skip;
                 while (skip < s.size() && is_sep(s[skip])) ++skip;
             }
+        } else if (!s.empty() && is_sep(s[0])) {
+            // A single leading separator is a drive-relative root ("\foo"), which
+            // is rooted even though it names no drive.
+            skip = 1;
         } else {
             e.set_result(0x80070057);  // E_INVALIDARG: the path is not rooted
             return;
