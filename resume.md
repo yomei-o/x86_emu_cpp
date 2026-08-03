@@ -212,11 +212,20 @@ step, not the first.
 
 ## Next: dynamic linking (real libc.so), and the ARM/macOS question
 
-Today's Linux CPython works only because it is *statically* linked (musl in the
-binary, `.so` count = 0, all extension modules builtin, `lib-dynload/` empty).
-That let us skip the dynamic linker entirely and emulate only syscalls. The next
-step is to run *dynamically* linked ELFs — i.e. supply/handle real `libc.so`, so a
-stock distro or python.org Linux Python runs without hunting for a `+static` build.
+**Progress 2026-08-03: route 2 works for the single-DSO case.** `elf_loader.cpp`
+now accepts `ET_DYN` (PIE): it biases the image to a load base, reads `PT_INTERP`,
+maps the named loader (`/lib/ld-musl-x86_64.so.1`) at `0x7f00_0000_0000`, sets the
+initial RIP to the loader's entry, and adds `AT_BASE` to the auxv (with `AT_ENTRY`
+still the real program). **Alpine busybox runs through its real ld-musl**
+(`web/test_dynamic.mjs`, ~170K insns). busybox needs no extra libraries — ld-musl
+*is* libc for musl — so it needed **no file-backed mmap**. That is the remaining
+piece below, and it is what a dynamic *CPython* will hit first (ld.so mmaps
+`libpython3.13.so` + the `lib-dynload/*.so`). The dynamic musl python
+(`pylinux/musl_io.tar.gz`, ET_DYN + those `.so`s) is the next target.
+
+Static Linux CPython already works because it is *statically* linked (musl in the
+binary, `.so` count = 0, extensions builtin). The dynamic path removes the need to
+hunt for a `+static` build — a stock distro / python.org Linux Python would run.
 
 **Windows is effectively already done** — a program's own DLLs load for real
 (`modules.cpp`: relocation, exports, `DllMain`, static TLS); only the system libc
