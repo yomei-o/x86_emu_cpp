@@ -336,6 +336,7 @@ void Emulator::install_win32_extra_hooks() {
         }
         int fd = e.files.open(path, f);
         e.log_call("_wfopen(%s, %s) = %d", path.c_str(), mode.c_str(), fd);
+        e.report_file_error(fd);
         e.set_result(fd < 0 ? 0 : e.guest_file(fd));
     });
     ucrt("_wopen", [](Emulator& e) {
@@ -352,6 +353,7 @@ void Emulator::install_win32_extra_hooks() {
         f.append = (flags & 0x0008) != 0;
         f.binary = true;
         int fd = e.files.open(path, f);
+        e.report_file_error(fd);
         e.set_result(static_cast<uint64_t>(static_cast<int64_t>(fd < 0 ? -1 : fd)));
     });
     ucrt("_wgetenv", [](Emulator& e) {

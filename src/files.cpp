@@ -127,9 +127,24 @@ int FileTable::open(const std::string& path, const OpenFlags& flags) {
     return fd;
 }
 
+int FileTable::open_directory(const std::string& path) {
+    Stat st;
+    if (stat_path(path, st) != 0) return kENOENT;
+    if (!st.is_dir) return kEINVAL;
+    int fd = alloc_slot();
+    if (fd < 0) return kEMFILE;
+    Entry e;
+    e.path = path;
+    e.readable = true;
+    e.is_directory = true;
+    files_[fd] = e;
+    return fd;
+}
+
 bool FileTable::valid(int fd) const {
     auto it = files_.find(fd);
-    return it != files_.end() && !it->second.closed && it->second.fp != nullptr;
+    return it != files_.end() && !it->second.closed &&
+           (it->second.fp != nullptr || it->second.is_directory);
 }
 
 FileTable::Entry* FileTable::get(int fd) {
@@ -141,9 +156,9 @@ FileTable::Entry* FileTable::get(int fd) {
 int FileTable::close(int fd) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (e->standard_stream) {
-        // Closing a standard stream must not close the host's copy; the guest
-        // just loses its descriptor.
+    if (e->standard_stream || e->is_directory) {
+        // Nothing to close: a standard stream belongs to the host, and a
+        // directory handle never had a stream at all.
         files_.erase(fd);
         return 0;
     }
@@ -155,7 +170,7 @@ int FileTable::close(int fd) {
 int64_t FileTable::read(int fd, void* dst, uint64_t len) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (!e->readable) return kEBADF;
+    if (!e->readable || e->is_directory) return kEBADF;
     if (len == 0) return 0;
     if (e->last_was_write) {
         std::fflush(e->fp);
@@ -179,7 +194,7 @@ int64_t FileTable::read(int fd, void* dst, uint64_t len) {
 int64_t FileTable::write(int fd, const void* src, uint64_t len) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (!e->writable) return kEBADF;
+    if (!e->writable || e->is_directory) return kEBADF;
     if (len == 0) return 0;
     if (!e->last_was_write && !e->standard_stream) {
         // Seeking to the current position is the standard way to switch a stream
@@ -207,7 +222,7 @@ int64_t FileTable::write(int fd, const void* src, uint64_t len) {
 int64_t FileTable::seek(int fd, int64_t offset, int whence) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (e->standard_stream) return kEINVAL;
+    if (e->standard_stream || e->is_directory) return kEINVAL;
     e->last_was_write = false;
     int origin = whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET;
 #if defined(_WIN32)
@@ -238,6 +253,7 @@ int64_t FileTable::size(int fd) {
 int FileTable::flush(int fd) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
+    if (e->is_directory) return 0;
     return std::fflush(e->fp) == 0 ? 0 : kEINVAL;
 }
 
@@ -294,6 +310,8 @@ int FileTable::stat_fd(int fd, Stat& out) {
         out.size = 0;
         return 0;
     }
+    // A directory handle has no stream to measure; the path is the whole answer.
+    if (e->is_directory) return stat_path(e->path, out);
     // Start from the path so mode and timestamps are right, then take the size
     // from the stream itself: Windows does not update a file's directory entry
     // until the handle is closed, so stat() on an open file can report a stale

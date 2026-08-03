@@ -504,6 +504,25 @@ std::vector<std::string> Emulator::unimplemented_imports() const {
     return names;
 }
 
+uint64_t Emulator::errno_address() {
+    if (!errno_address_) {
+        const uint32_t zero = 0;
+        errno_address_ = alloc_guest_data(&zero, sizeof zero);
+    }
+    return errno_address_;
+}
+
+void Emulator::set_guest_errno(int value) {
+    mem.write32(errno_address(), static_cast<uint32_t>(value));
+}
+
+void Emulator::report_file_error(int64_t code) {
+    if (code >= 0) return;
+    // FileTable speaks in negative Linux errno numbers, and the ones that matter
+    // here happen to have the same values in a Windows CRT.
+    set_guest_errno(static_cast<int>(-code));
+}
+
 std::string Emulator::stack_trace(int depth) {
     // Without unwind information the honest thing is to report every stack slot
     // that *could* be a return address, rather than pretend to know the frames.

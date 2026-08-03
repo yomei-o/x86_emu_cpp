@@ -290,23 +290,39 @@ misbehaving quietly.
 
 ### Working towards CPython
 
-A stock CPython 3.13 for x64 currently gets through its whole native startup —
-`python313.dll` is loaded, relocated and initialised, static TLS is set up, and
-the interpreter runs far enough to execute its own frozen `getpath` bytecode —
-and then stops with CPython's own `Fatal Python error: error evaluating path`,
-which is its path configuration failing to locate the standard library. So the
-machine underneath works; what is missing is more of the Windows filesystem
-surface it uses to find its files.
-
-`--imports` lists what a given guest still needs:
+A stock CPython 3.13 for x64 now gets a long way: `python313.dll` is loaded and
+relocated, static TLS is set up, the interpreter initialises, and it completes its
+whole path configuration from the real installation —
 
 ```console
-$ ./x86emu --imports C:/Python313/python.exe | wc -l
-195
+$ ./x86emu C:/Python313/python.exe -c "print(1)"
+  stdlib dir = 'C:\Python313\Lib'
+  sys.prefix = 'C:\Python313'
+  sys.path = ['C:\Python313\python313.zip', 'C:\Python313\DLLs',
+              'C:\Python313\Lib', 'C:\Python313']
 ```
 
-Most of those are imported but never called. The ones that matter next are
-directory enumeration (`FindFirstFileW`), the registry, and threads.
+— reaching its first real import before stopping at
+`init_fs_encoding: failed to get the Python codec of the filesystem encoding`.
+Directory enumeration and `os.stat` both work at that point (the emulator hands
+back all 189 entries of `Lib`, `traceback.py` among them), so what remains is
+somewhere in the import machinery's own lookup rather than in a missing
+operation.
+
+Two findings from getting this far were bugs worth naming, because both were
+silent:
+
+- **Hooks were not setting the guest's `errno`.** A libc distinguishes "not
+  found" from "permission denied" by errno and nothing else, and CPython's path
+  search catches `FileNotFoundError` specifically — so a failed open that left
+  errno at zero raised a plain `OSError`, escaped the handler, and killed path
+  resolution 8 million instructions in.
+- **`FindFirstFileA` wrote the wide form of `WIN32_FIND_DATA`**, 274 bytes past
+  the end of a narrow caller's stack buffer, over the return address. It
+  presented as an inexplicable jump to address zero, and the fault backtrace is
+  what caught it.
+
+`--imports` lists what any given guest still needs.
 
 ## License
 

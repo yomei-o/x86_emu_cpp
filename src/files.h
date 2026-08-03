@@ -40,6 +40,9 @@ public:
         // asking GetFileType deserves the real answer.
         bool standard_stream = false;
         bool is_tty = false;
+        // A directory handle has no stream behind it: Windows lets a program open
+        // a directory to ask about its attributes, which no C library can do.
+        bool is_directory = false;
         bool text_mode = false;  // a Windows guest opened it without "b"
         bool closed = false;
         // C forbids reading straight after writing on the same stream without an
@@ -58,6 +61,9 @@ public:
 
     // Returns a descriptor, or a negative errno-style code.
     int open(const std::string& path, const OpenFlags& flags);
+    // A descriptor that names a directory rather than a stream.  Only the
+    // metadata operations work on it, which is all Windows allows either.
+    int open_directory(const std::string& path);
     int close(int fd);
     // Negative return values are errno-style; otherwise a byte count.
     int64_t read(int fd, void* dst, uint64_t len);

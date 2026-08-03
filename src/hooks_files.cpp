@@ -81,6 +81,7 @@ void Emulator::install_file_hooks() {
         std::string mode = e.mem.read_cstring(e.arg_slot(1));
         int fd = e.files.open(path, parse_mode(mode));
         e.log_call("fopen(%s, %s) = %d", path.c_str(), mode.c_str(), fd);
+        e.report_file_error(fd);
         e.set_result(fd < 0 ? 0 : e.guest_file(fd));
     });
     libc("fopen_s", [](Emulator& e) {
@@ -89,6 +90,7 @@ void Emulator::install_file_hooks() {
         std::string path = e.mem.read_cstring(e.arg_slot(1));
         std::string mode = e.mem.read_cstring(e.arg_slot(2));
         int fd = e.files.open(path, parse_mode(mode));
+        e.report_file_error(fd);
         if (out) e.mem.write_sized(out, e.pointer_size(), fd < 0 ? 0 : e.guest_file(fd));
         e.set_result(fd < 0 ? 22 : 0);
     });
@@ -98,6 +100,7 @@ void Emulator::install_file_hooks() {
         int old = e.host_fd(e.arg_slot(2));
         if (old >= 3) e.files.close(old);
         int fd = e.files.open(path, parse_mode(mode));
+        e.report_file_error(fd);
         e.set_result(fd < 0 ? 0 : e.guest_file(fd));
     });
     libc("fclose", [](Emulator& e) {
@@ -231,6 +234,7 @@ void Emulator::install_file_hooks() {
         f.exclusive = (flags & 0x0400) != 0;
         f.binary = true;
         int fd = e.files.open(path, f);
+        e.report_file_error(fd);
         e.set_result(static_cast<uint64_t>(static_cast<int64_t>(fd < 0 ? -1 : fd)));
     });
     libc2("close", [](Emulator& e) {
@@ -303,9 +307,29 @@ void Emulator::install_file_hooks() {
         uint32_t access = static_cast<uint32_t>(e.arg_slot(1));
         uint32_t disposition = static_cast<uint32_t>(e.arg_slot(4));
 
+        uint32_t flags_and_attributes = static_cast<uint32_t>(e.arg_slot(5));
+
+        // Windows lets a program open a *directory* to ask about its attributes,
+        // which is how os.stat works there.  No C library can do that, so such a
+        // handle names the path without holding a stream.
+        FileTable::Stat probe;
+        bool is_directory = FileTable::stat_path(path, probe) == 0 && probe.is_dir;
+        if (is_directory || (flags_and_attributes & 0x02000000u) != 0) {
+            int dir_fd = e.files.open_directory(path);
+            if (dir_fd < 0) {
+                e.report_file_error(dir_fd);
+                e.set_last_error(win32_error_for(dir_fd));
+                e.set_result(~0ull);
+            } else {
+                e.set_result(Emulator::handle_from_fd(dir_fd));
+            }
+            return;
+        }
+
         FileTable::OpenFlags f;
         f.read = (access & 0x80000000u) != 0;   // GENERIC_READ
         f.write = (access & 0x40000000u) != 0;  // GENERIC_WRITE
+        // FILE_READ_ATTRIBUTES on its own is how a metadata-only open looks.
         if (!f.read && !f.write) f.read = true;
         switch (disposition) {
             case 1: f.create = true; f.exclusive = true; break;  // CREATE_NEW
@@ -317,6 +341,7 @@ void Emulator::install_file_hooks() {
         }
         int fd = e.files.open(path, f);
         if (fd < 0) {
+            e.report_file_error(fd);
             e.set_last_error(win32_error_for(fd));
             e.set_result(~0ull);  // INVALID_HANDLE_VALUE
         } else {

@@ -178,7 +178,9 @@ void Emulator::install_win32_fs_hooks() {
             e.set_result(0);
             return;
         }
-        write_find_data(e, e.arg_slot(1), *e.find_current(e.arg_slot(0)), true);
+        const auto* entry = e.find_current(e.arg_slot(0));
+        e.log_call("FindNextFileW -> %s", entry->name.c_str());
+        write_find_data(e, e.arg_slot(1), *entry, true);
         e.set_result(1);
     });
     win32("FindNextFileA", 2, [](Emulator& e) {
@@ -227,6 +229,7 @@ void Emulator::install_win32_fs_hooks() {
         // Logging the path is what makes "why can it not find its files?" a
         // question with an answer.
         e.log_call("stat(%s) = %d", path.c_str(), r);
+        e.report_file_error(r);
         if (r != 0) {
             e.set_result(static_cast<uint64_t>(static_cast<int64_t>(-1)));
             return;
@@ -277,7 +280,60 @@ void Emulator::install_win32_fs_hooks() {
         e.mem.write32(out + 40, 1);       // number of links
         e.set_result(1);
     });
-    win32("GetFileInformationByHandleEx", 4, [](Emulator& e) { e.set_result(0); });
+    // (handle, information class, buffer, size).  CPython's os.stat needs the
+    // attribute-tag class in particular: it opens the path, asks for the basic
+    // information, and then asks whether it is a reparse point.
+    win32("GetFileInformationByHandleEx", 4, [](Emulator& e) {
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        uint32_t info_class = static_cast<uint32_t>(e.arg_slot(1));
+        uint64_t out = e.arg_slot(2);
+        FileTable::Stat st;
+        if (fd < 0 || !out || e.files.stat_fd(fd, st) != 0) {
+            e.set_last_error(6);  // ERROR_INVALID_HANDLE
+            e.set_result(0);
+            return;
+        }
+        uint64_t ticks = to_filetime(st.mtime);
+        uint32_t attributes = st.is_dir ? 0x10u : 0x80u;
+        switch (info_class) {
+            case 0: {  // FileBasicInfo: four times then the attributes
+                std::vector<uint8_t> zeros(40, 0);
+                e.mem.write(out, zeros.data(), zeros.size());
+                e.mem.write64(out + 0, ticks);
+                e.mem.write64(out + 8, ticks);
+                e.mem.write64(out + 16, ticks);
+                e.mem.write64(out + 24, ticks);
+                e.mem.write32(out + 32, attributes);
+                break;
+            }
+            case 1: {  // FileStandardInfo
+                std::vector<uint8_t> zeros(24, 0);
+                e.mem.write(out, zeros.data(), zeros.size());
+                e.mem.write64(out + 0, (st.size + 4095) & ~4095ull);  // allocation size
+                e.mem.write64(out + 8, st.size);                      // end of file
+                e.mem.write32(out + 16, 1);                           // link count
+                e.mem.write8(out + 20, 0);                            // delete pending
+                e.mem.write8(out + 21, st.is_dir ? 1 : 0);
+                break;
+            }
+            case 9: {  // FileAttributeTagInfo: attributes and the reparse tag
+                e.mem.write32(out + 0, attributes);
+                e.mem.write32(out + 4, 0);  // not a reparse point
+                break;
+            }
+            case 18: {  // FileIdInfo: a volume serial and a 128-bit file id
+                std::vector<uint8_t> zeros(24, 0);
+                e.mem.write(out, zeros.data(), zeros.size());
+                e.mem.write64(out + 0, 0x1234);
+                break;
+            }
+            default:
+                e.set_last_error(87);  // ERROR_INVALID_PARAMETER
+                e.set_result(0);
+                return;
+        }
+        e.set_result(1);
+    });
     win32("SetFileInformationByHandle", 4, [](Emulator& e) { e.set_result(1); });
     win32("SetFileTime", 4, [](Emulator& e) { e.set_result(1); });
     win32("GetFinalPathNameByHandleW", 4, [](Emulator& e) {

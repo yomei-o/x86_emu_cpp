@@ -190,6 +190,72 @@ void Emulator::install_math_hooks() {
         }
     });
 
+    // The UCRT's own classification helpers, which is how fpclassify and isnan
+    // are actually implemented there.  Its constants are not the ones other
+    // libcs use, so they are spelled out rather than passed through.
+    enum : int32_t {
+        kFpInfinite = 1,
+        kFpNan = 2,
+        kFpNormal = -1,
+        kFpSubnormal = -2,
+        kFpZero = 0,
+    };
+    auto classify_double = [](double v) -> int32_t {
+        switch (std::fpclassify(v)) {
+            case FP_NAN: return kFpNan;
+            case FP_INFINITE: return kFpInfinite;
+            case FP_ZERO: return kFpZero;
+            case FP_SUBNORMAL: return kFpSubnormal;
+            default: return kFpNormal;
+        }
+    };
+    add("_dclass", [classify_double](Emulator& e) {
+        Args a(e);
+        e.set_result(static_cast<uint64_t>(
+            static_cast<int64_t>(classify_double(a.next_double_param()))));
+    });
+    add("_ldclass", [classify_double](Emulator& e) {
+        Args a(e);
+        e.set_result(static_cast<uint64_t>(
+            static_cast<int64_t>(classify_double(a.next_double_param()))));
+    });
+    add("_fdclass", [classify_double](Emulator& e) {
+        Args a(e);
+        e.set_result(static_cast<uint64_t>(
+            static_cast<int64_t>(classify_double(a.next_float_param()))));
+    });
+    // The _dtest family takes a pointer to the value instead of the value.
+    add("_dtest", [classify_double](Emulator& e) {
+        uint64_t p = e.arg_slot(0);
+        double v = 0;
+        if (p) {
+            uint64_t bits = e.mem.read64(p);
+            std::memcpy(&v, &bits, sizeof v);
+        }
+        e.set_result(static_cast<uint64_t>(static_cast<int64_t>(classify_double(v))));
+    });
+    add("_fdtest", [classify_double](Emulator& e) {
+        uint64_t p = e.arg_slot(0);
+        float v = 0;
+        if (p) {
+            uint32_t bits = e.mem.read32(p);
+            std::memcpy(&v, &bits, sizeof v);
+        }
+        e.set_result(static_cast<uint64_t>(static_cast<int64_t>(classify_double(v))));
+    });
+    add("_dsign", [](Emulator& e) {
+        Args a(e);
+        e.set_result(std::signbit(a.next_double_param()) ? 0x8000u : 0u);
+    });
+    add("_fdsign", [](Emulator& e) {
+        Args a(e);
+        e.set_result(std::signbit(a.next_float_param()) ? 0x8000u : 0u);
+    });
+    add("_ldsign", [](Emulator& e) {
+        Args a(e);
+        e.set_result(std::signbit(a.next_double_param()) ? 0x8000u : 0u);
+    });
+
     // msvcrt spells a few of these differently.
     add("_chgsign", [](Emulator& e) {
         Args a(e);

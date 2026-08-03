@@ -51,22 +51,15 @@ void Emulator::install_libc_hooks() {
     // ---- errno ---------------------------------------------------------------
     // errno is a variable, so what a guest calls is a function returning its
     // address.  One shared slot is right: there is one thread.
-    auto errno_slot = [this]() -> uint64_t {
-        if (!errno_address_) {
-            const uint32_t zero = 0;
-            errno_address_ = alloc_guest_data(&zero, sizeof zero);
-        }
-        return errno_address_;
-    };
-    libc("_errno", [errno_slot](Emulator& e) { e.set_result(errno_slot()); });
-    libc("__errno_location", [errno_slot](Emulator& e) { e.set_result(errno_slot()); });
-    libc("__doserrno", [errno_slot](Emulator& e) { e.set_result(errno_slot()); });
-    libc("_set_errno", [errno_slot](Emulator& e) {
-        e.mem.write32(errno_slot(), static_cast<uint32_t>(e.arg_slot(0)));
+    libc("_errno", [](Emulator& e) { e.set_result(e.errno_address()); });
+    libc("__errno_location", [](Emulator& e) { e.set_result(e.errno_address()); });
+    libc("__doserrno", [](Emulator& e) { e.set_result(e.errno_address()); });
+    libc("_set_errno", [](Emulator& e) {
+        e.set_guest_errno(static_cast<int>(e.arg_slot(0)));
         e.set_result(0);
     });
-    libc("_get_errno", [errno_slot](Emulator& e) {
-        if (e.arg_slot(0)) e.mem.write32(e.arg_slot(0), e.mem.read32(errno_slot()));
+    libc("_get_errno", [](Emulator& e) {
+        if (e.arg_slot(0)) e.mem.write32(e.arg_slot(0), e.mem.read32(e.errno_address()));
         e.set_result(0);
     });
     libc("strerror", [](Emulator& e) {

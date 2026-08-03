@@ -315,6 +315,15 @@ public:
     // string if there is nothing useful to say.
     std::string describe_address(uint64_t addr) const;
 
+    // The guest's errno.  A libc distinguishes "not found" from "permission
+    // denied" by this and nothing else, and control flow depends on the answer:
+    // CPython's path search catches FileNotFoundError specifically, so a failed
+    // open that leaves errno at 0 raises the wrong exception and escapes.
+    uint64_t errno_address();
+    void set_guest_errno(int value);
+    // Translates a FileTable result (a negative errno-style code) and records it.
+    void report_file_error(int64_t code);
+
     void log_call(const char* fmt, ...);
     const std::vector<std::string>& args() const { return args_; }
 
