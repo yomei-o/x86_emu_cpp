@@ -560,6 +560,27 @@ void Emulator::install_thread_hooks() {
         e.set_result(enter_lock(e, e.arg_slot(0), false) ? 1 : 0);
     });
 
+    // A condition variable is a pointer-sized object the caller owns.  With
+    // cooperative threads the wake operations have nothing to do: a waiter always
+    // re-checks its predicate after yielding.
+    win32("InitializeConditionVariable", 1, [](Emulator& e) {
+        if (e.arg_slot(0)) e.mem.write_sized(e.arg_slot(0), e.pointer_size(), 0);
+        e.set_result(0);
+    });
+    win32("WakeConditionVariable", 1, [](Emulator& e) { e.set_result(0); });
+    win32("WakeAllConditionVariable", 1, [](Emulator& e) { e.set_result(0); });
+    win32("InterlockedFlushSList", 1, [](Emulator& e) { e.set_result(0); });
+    win32("CreateWaitableTimerExW", 4, [](Emulator& e) {
+        e.set_result(e.create_sync_object(SyncObject::Kind::Event, true, false, 0));
+    });
+    win32("SetWaitableTimerEx", 6, [](Emulator& e) {
+        // Nothing measures wall-clock time here, so a timer that is immediately
+        // signalled is the closest honest behaviour.
+        e.signal_object(e.arg_slot(0));
+        e.set_result(1);
+    });
+    win32("CancelWaitableTimer", 1, [](Emulator& e) { e.set_result(1); });
+
     // A condition variable wait releases its lock, yields, and takes the lock
     // again - which with cooperative threads is enough for the usual
     // "wait until a predicate holds" loop to make progress.

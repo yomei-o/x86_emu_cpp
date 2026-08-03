@@ -19,6 +19,8 @@ EXPORTS
 printf
 puts
 putchar
+strcmp
+strcpy
 malloc
 free
 strlen
@@ -88,6 +90,11 @@ GetFileAttributesA@4 == GetFileAttributesA
 GetLastError@0 == GetLastError
 GetFileType@4 == GetFileType
 GetStdHandle@4 == GetStdHandle
+CreateDirectoryA@8 == CreateDirectoryA
+RemoveDirectoryA@4 == RemoveDirectoryA
+FindFirstFileA@8 == FindFirstFileA
+FindNextFileA@8 == FindNextFileA
+FindClose@4 == FindClose
 EOF
 cat > $out/kernel32_64.def <<'EOF'
 LIBRARY kernel32.dll
@@ -116,6 +123,11 @@ GetFileAttributesA
 GetLastError
 GetFileType
 GetStdHandle
+CreateDirectoryA
+RemoveDirectoryA
+FindFirstFileA
+FindNextFileA
+FindClose
 EOF
 
 echo "== generating import libraries"

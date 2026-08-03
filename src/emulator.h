@@ -270,6 +270,21 @@ public:
     // ---- files ---------------------------------------------------------------
     FileTable files;
 
+    // One entry from a directory listing, as FindFirstFile reports them.
+    struct DirectoryEntry {
+        std::string name;
+        bool is_dir = false;
+        uint64_t size = 0;
+        int64_t mtime = 0;
+    };
+    // Lists a directory, filtered by the wildcard in `spec` ("dir/*.py").
+    std::vector<DirectoryEntry> list_directory(const std::string& spec);
+    // The FindFirstFile/FindNextFile cursor, kept behind a handle.
+    uint64_t open_find_handle(std::vector<DirectoryEntry> entries);
+    const DirectoryEntry* find_current(uint64_t handle);
+    bool find_advance(uint64_t handle);
+    void close_find_handle(uint64_t handle);
+
     // A guest FILE* is a small synthetic object the emulator owns, holding the
     // descriptor it stands for; guest_file() creates one on demand.
     uint64_t guest_file(int fd);
@@ -290,6 +305,11 @@ public:
     // Imports that resolved to a "not implemented" stub rather than to a real
     // hook or a loaded DLL.  Calling one of these is what fails.
     std::vector<std::string> unimplemented_imports() const;
+
+    // A crude backtrace: the return addresses sitting near the top of the stack,
+    // each with whatever can be said about it.  Enough to answer "which call
+    // faulted?" without a full unwinder.
+    std::string stack_trace(int depth = 8);
 
     // Explains what lives at an address, for fault reporting.  Returns an empty
     // string if there is nothing useful to say.
@@ -330,6 +350,7 @@ public:
     void install_libc_hooks();
     void install_win32_hooks();
     void install_win32_extra_hooks();
+    void install_win32_fs_hooks();
     void install_ucrt_hooks();
     void install_syscall_handlers();
 
@@ -425,6 +446,12 @@ private:
     uint64_t thread_exit_thunk_ = 0;
     std::unordered_map<uint64_t, SyncObject> sync_objects_;
     uint64_t next_sync_handle_ = 0x8000;
+    struct FindState {
+        std::vector<DirectoryEntry> entries;
+        size_t index = 0;
+    };
+    std::unordered_map<uint64_t, FindState> find_handles_;
+    uint64_t next_find_handle_ = 0x30000;
     // Handles for libraries answered by hooks; deliberately far from any real
     // mapping so that a stray dereference faults instead of reading a module.
     static constexpr uint64_t kHookedModuleBase = 0x00000000EE000000ull;

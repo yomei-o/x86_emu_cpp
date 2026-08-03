@@ -31,6 +31,7 @@ Verified by diffing emulated output against real native execution, byte for byte
 | a program plus its own DLL, loaded for real | ✅ | ✅ |
 | threads, locks, events and per-thread storage | ✅ | ✅ |
 | the Win32 file API (`CreateFile`/`ReadFile`/`WriteFile`) | ✅ | ✅ |
+| directory enumeration (`FindFirstFile`/`FindNextFile`) | ✅ | ✅ |
 | gcc + glibc, `-static` (real libc inside the guest, kernel emulated) | — | ✅ |
 | hand-assembled ELF using raw syscalls | ✅ | ✅ |
 
@@ -147,6 +148,13 @@ usage: x86emu [options] <program> [guest args...]
   -L, --libpath DIR    also look here for DLLs the guest imports
       --imports        list imports with no implementation, then exit
 ```
+
+A fault reports what it can: what the address was (a null pointer, a hook for an
+imported variable, inside the stack), the register state, and the stack slots that
+look like return addresses. That last one is a crude backtrace rather than a real
+unwind, and it is what found a 274-byte overrun in the emulator's own
+`FindFirstFileA` - writing the wide form of `WIN32_FIND_DATA` into a narrow
+caller's buffer, which overwrote the guest's return address.
 
 `--imports` is how you bring up a new guest: it loads the program, binds every
 import, and prints the ones that resolved to a "not implemented" stub. Working
@@ -273,7 +281,9 @@ misbehaving quietly.
 - **No dynamic linking for ELF.** `ET_DYN`/PIE and anything needing `ld.so` are
   rejected at load time; statically linked `ET_EXEC` works. Windows DLLs *are*
   loaded for real.
-- **No registry, processes or pipes**, and no directory enumeration.
+- **No registry, processes or pipes.** The registry answers "not present", which
+  is a real answer: a runtime installed without registry entries has to cope, and
+  they all do.
 - Segmentation is flat: `fs:`/`gs:` resolve to a synthetic TEB/PEB on Windows and
   to whatever `arch_prctl`/`set_thread_area` set on Linux; every other segment
   base is zero.

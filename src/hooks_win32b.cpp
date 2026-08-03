@@ -96,6 +96,14 @@ void Emulator::install_win32_extra_hooks() {
         e.set_result(chdir(path.c_str()) == 0 ? 1 : 0);
 #endif
     });
+    win32("CreateDirectoryA", 2, [](Emulator& e) {
+        int r = make_directory(e.mem.read_cstring(e.arg_slot(0)));
+        if (r != 0) e.set_last_error(183);  // ERROR_ALREADY_EXISTS
+        e.set_result(r == 0 ? 1 : 0);
+    });
+    win32("RemoveDirectoryA", 1, [](Emulator& e) {
+        e.set_result(remove_directory(e.mem.read_cstring(e.arg_slot(0))) == 0 ? 1 : 0);
+    });
     win32("CreateDirectoryW", 2, [](Emulator& e) {
         int r = make_directory(utf16_to_utf8(e, e.arg_slot(0), -1));
         if (r != 0) e.set_last_error(183);  // ERROR_ALREADY_EXISTS
@@ -327,6 +335,7 @@ void Emulator::install_win32_extra_hooks() {
             f.write = plus;
         }
         int fd = e.files.open(path, f);
+        e.log_call("_wfopen(%s, %s) = %d", path.c_str(), mode.c_str(), fd);
         e.set_result(fd < 0 ? 0 : e.guest_file(fd));
     });
     ucrt("_wopen", [](Emulator& e) {

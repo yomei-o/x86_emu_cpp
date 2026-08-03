@@ -161,6 +161,8 @@ int main(int argc, char** argv) {
         std::string what = emu.describe_address(err.addr);
         if (!what.empty()) std::fprintf(stderr, "  %s\n", what.c_str());
         std::fprintf(stderr, "  %s\n", emu.cpu().state_line().c_str());
+        std::string trace = emu.stack_trace();
+        if (!trace.empty()) std::fprintf(stderr, "  possible callers:\n%s", trace.c_str());
         return 1;
     }
 }

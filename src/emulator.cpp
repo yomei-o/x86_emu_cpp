@@ -471,6 +471,29 @@ uint64_t Emulator::environment_vector() {
     return base;
 }
 
+uint64_t Emulator::open_find_handle(std::vector<DirectoryEntry> entries) {
+    uint64_t handle = next_find_handle_;
+    next_find_handle_ += 8;
+    find_handles_[handle] = FindState{std::move(entries), 0};
+    return handle;
+}
+
+const Emulator::DirectoryEntry* Emulator::find_current(uint64_t handle) {
+    auto it = find_handles_.find(handle);
+    if (it == find_handles_.end() || it->second.index >= it->second.entries.size())
+        return nullptr;
+    return &it->second.entries[it->second.index];
+}
+
+bool Emulator::find_advance(uint64_t handle) {
+    auto it = find_handles_.find(handle);
+    if (it == find_handles_.end()) return false;
+    ++it->second.index;
+    return it->second.index < it->second.entries.size();
+}
+
+void Emulator::close_find_handle(uint64_t handle) { find_handles_.erase(handle); }
+
 std::vector<std::string> Emulator::unimplemented_imports() const {
     std::vector<std::string> names;
     // resolve_import() names a stub "DLL!symbol"; a real hook is named after the
@@ -479,6 +502,43 @@ std::vector<std::string> Emulator::unimplemented_imports() const {
         if (h.name.find('!') != std::string::npos) names.push_back(h.name);
     std::sort(names.begin(), names.end());
     return names;
+}
+
+std::string Emulator::stack_trace(int depth) {
+    // Without unwind information the honest thing is to report every stack slot
+    // that *could* be a return address, rather than pretend to know the frames.
+    std::string out;
+    int ps = pointer_size();
+    uint64_t rsp = cpu_->regs[RSP];
+    int found = 0;
+    for (int i = 0; i < 64 && found < depth; ++i) {
+        uint64_t slot = rsp + static_cast<uint64_t>(i) * ps;
+        uint64_t value;
+        try {
+            value = mem.read_sized(slot, ps);
+        } catch (const MemoryFault&) {
+            break;
+        }
+        // A return address points into a mapped module.  Anything else is data,
+        // but it is still worth showing: a stack slot that looks like nothing is
+        // itself a clue.
+        Module* m = module_for(value);
+        if (!m && value < 0x10000) continue;
+        char line[192];
+        if (!m) {
+            std::snprintf(line, sizeof line, "    [rsp+%-4d] 0x%llX\n", i * ps,
+                          (unsigned long long)value);
+            out += line;
+            ++found;
+            continue;
+        }
+        std::snprintf(line, sizeof line, "    [rsp+%-4d] 0x%llX  %s+0x%llX\n", i * ps,
+                      (unsigned long long)value, m->name.c_str(),
+                      (unsigned long long)(value - m->image.base));
+        out += line;
+        ++found;
+    }
+    return out;
 }
 
 std::string Emulator::describe_address(uint64_t addr) const {
@@ -893,6 +953,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         install_thread_hooks();
         install_win32_hooks();
         install_win32_extra_hooks();
+        install_win32_fs_hooks();
         install_ucrt_hooks();
     }
 
