@@ -116,6 +116,11 @@ public:
 
     Memory& mem() { return mem_; }
     std::string state_line() const;
+
+    // The 32-bit ABI returns floating point in ST(0), so a hook standing in for
+    // a math function needs access to the x87 stack.
+    void fpu_push(double v);
+    double fpu_pop();
     static const char* reg_name(int i, int size);
 
     bool flag(uint64_t f) const { return (rflags & f) != 0; }
@@ -230,8 +235,6 @@ private:
     bool execute_sse(uint8_t op);
     // x87 lives in x87.cpp; handles the 0xD8-0xDF opcode block.
     void execute_x87(uint8_t op);
-    void fpu_push(double v);
-    double fpu_pop();
     double& fpu_reg(int i);  // i counts down from the top of the stack
     Xmm xmm_read(const RM& rm);           // 128-bit operand
     void xmm_write(const RM& rm, const Xmm& v);

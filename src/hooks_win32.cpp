@@ -178,6 +178,13 @@ void Emulator::install_win32_hooks() {
         e.set_result(processor_feature(static_cast<uint32_t>(e.arg_slot(0))) ? 1 : 0);
     });
     ret0("IsDebuggerPresent", 0);
+    // EncodePointer/DecodePointer obfuscate a stored function pointer against
+    // tampering.  An identity transform is a valid implementation - the CRT only
+    // requires that decode undoes encode.
+    win32("EncodePointer", 1, [](Emulator& e) { e.set_result(e.arg_slot(0)); });
+    win32("DecodePointer", 1, [](Emulator& e) { e.set_result(e.arg_slot(0)); });
+    win32("EncodeSystemPointer", 1, [](Emulator& e) { e.set_result(e.arg_slot(0)); });
+    win32("DecodeSystemPointer", 1, [](Emulator& e) { e.set_result(e.arg_slot(0)); });
     ret0("InitializeSListHead", 1);
     ret0("SetUnhandledExceptionFilter", 1);
     ret1("UnhandledExceptionFilter", 1);  // EXCEPTION_EXECUTE_HANDLER

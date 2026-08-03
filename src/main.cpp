@@ -131,6 +131,9 @@ int main(int argc, char** argv) {
     } catch (const x86emu::MemoryFault& err) {
         std::fflush(stdout);
         std::fprintf(stderr, "\nx86emu: %s\n", err.what());
+        // Saying what the address is turns "unmapped read" into an explanation.
+        std::string what = emu.describe_address(err.addr);
+        if (!what.empty()) std::fprintf(stderr, "  %s\n", what.c_str());
         std::fprintf(stderr, "  %s\n", emu.cpu().state_line().c_str());
         return 1;
     }

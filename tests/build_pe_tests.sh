@@ -24,6 +24,28 @@ free
 strlen
 memset
 exit
+sin
+cos
+tan
+asin
+acos
+atan
+atan2
+exp
+log
+log10
+pow
+sqrt
+sinh
+cosh
+tanh
+fabs
+ceil
+floor
+fmod
+ldexp
+frexp
+modf
 EOF
 
 echo "== generating import libraries"

@@ -73,6 +73,12 @@ uint64_t Emulator::add_hook(std::string name, int stdcall_bytes,
 }
 
 uint64_t Emulator::resolve_import(const std::string& dll, const std::string& symbol) {
+    // Which C runtime the guest links against changes observable formatting, so
+    // note it while the DLL name is in front of us.
+    std::string lower;
+    for (char c : dll) lower += static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    if (lower.compare(0, 6, "msvcrt") == 0) three_digit_exponents_ = true;
+
     auto it = hook_by_name_.find(symbol);
     if (it != hook_by_name_.end()) return it->second;
 
@@ -175,6 +181,76 @@ double Emulator::Args::next_double() {
     double d;
     std::memcpy(&d, &bits, sizeof d);
     return d;
+}
+
+double Emulator::Args::next_double_param() {
+    if (from_memory_) return next_double();
+    switch (e_->abi()) {
+        case Abi::Cdecl32:
+            return next_double();  // two stack slots, same as the variadic case
+        case Abi::MsX64: {
+            // Position-based: the Nth argument travels in XMM(N), sharing the
+            // counter with the integer registers, and spills to the stack past
+            // the fourth.
+            uint64_t bits;
+            if (i_ < 4)
+                bits = e_->cpu_->xmm[i_].q[0];
+            else
+                bits = e_->mem.read64(e_->cpu_->regs[RSP] + 8 + 32 +
+                                      static_cast<uint64_t>(i_ - 4) * 8);
+            ++i_;
+            double d;
+            std::memcpy(&d, &bits, sizeof d);
+            return d;
+        }
+        default: {  // SysV64: floating point has its own register sequence
+            uint64_t bits;
+            if (fp_ < 8)
+                bits = e_->cpu_->xmm[fp_++].q[0];
+            else
+                bits = next_slot();
+            double d;
+            std::memcpy(&d, &bits, sizeof d);
+            return d;
+        }
+    }
+}
+
+float Emulator::Args::next_float_param() {
+    if (!e_->is64()) {
+        // A float parameter occupies one 4-byte stack slot in 32-bit code.
+        uint32_t bits = static_cast<uint32_t>(next_slot());
+        float f;
+        std::memcpy(&f, &bits, sizeof f);
+        return f;
+    }
+    uint32_t bits;
+    if (e_->abi() == Abi::MsX64)
+        bits = i_ < 4 ? e_->cpu_->xmm[i_++].d[0] : static_cast<uint32_t>(next_slot());
+    else
+        bits = fp_ < 8 ? e_->cpu_->xmm[fp_++].d[0] : static_cast<uint32_t>(next_slot());
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+void Emulator::set_result_double(double v) {
+    if (is64()) {
+        cpu_->xmm[0] = Cpu::Xmm{};
+        cpu_->xmm[0].f64[0] = v;
+    } else {
+        // The 32-bit ABI returns floating point on the x87 stack.
+        cpu_->fpu_push(v);
+    }
+}
+
+void Emulator::set_result_float(float v) {
+    if (is64()) {
+        cpu_->xmm[0] = Cpu::Xmm{};
+        cpu_->xmm[0].f32[0] = v;
+    } else {
+        cpu_->fpu_push(v);
+    }
 }
 
 void Emulator::set_result(uint64_t v) {
@@ -282,6 +358,24 @@ uint64_t Emulator::tls_get(uint32_t index) const {
 void Emulator::tls_set(uint32_t index, uint64_t value) {
     if (index >= tls_slots_.size()) tls_slots_.resize(index + 1, 0);
     tls_slots_[index] = value;
+}
+
+std::string Emulator::describe_address(uint64_t addr) const {
+    if (addr >= hook_base_ && addr < hook_base_ + hooks_.size() * kHookStride) {
+        size_t idx = static_cast<size_t>((addr - hook_base_) / kHookStride);
+        // Reading from a hook address rather than calling it means the guest
+        // imported a *variable*, not a function - the loader cannot tell the two
+        // apart, so it binds both to a hook.
+        return "this is the hook for '" + hooks_[idx].name +
+               "'; reading it as data means the guest imports it as a variable, "
+               "which needs the real DLL loaded";
+    }
+    if (addr >= image_.image_base && addr < image_.image_base + image_.image_size)
+        return "inside the loaded image";
+    if (addr >= stack_base_ && addr < stack_top_) return "inside the stack";
+    if (addr >= heap_base_ && addr < heap_limit_) return "inside the heap";
+    if (addr < 0x10000) return "a null or near-null pointer";
+    return {};
 }
 
 void Emulator::log_call(const char* fmt, ...) {
@@ -622,6 +716,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     nested_return_ = add_hook("__emu_nested_return__", 0, [](Emulator&) {});
 
     install_library_hooks();
+    install_math_hooks();
     if (os_kind == Os::Windows) {
         install_win32_hooks();
         install_ucrt_hooks();

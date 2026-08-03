@@ -20,6 +20,27 @@ int64_t sign_extend(uint64_t v, int bytes) {
     }
 }
 
+// Rewrites the exponent of a formatted %e/%g result to a fixed minimum number of
+// digits.  Two things make this necessary: the old msvcrt prints three digits
+// where C99 prints two, and host C runtimes do not all agree either - doing it
+// here keeps guest output identical whatever the emulator was built with.
+void normalise_exponent(std::string& s, int min_digits) {
+    size_t e = s.find_last_of("eE");
+    if (e == std::string::npos || e + 2 >= s.size()) return;
+    size_t p = e + 1;
+    if (s[p] == '+' || s[p] == '-') ++p;
+    size_t start = p;
+    while (p < s.size() && s[p] >= '0' && s[p] <= '9') ++p;
+    if (p == start) return;
+
+    std::string digits = s.substr(start, p - start);
+    // Strip leading zeroes, then pad back up to the requested width.
+    size_t first = digits.find_first_not_of('0');
+    digits = first == std::string::npos ? "0" : digits.substr(first);
+    while (static_cast<int>(digits.size()) < min_digits) digits.insert(digits.begin(), '0');
+    s.replace(start, p - start, digits);
+}
+
 std::string pad(const std::string& s, int width, bool left_align) {
     if (width <= 0 || static_cast<int>(s.size()) >= width) return s;
     std::string fill(static_cast<size_t>(width) - s.size(), ' ');
@@ -190,8 +211,34 @@ std::string format_guest(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va) {
             case 'A': {
                 double d = va.next_double();
                 buf.resize(buf.size() + 512);  // %f of a huge value is long
+                bool has_exponent = conv != 'f' && conv != 'F';
+                if (!has_exponent) {
+                    std::snprintf(buf.data(), buf.size(), host_spec("", conv).c_str(), d);
+                    out += buf.data();
+                    break;
+                }
+                // Rewriting the exponent changes the length, so the field width
+                // has to be applied afterwards rather than by the host.
+                int saved_width = width;
+                bool saved_has_width = has_width;
+                has_width = false;
                 std::snprintf(buf.data(), buf.size(), host_spec("", conv).c_str(), d);
-                out += buf.data();
+                has_width = saved_has_width;
+                width = saved_width;
+
+                std::string text = buf.data();
+                normalise_exponent(text, e.three_digit_exponents() ? 3 : 2);
+                if (has_width && static_cast<int>(text.size()) < width) {
+                    bool left = flags.find('-') != std::string::npos;
+                    if (!left && flags.find('0') != std::string::npos) {
+                        // Zero padding goes after the sign, not before it.
+                        size_t at = (!text.empty() && (text[0] == '-' || text[0] == '+')) ? 1 : 0;
+                        text.insert(at, static_cast<size_t>(width) - text.size(), '0');
+                    } else {
+                        text = pad(text, width, left);
+                    }
+                }
+                out += text;
                 break;
             }
             case 'n': {

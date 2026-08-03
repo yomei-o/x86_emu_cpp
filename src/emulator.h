@@ -93,7 +93,15 @@ public:
 
         uint64_t next_int(int bytes);  // a 4- or 8-byte C integer
         uint64_t next_ptr() { return next_slot(); }
+
+        // A variadic floating-point argument, i.e. part of printf's tail.
         double next_double();
+        // A *declared* double or float parameter.  This is a different question
+        // from the one above: Microsoft's ABI passes these in XMM registers
+        // only, and duplicates them into the integer registers just for
+        // variadic calls, which is why printf can read them either way.
+        double next_double_param();
+        float next_float_param();
 
     private:
         uint64_t next_slot();
@@ -106,6 +114,10 @@ public:
     };
 
     void set_result(uint64_t v);
+    // Returns a floating-point value the way the ABI expects: XMM0 in 64-bit
+    // code, the top of the x87 stack in 32-bit code.
+    void set_result_double(double v);
+    void set_result_float(float v);
     void exit_process(int code);
 
     // Calls a function *in the guest* from inside a hook and returns its result.
@@ -150,13 +162,25 @@ public:
     std::FILE* host_stream(uint64_t guest_file_ptr) const;
     int host_fd(uint64_t guest_file_ptr) const;
 
+    // Explains what lives at an address, for fault reporting.  Returns an empty
+    // string if there is nothing useful to say.
+    std::string describe_address(uint64_t addr) const;
+
     void log_call(const char* fmt, ...);
     const std::vector<std::string>& args() const { return args_; }
     uint64_t last_error() const { return last_error_; }
     void set_last_error(uint64_t e) { last_error_ = e; }
 
+    // The old msvcrt.dll prints %e/%g exponents with three digits (1e+010);
+    // the UCRT and every other libc use the C99 minimum of two (1e+10).  The
+    // loader notices which runtime the guest imports so that emulated output
+    // matches the real thing byte for byte.
+    bool three_digit_exponents() const { return three_digit_exponents_; }
+    void set_three_digit_exponents(bool v) { three_digit_exponents_ = v; }
+
     // Installed by hooks.cpp, hooks_win32.cpp and syscalls.cpp.
     void install_library_hooks();
+    void install_math_hooks();
     void install_win32_hooks();
     void install_ucrt_hooks();
     void install_syscall_handlers();
@@ -202,6 +226,7 @@ private:
     std::unordered_map<uint64_t, HeapBlock> heap_blocks_;
     uint64_t guest_files_[3] = {};
     uint64_t last_error_ = 0;
+    bool three_digit_exponents_ = false;
     uint64_t exit_thunk_ = 0;
     uint64_t nested_return_ = 0;  // sentinel address call_guest() returns to
     std::vector<uint64_t> tls_slots_;

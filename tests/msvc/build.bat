@@ -34,7 +34,7 @@ set SRC=%3
 set NAME=%~n3
 if "%ARCH%"=="x64" (set TAG=64) else (set TAG=32)
 call "%VS%\VC\Auxiliary\Build\vcvarsall.bat" %ARCH% >nul
-cl /nologo /EHsc /O2 /%CRT% /Fo:bin\ /Fe:bin\%NAME%_%CRT%%TAG%.exe %SRC% >bin\build_%NAME%_%CRT%%TAG%.log 2>&1
+cl /nologo /EHsc /std:c++17 /O2 /%CRT% /Fo:bin\ /Fe:bin\%NAME%_%CRT%%TAG%.exe %SRC% >bin\build_%NAME%_%CRT%%TAG%.log 2>&1
 if errorlevel 1 (
   echo   FAILED %ARCH% /%CRT% %SRC% - see bin\build_%NAME%_%CRT%%TAG%.log
 ) else (

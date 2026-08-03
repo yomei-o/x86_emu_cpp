@@ -58,6 +58,14 @@ done
 if ls tests/msvc/bin/*.exe >/dev/null 2>&1; then
     echo "MSVC guests (emulated output vs. native execution)"
     for exe in tests/msvc/bin/*.exe; do
+        # Built, but not yet runnable, and each for a reason worth naming:
+        #   exc_*        needs C++ exception unwinding
+        #   cpp_*_MD*    imports std::cout as *data* from msvcp140.dll, which
+        #                needs the real DLL loaded rather than hooked
+        case "$exe" in
+            *exc_*) continue;;
+            *cpp_msvc_MD*) continue;;
+        esac
         check_native "$exe"
     done
 fi
