@@ -51,6 +51,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
             opt.max_instructions = std::strtoull(argv[++i], nullptr, 0);
+        } else if (a == "-L" || a == "--libpath") {
+            if (i + 1 >= argc) {
+                usage();
+                return 2;
+            }
+            opt.library_paths.push_back(argv[++i]);
         } else if (a == "-d" || a == "--dump") {
             if (i + 1 >= argc) {
                 usage();
@@ -89,6 +95,12 @@ int main(int argc, char** argv) {
         emu.load(program, guest_args);
     } catch (const x86emu::LoadError& err) {
         std::fprintf(stderr, "x86emu: cannot load %s: %s\n", program.c_str(), err.what());
+        return 1;
+    } catch (const std::exception& err) {
+        // Loading now runs guest code (DllMain, TLS callbacks), so a fault here is
+        // possible and belongs in a message rather than escaping as a crash.
+        std::fflush(stdout);
+        std::fprintf(stderr, "x86emu: while loading %s: %s\n", program.c_str(), err.what());
         return 1;
     }
 

@@ -1,0 +1,245 @@
+// Dynamic loading of real DLLs.
+//
+// Up to now every import was answered by a host hook.  That works for the C
+// runtime and the Win32 API, whose behaviour the emulator can reproduce, but not
+// for an application's own DLLs: their behaviour *is* the code inside them, and
+// some of what they export is data rather than functions.  So those get mapped
+// into guest memory for real - relocated, their own imports bound recursively,
+// their TLS callbacks and DllMain run - and only the system libraries stay hooked.
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "emulator.h"
+
+namespace x86emu {
+namespace {
+
+std::string lowercase(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) out += static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    return out;
+}
+
+// Splits a forwarder target ("KERNEL32.Sleep") into its two halves.
+bool split_forwarder(const std::string& target, std::string& dll, std::string& symbol) {
+    size_t dot = target.rfind('.');
+    if (dot == std::string::npos) return false;
+    dll = target.substr(0, dot) + ".dll";
+    symbol = target.substr(dot + 1);
+    return true;
+}
+
+// The libraries the emulator implements itself.  Loading a real copy of these
+// would mean emulating the kernel underneath them, so they stay hooked even when
+// the file happens to be sitting on disk.
+bool is_system_library(const std::string& lower_name) {
+    static const char* kPrefixes[] = {
+        "kernel32", "kernelbase", "user32", "gdi32", "advapi32", "shell32", "ole32",
+        "oleaut32", "ws2_32", "wsock32", "rpcrt4", "sechost", "shlwapi", "psapi",
+        "version", "comdlg32", "comctl32", "winmm", "imm32", "setupapi", "crypt32",
+        "bcrypt", "ncrypt", "userenv", "netapi32", "iphlpapi", "dbghelp",
+        // msvcp (the C++ standard library) is deliberately absent: it exports
+        // std::cout as *data*, so there is nothing to hook - it has to be the
+        // real DLL, and its own dependencies are all on this list.
+        "msvcrt", "msvcr", "ucrtbase", "vcruntime", "concrt",
+        "api-ms-win-", "ext-ms-win-", "ntdll",
+    };
+    for (const char* p : kPrefixes)
+        if (lower_name.compare(0, std::strlen(p), p) == 0) return true;
+    return false;
+}
+
+std::string directory_of(const std::string& path) {
+    size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
+
+bool file_exists(const std::string& path) {
+    FileTable::Stat st;
+    return FileTable::stat_path(path, st) == 0 && !st.is_dir;
+}
+
+}  // namespace
+
+std::string Emulator::find_library_file(const std::string& name) const {
+    std::vector<std::string> dirs;
+    if (!args_.empty()) dirs.push_back(directory_of(args_[0]));
+    dirs.push_back(".");
+    for (const auto& d : opt_.library_paths) dirs.push_back(d);
+
+    for (const auto& dir : dirs) {
+        std::string candidate = dir + "/" + name;
+        if (file_exists(candidate)) return candidate;
+    }
+    return {};
+}
+
+Emulator::Module* Emulator::module_by_name(const std::string& name) {
+    std::string lower = lowercase(name);
+    for (auto& m : modules_)
+        if (m->name == lower) return m.get();
+    return nullptr;
+}
+
+Emulator::Module* Emulator::module_for(uint64_t base) {
+    for (auto& m : modules_)
+        if (base >= m->image.base && base < m->image.base + m->image.size) return m.get();
+    return nullptr;
+}
+
+uint64_t Emulator::load_library(const std::string& raw_name) {
+    std::string name = lowercase(raw_name);
+    if (name.find('.') == std::string::npos) name += ".dll";
+
+    if (Module* existing = module_by_name(name)) return existing->image.base;
+    if (is_system_library(name)) return 0;  // the hooks are the implementation
+
+    // A cycle in DLL dependencies would otherwise recurse forever; the partially
+    // loaded module is already registered by the time its imports are bound, so
+    // this only catches a cycle *during* the map step.
+    for (const auto& n : loading_)
+        if (n == name) return 0;
+
+    std::string path = find_library_file(name);
+    if (path.empty()) {
+        log_call("load_library(%s): not found", name.c_str());
+        return 0;
+    }
+
+    std::vector<uint8_t> file;
+    try {
+        file = read_file(path);
+    } catch (const LoadError& err) {
+        log_call("load_library(%s): cannot read %s: %s", name.c_str(), path.c_str(), err.what());
+        return 0;
+    }
+
+    // A DLL almost never gets its preferred base, so pick the next free slot in
+    // the region set aside for them and let map_pe relocate.
+    Mode mode;
+    std::string format;
+    bool is_dll = false;
+    try {
+        peek_pe(file, mode, format, is_dll);
+    } catch (const LoadError& err) {
+        log_call("load_library(%s): not a usable PE: %s", name.c_str(), err.what());
+        return 0;
+    }
+    if (mode != image_.mode) {
+        log_call("load_library(%s): wrong bitness, ignoring", name.c_str());
+        return 0;
+    }
+
+    loading_.push_back(name);
+    auto module = std::make_unique<Module>();
+    module->name = name;
+    module->path = path;
+    try {
+        module->image = map_pe(file, mem, dll_next_base_);
+    } catch (const LoadError& err) {
+        loading_.pop_back();
+        log_call("load_library(%s): %s", name.c_str(), err.what());
+        return 0;
+    }
+    // Leave a gap so a module that grows its mapping cannot collide with the next.
+    dll_next_base_ = (module->image.base + module->image.size + 0xFFFF) & ~0xFFFFull;
+
+    Module* raw = module.get();
+    modules_.push_back(std::move(module));
+    log_call("load_library(%s) at 0x%llX from %s", name.c_str(),
+             (unsigned long long)raw->image.base, path.c_str());
+
+    bind_imports(raw->image);
+    loading_.pop_back();
+
+    // Only run its initialisers if the guest environment is already up; during
+    // the initial load it is not, and run_pending_module_init() catches up.
+    if (guest_env_ready_) run_module_init(*raw);
+    return raw->image.base;
+}
+
+uint64_t Emulator::find_export(uint64_t module_base, const std::string& symbol) {
+    Module* m = module_for(module_base);
+    if (!m) return 0;
+    auto it = m->image.exports.find(symbol);
+    if (it != m->image.exports.end()) return it->second;
+
+    auto fwd = m->image.forwarders.find(symbol);
+    if (fwd != m->image.forwarders.end()) {
+        std::string dll, target;
+        if (split_forwarder(fwd->second, dll, target)) {
+            uint64_t base = load_library(dll);
+            // A forwarder into a system library lands back on the hook for it.
+            if (base == 0) return resolve_import(dll, target);
+            return find_export(base, target);
+        }
+    }
+    return 0;
+}
+
+uint64_t Emulator::find_export_ordinal(uint64_t module_base, uint32_t ordinal) {
+    Module* m = module_for(module_base);
+    if (!m) return 0;
+    auto it = m->image.exports_by_ordinal.find(ordinal);
+    return it == m->image.exports_by_ordinal.end() ? 0 : it->second;
+}
+
+void Emulator::bind_imports(PeImage& img) {
+    for (const auto& imp : img.imports) {
+        uint64_t target = 0;
+        uint64_t base = load_library(imp.dll);
+        if (base) {
+            target = imp.symbol.empty() ? find_export_ordinal(base, imp.ordinal)
+                                        : find_export(base, imp.symbol);
+        }
+        if (!target) {
+            // Either a system library, or a real DLL that turned out not to export
+            // it; a hook is the answer in both cases, and an unknown name becomes
+            // a stub that only fails if it is actually called.
+            std::string symbol = imp.symbol;
+            if (symbol.empty()) symbol = "#" + std::to_string(imp.ordinal);
+            target = resolve_import(imp.dll, symbol);
+        }
+        if (img.mode == Mode::X86_64)
+            mem.write64(imp.slot, target);
+        else
+            mem.write32(imp.slot, static_cast<uint32_t>(target));
+    }
+}
+
+void Emulator::run_pending_module_init() {
+    guest_env_ready_ = true;
+    // Dependencies were appended after their dependents, so initialise in reverse
+    // to give each module its imports already live.
+    for (size_t i = modules_.size(); i-- > 0;) run_module_init(*modules_[i]);
+    // The executable's own TLS callbacks run last, just before its entry point.
+    for (uint64_t callback : exe_tls_callbacks_) {
+        if (cpu_->halted) return;
+        call_guest(callback, {image_.image_base, 1 /* DLL_PROCESS_ATTACH */, 0});
+    }
+}
+
+void Emulator::run_module_init(Module& module) {
+    if (module.initialised) return;
+    module.initialised = true;
+
+    // TLS callbacks run before DllMain, exactly as the real loader does it.
+    for (uint64_t callback : module.image.tls_callbacks) {
+        constexpr uint64_t kDllProcessAttach = 1;
+        call_guest(callback, {module.image.base, kDllProcessAttach, 0});
+        if (cpu_->halted) return;
+    }
+    if (module.image.entry) {
+        constexpr uint64_t kDllProcessAttach = 1;
+        uint64_t ok = call_guest(module.image.entry, {module.image.base, kDllProcessAttach, 0});
+        // DllMain returning FALSE means the library refused to initialise; say so
+        // rather than carrying on with a half-live module.
+        if (!cpu_->halted && (ok & 0xFFFFFFFFull) == 0)
+            std::fprintf(stderr, "x86emu: warning: DllMain of %s returned FALSE\n",
+                         module.name.c_str());
+    }
+}
+
+}  // namespace x86emu

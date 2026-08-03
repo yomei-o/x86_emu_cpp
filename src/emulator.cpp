@@ -98,6 +98,24 @@ uint64_t Emulator::resolve_import(const std::string& dll, const std::string& sym
     });
 }
 
+uint64_t Emulator::existing_hook(const std::string& symbol) const {
+    auto it = hook_by_name_.find(symbol);
+    if (it != hook_by_name_.end()) return it->second;
+    // The stub created for an unimplemented import is registered as "DLL!name";
+    // that is not an implementation, so it must not be handed out here.
+    return 0;
+}
+
+uint64_t Emulator::hooked_module_handle(const std::string& name) {
+    // Distinct per name so a guest can tell two modules apart, and tagged so that
+    // module_for() will not mistake it for a real mapping.
+    auto it = hooked_modules_.find(name);
+    if (it != hooked_modules_.end()) return it->second;
+    uint64_t handle = kHookedModuleBase + hooked_modules_.size() * 0x10000;
+    hooked_modules_[name] = handle;
+    return handle;
+}
+
 bool Emulator::dispatch_hook(uint64_t addr) {
     if (addr < hook_base_ || addr >= hook_base_ + hooks_.size() * kHookStride) return false;
     size_t idx = static_cast<size_t>((addr - hook_base_) / kHookStride);
@@ -285,35 +303,38 @@ uint64_t Emulator::call_guest(uint64_t func, const std::vector<uint64_t>& args) 
 
     switch (abi()) {
         case Abi::Cdecl32:
-            for (size_t i = args.size(); i-- > 0;) {
-                rsp -= 4;
-                mem.write32(rsp, static_cast<uint32_t>(args[i]));
-            }
+            // The argument block is reserved *and aligned* before anything is
+            // written into it: aligning afterwards would move the stack pointer
+            // away from the arguments, which the callee reads at fixed offsets
+            // from it.
+            rsp = (rsp - 4 * static_cast<uint64_t>(args.size())) & ~0xFull;
+            for (size_t i = 0; i < args.size(); ++i)
+                mem.write32(rsp + i * 4, static_cast<uint32_t>(args[i]));
             break;
         case Abi::MsX64: {
             static const int kRegs[4] = {RCX, RDX, R8, R9};
-            for (size_t i = args.size(); i-- > 4;) {
-                rsp -= 8;
-                mem.write64(rsp, args[i]);
-            }
-            rsp -= 32;  // shadow space for the register arguments
+            // Stack arguments sit above the shadow space, so reserve both at once
+            // and then fill them in relative to the final stack pointer.
+            size_t stack_args = args.size() > 4 ? args.size() - 4 : 0;
+            rsp = (rsp - 32 - stack_args * 8) & ~0xFull;
+            for (size_t i = 4; i < args.size(); ++i)
+                mem.write64(rsp + 32 + (i - 4) * 8, args[i]);
             for (size_t i = 0; i < args.size() && i < 4; ++i) cpu_->regs[kRegs[i]] = args[i];
             break;
         }
         default: {  // SysV64
             static const int kRegs[6] = {RDI, RSI, RDX, RCX, R8, R9};
-            for (size_t i = args.size(); i-- > 6;) {
-                rsp -= 8;
-                mem.write64(rsp, args[i]);
-            }
+            size_t stack_args = args.size() > 6 ? args.size() - 6 : 0;
+            rsp = (rsp - stack_args * 8) & ~0xFull;
+            for (size_t i = 6; i < args.size(); ++i)
+                mem.write64(rsp + (i - 6) * 8, args[i]);
             for (size_t i = 0; i < args.size() && i < 6; ++i) cpu_->regs[kRegs[i]] = args[i];
             cpu_->regs[RAX] = 0;  // no vector arguments
             break;
         }
     }
-    // Both 64-bit ABIs want RSP+8 aligned to 16 on entry, which is what pushing
-    // the return address onto a 16-byte boundary produces.
-    rsp &= ~0xFull;
+    // Pushing the return address onto a 16-byte boundary is what every one of
+    // these ABIs expects at a function's first instruction.
     cpu_->regs[RSP] = rsp;
     cpu_->push(nested_return_);
     cpu_->rip = func;
@@ -739,9 +760,27 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     }
 
     if (os_kind == Os::Windows) {
-        image_ = load_pe(file, mem, [this](const std::string& dll, const std::string& sym) {
-            return resolve_import(dll, sym);
-        });
+        PeImage exe = map_pe(file, mem, 0);
+        image_.mode = exe.mode;
+        image_.os = Os::Windows;
+        image_.format = exe.format;
+        image_.entry = exe.entry;
+        image_.image_base = exe.base;
+        image_.image_size = exe.size;
+        image_.brk = exe.base + exe.size;
+        // Real DLLs are mapped above the executable, well clear of it.
+        dll_next_base_ = (exe.base + exe.size + 0xFFFFF) & ~0xFFFFFull;
+        // The main image is registered as a module too, so that GetModuleHandle
+        // and GetProcAddress can treat it like any other.
+        auto self = std::make_unique<Module>();
+        self->name = "__main__";
+        self->path = args_.empty() ? std::string() : args_[0];
+        self->image = exe;
+        self->initialised = true;  // its entry point is the program, not DllMain
+        Module* self_raw = self.get();
+        modules_.push_back(std::move(self));
+        bind_imports(self_raw->image);
+        exe_tls_callbacks_ = self_raw->image.tls_callbacks;
     } else {
         image_ = load_elf(file, mem);
         // The Linux heap sits right after the image, which is only known now.
@@ -764,6 +803,9 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         setup_linux_stack(args);
 
     cpu_->rip = image_.entry;
+
+    // Now that there is a TEB and a stack, the loaded modules can initialise.
+    if (os_kind == Os::Windows) run_pending_module_init();
 
     if (opt_.dump_map) dump_memory_map();
 }

@@ -46,8 +46,8 @@ std::vector<uint8_t> read_file(const std::string& path);
 // memory and install hooks, which happens before the full load.
 void peek_image(const std::vector<uint8_t>& file, Mode& mode, Os& os, std::string& format);
 
-// Both loaders throw LoadError if the file is not of their format.
-LoadedImage load_pe(const std::vector<uint8_t>& file, Memory& mem, const ImportBinder& bind);
+// PE images go through map_pe() in pe.h, because the emulator binds their imports
+// itself: whether a DLL should be hooked or actually loaded is its decision.
 LoadedImage load_elf(const std::vector<uint8_t>& file, Memory& mem);
 
 }  // namespace x86emu

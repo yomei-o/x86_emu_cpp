@@ -20,6 +20,7 @@
 #include "cpu.h"
 #include "files.h"
 #include "loader.h"
+#include "pe.h"
 #include "memory.h"
 
 namespace x86emu {
@@ -38,6 +39,9 @@ public:
         bool trace_calls = false;   // log intercepted library calls
         bool dump_map = false;      // print the guest memory map after loading
         uint64_t max_instructions = 500000000ull;
+        // Where to look for DLLs the guest imports, beyond the program's own
+        // directory and the working directory.
+        std::vector<std::string> library_paths;
     };
 
     // No default argument: a nested type's default member initializers are not
@@ -67,6 +71,26 @@ public:
     const Options& options() const { return opt_; }
     int pointer_size() const { return is64() ? 8 : 4; }
 
+    // ---- modules -------------------------------------------------------------
+    // A DLL actually loaded into guest memory, as opposed to one whose functions
+    // the emulator provides itself.
+    struct Module {
+        std::string name;      // as the guest spelled it, lowercased
+        std::string path;      // where it was found
+        PeImage image;
+        bool initialised = false;
+    };
+
+    // Loads a DLL if one can be found and is not better served by hooks.  Returns
+    // its base address, or 0 if the emulator will hook its functions instead.
+    uint64_t load_library(const std::string& name);
+    // Resolves a symbol in a loaded module, following forwarders; 0 if absent.
+    uint64_t find_export(uint64_t module_base, const std::string& symbol);
+    uint64_t find_export_ordinal(uint64_t module_base, uint32_t ordinal);
+    Module* module_for(uint64_t base);
+    Module* module_by_name(const std::string& name);
+    const std::vector<std::unique_ptr<Module>>& modules() const { return modules_; }
+
     // ---- hooks -------------------------------------------------------------
     // Registers a host implementation and returns the guest address that calls
     // it.  stdcall_bytes is how many argument bytes the callee pops, which only
@@ -76,6 +100,12 @@ public:
     // stub if there is none, so that an unknown import only fails if it is
     // actually called.
     uint64_t resolve_import(const std::string& dll, const std::string& symbol);
+    // The address of an already-registered hook, or 0.  Unlike resolve_import
+    // this never creates a stub, so a guest probing for an optional API gets the
+    // NULL it is looking for.
+    uint64_t existing_hook(const std::string& symbol) const;
+    // A stand-in HMODULE for a library the emulator implements rather than loads.
+    uint64_t hooked_module_handle(const std::string& name);
 
     // ---- argument access for hook bodies ----------------------------------
     // One pointer-sized argument slot, 0-based, per the active ABI.
@@ -219,6 +249,15 @@ private:
 
     void choose_layout();
     bool dispatch_hook(uint64_t addr);
+    // Fills in one image's import table, loading real DLLs where that is the
+    // better answer and falling back to hooks otherwise.
+    void bind_imports(PeImage& img);
+    void run_module_init(Module& module);
+    // DllMain and TLS callbacks are guest code, and guest code needs the TEB and
+    // a stack, so initialisation waits until the environment exists - which is
+    // also the order the real loader uses.
+    void run_pending_module_init();
+    std::string find_library_file(const std::string& name) const;
     void setup_windows_env(const std::vector<std::string>& args);
     void setup_linux_stack(const std::vector<std::string>& args);
     void dump_memory_map() const;
@@ -249,6 +288,16 @@ private:
     bool three_digit_exponents_ = false;
     uint64_t exit_thunk_ = 0;
     uint64_t nested_return_ = 0;  // sentinel address call_guest() returns to
+    std::vector<std::unique_ptr<Module>> modules_;
+    std::vector<uint64_t> exe_tls_callbacks_;
+    bool guest_env_ready_ = false;
+    // Handles for libraries answered by hooks; deliberately far from any real
+    // mapping so that a stray dereference faults instead of reading a module.
+    static constexpr uint64_t kHookedModuleBase = 0x00000000EE000000ull;
+    std::unordered_map<std::string, uint64_t> hooked_modules_;
+    uint64_t dll_next_base_ = 0;   // where the next real DLL gets mapped
+    // Guards against a cycle in DLL dependencies.
+    std::vector<std::string> loading_;
     std::vector<uint64_t> tls_slots_;
     std::vector<uint64_t> atexit_funcs_;
 };

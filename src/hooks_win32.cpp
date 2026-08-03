@@ -119,13 +119,42 @@ void Emulator::install_win32_hooks() {
         int n = write_utf16(e, e.arg_slot(1), name, static_cast<int>(e.arg_slot(2)));
         e.set_result(static_cast<uint64_t>(n > 0 ? n - 1 : 0));
     });
-    // Returning "not found" is the honest answer: there are no real DLLs here,
-    // and the CRT copes with a failed probe by using its fallback path.
-    ret0("LoadLibraryA", 1);
-    ret0("LoadLibraryW", 1);
-    ret0("LoadLibraryExA", 3);
-    ret0("LoadLibraryExW", 3);
-    ret0("GetProcAddress", 2);
+    // A DLL the emulator implements itself has no base address to hand out, so
+    // LoadLibrary reports success with a sentinel handle: the guest only uses the
+    // result to call GetProcAddress, which resolves such names to hooks.
+    auto load_library_hook = [](Emulator& e, bool wide) {
+        std::string name = wide ? utf16_to_utf8(e, e.arg_slot(0), -1)
+                                : e.mem.read_cstring(e.arg_slot(0));
+        uint64_t base = e.load_library(name);
+        if (base) {
+            e.set_result(base);
+            return;
+        }
+        e.set_result(e.hooked_module_handle(name));
+    };
+    win32("LoadLibraryA", 1, [load_library_hook](Emulator& e) { load_library_hook(e, false); });
+    win32("LoadLibraryW", 1, [load_library_hook](Emulator& e) { load_library_hook(e, true); });
+    win32("LoadLibraryExA", 3, [load_library_hook](Emulator& e) { load_library_hook(e, false); });
+    win32("LoadLibraryExW", 3, [load_library_hook](Emulator& e) { load_library_hook(e, true); });
+    win32("GetProcAddress", 2, [](Emulator& e) {
+        uint64_t module = e.arg_slot(0);
+        uint64_t name_or_ordinal = e.arg_slot(1);
+        // An argument below 0x10000 is an ordinal, not a pointer.
+        if (name_or_ordinal < 0x10000) {
+            e.set_result(e.find_export_ordinal(module, static_cast<uint32_t>(name_or_ordinal)));
+            return;
+        }
+        std::string symbol = e.mem.read_cstring(name_or_ordinal);
+        uint64_t addr = e.find_export(module, symbol);
+        if (!addr) {
+            // Either a hooked module, or a real one that does not export it.  A
+            // hook exists only if the emulator implements the function; asking
+            // for one it does not know must fail rather than return a stub, since
+            // a guest probing for an optional API expects NULL.
+            addr = e.existing_hook(symbol);
+        }
+        e.set_result(addr);
+    });
     ret1("FreeLibrary", 1);
     win32("GetCommandLineA", 0, [](Emulator& e) {
         e.set_result(e.alloc_guest_string(command_line(e)));
@@ -499,22 +528,30 @@ void Emulator::install_ucrt_hooks() {
     ucrt("_initterm", [](Emulator& e) {
         uint64_t first = e.arg_slot(0), last = e.arg_slot(1);
         int ps = e.pointer_size();
+        int called = 0;
         for (uint64_t p = first; p < last && !e.cpu().halted; p += ps) {
             uint64_t fn = e.mem.read_sized(p, ps);
-            if (fn) e.call_guest(fn, {});
+            if (!fn) continue;
+            ++called;
+            e.call_guest(fn, {});
         }
+        e.log_call("_initterm ran %d initialisers", called);
         e.set_result(0);
     });
     ucrt("_initterm_e", [](Emulator& e) {
         uint64_t first = e.arg_slot(0), last = e.arg_slot(1);
         int ps = e.pointer_size();
         uint64_t result = 0;
+        int called = 0;
         for (uint64_t p = first; p < last && !e.cpu().halted; p += ps) {
             uint64_t fn = e.mem.read_sized(p, ps);
             if (!fn) continue;
             result = e.call_guest(fn, {}) & 0xFFFFFFFFull;
+            ++called;
             if (result) break;  // a non-zero return aborts initialisation
         }
+        e.log_call("_initterm_e ran %d initialisers, result %llu", called,
+                   (unsigned long long)result);
         e.set_result(result);
     });
     ret0("_configure_narrow_argv");

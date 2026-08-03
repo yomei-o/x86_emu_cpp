@@ -52,6 +52,15 @@ for exe in tests/bin/*.exe; do
     check_native "$exe"
 done
 
+# Built by tests/dll/build.sh: a program plus a DLL the emulator loads for real -
+# mapped, relocated, its imports bound and its DllMain run - rather than hooking.
+if ls tests/dll/bin/*/usedll.exe >/dev/null 2>&1; then
+    echo "Dynamic loading (emulated output vs. native execution)"
+    for exe in tests/dll/bin/*/usedll.exe; do
+        check_native "$exe"
+    done
+fi
+
 # Built by tests/msvc/build.bat: a real Visual Studio toolchain, so the CRT
 # startup runs before main and - with /MT - the C runtime itself executes inside
 # the guest.
