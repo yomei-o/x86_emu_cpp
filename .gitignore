@@ -9,3 +9,11 @@ tests/msvc/bin/
 tests/dll/bin/
 # The WebAssembly build is committed so the demo page can be served as-is.
 !web/x86emu.js
+
+# MSVC builds
+build_msvc/
+build_cmake/
+x86emu.exe
+gen_elf_tests.exe
+*.obj
+*.log

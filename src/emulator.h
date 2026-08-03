@@ -336,7 +336,7 @@ public:
     const std::vector<std::pair<std::string, std::string>>& environment() const {
         return env_;
     }
-    // The environment as a guest-memory block: "NAME=VALUE ...  ", narrow or
+    // The environment as a guest-memory block: "NAME=VALUE\0...\0\0", narrow or
     // wide.  Rebuilt on demand, since a guest may have changed it.
     uint64_t environment_block(bool wide);
     // A char*[] terminated by NULL, which is what `environ` and main's third
