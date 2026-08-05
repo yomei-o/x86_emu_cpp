@@ -38,6 +38,39 @@ Verified by diffing emulated output against real native execution, byte for byte
 | **a stock CPython 3.13**, running its own standard library | — | ✅ |
 | gcc + glibc, `-static` (real libc inside the guest, kernel emulated) | — | ✅ |
 | hand-assembled ELF using raw syscalls | ✅ | ✅ |
+| child processes and pipes (`CreateProcess`, `CreatePipe`) | ✅ | ✅ |
+| Linux processes (`fork`, `execve`, `pipe`, `wait4`) | — | ✅ |
+| Linux threads (`clone`, `futex`) — a glibc `pthread` program | — | ✅ |
+| **mingw-w64 `gcc` compiling and linking a program** | — | ✅ |
+| **Alpine `as` and `ld` (musl, dynamically linked) building a binary** | — | ✅ |
+
+Two of those deserve spelling out, because they are the whole point of having
+processes:
+
+```console
+$ ./x86emu /c/prog/w64devkit/bin/gcc.exe hello.c -o hello.exe
+$ ./hello.exe                       # runs natively - and byte-identical to
+hello                               # what the same gcc produces on its own
+$ ./x86emu hello.exe                # and back inside the emulator
+hello
+```
+
+`gcc.exe` is a driver: it spawns `cc1.exe` to compile, `as.exe` to assemble and
+`collect2.exe`/`ld.exe` to link, each a separate emulated process with its own
+address space, talking through inherited handles and temporary files. The
+executable that comes out is identical to the one the same toolchain builds
+natively.
+
+The Linux side does the same through `fork`/`execve`, with `--sysroot` pointing
+at a directory of unpacked Alpine packages:
+
+```console
+$ ./x86emu --sysroot alpine/root alpine/root/usr/bin/as -o main.o main.s
+$ ./x86emu --sysroot alpine/root alpine/root/usr/bin/ld -static -o main \
+      alpine/root/usr/lib/crt1.o ... main.o alpine/root/usr/lib/libc.a
+$ ./x86emu main
+linked by the emulated toolchain
+```
 
 The Visual Studio and static-glibc cases matter because everything before `main`
 is real: CPU feature probing, TLS setup, locale and stdio initialisation, table
@@ -156,8 +189,20 @@ usage: x86emu [options] <program> [guest args...]
   -n, --max-insns N    stop after N instructions (0 = unlimited)
   -d, --dump ADDR[:N]  hex dump N bytes of guest memory after loading
   -L, --libpath DIR    also look here for DLLs the guest imports
+  -r, --sysroot DIR    treat DIR as a Linux guest's filesystem root
+      --history N      on a fault, print the last N instruction addresses
       --imports        list imports with no implementation, then exit
 ```
+
+`--sysroot` is what makes an unmodified distribution toolchain usable: every
+absolute path a Linux guest opens (`/usr/lib/libgmp.so.10`, `/lib/ld-musl-x86_64.so.1`)
+resolves inside that directory, so a tree of unpacked `.apk` or `.deb` files
+behaves like the filesystem those binaries were built for.
+
+`--history N` answers "how did it get there?" after a fault deep inside a large
+guest, where `--trace` would produce gigabytes. It keeps a ring of the last N
+instruction addresses and prints them, collapsing straight-line runs so what is
+left is the branches and calls.
 
 A fault reports what it can: what the address was (a null pointer, a hook for an
 imported variable, inside the stack), the register state, and the stack slots that
@@ -211,6 +256,7 @@ Serve `web/` over http and open `index.html`. Nothing leaves the browser.
 ```sh
 sh build.sh
 sh tests/build_pe_tests.sh      # mingw-w64 gcc + dlltool
+sh tests/hosted/build.sh        # mingw-w64 gcc, with the real CRT
 sh tests/dll/build.sh           # a program plus a DLL, for the loader
 ./gen_elf_tests tests/bin       # from tools/gen_elf_tests.cpp
 tests\msvc\build.bat            # Visual Studio 2022 (Windows only)
@@ -247,6 +293,22 @@ print so much:
   C runtime. The 32-bit `/MT` build does this on the x87 stack while switching
   the rounding mode around `FRNDINT`, which is exactly the case an emulator that
   ignores the control word gets wrong.
+- `tests/hosted/insns.c` — the instruction forms a *compiler* uses that simpler
+  programs never do: string moves running backwards with `DF` set (what a libc
+  `memmove` does for an overlapping copy), `BT`/`BTS`/`BTR`/`BTC` on memory with
+  bit offsets that fall outside the addressed word, 64-bit bit scans, and SSE2
+  integer forms. Every one of those was added after it was found to be wrong.
+- `tests/hosted/spawn.c` — a program that spawns *itself* twice: once with its
+  stdout captured through a pipe, once with a pipe fed to its stdin. It checks
+  both children's exit codes, so a missing wait or a lost pipe end shows up as a
+  differing line rather than a hang.
+- `tests/linux/proc_gcc.c` and `thread_gcc.c` — `fork` + `dup2` + `execve` +
+  `waitpid`, and four glibc `pthread`s incrementing a mutex-guarded counter.
+
+Any test whose output depends on how two processes' writes interleave would be
+untestable this way, since nothing - real OS or cooperative scheduler - promises
+an order. `spawn.c` therefore collects the child's bytes and prints them after
+waiting, rather than as they arrive.
 
 The freestanding PE tests are built with `-nostdlib` and their own entry point,
 importing straight from `msvcrt.dll`, so a failure points at the emulator rather
@@ -276,7 +338,11 @@ emulator built for the current host and prints which host that was.
 | `src/hooks_math.cpp` | the math library and its ABI plumbing |
 | `src/hooks_files.cpp` | stdio, POSIX descriptors and the Win32 file API |
 | `src/hooks_win32.cpp` | Win32 API and Universal CRT hooks |
-| `src/hooks_win32b.cpp` | synchronisation, directories, handles, paths |
+| `src/hooks_win32b.cpp` | synchronisation, directories, handles, paths, setjmp |
+| `src/hooks_win32c.cpp` | what the Visual C++ toolchain needs: the UCRT's wide-character dialect, file mappings, thread pools |
+| `src/hooks_process.cpp` | `CreateProcess`, pipes, process handles |
+| `src/processes.{h,cpp}` | the process table and the scheduler over it |
+| `src/threads.cpp` | guest threads, the scheduler, and waitable objects |
 | `src/guest_printf.cpp` | the printf engine and UTF-16 conversion |
 | `src/syscalls.cpp` | the Linux kernel interface |
 | `web/` | the WebAssembly front end and demo page |
@@ -286,8 +352,13 @@ emulator built for the current host and prints which host that was.
 Each of these fails with a message naming the instruction or import rather than
 misbehaving quietly.
 
-- **Threads are cooperative, and Windows-only so far.** `CreateThread` works;
-  Linux's `clone` does not. See below for what that costs.
+- **Threads and processes are cooperative.** One emulator interprets one
+  instruction stream, so guest threads take turns at a quantum boundary or the
+  moment they block, and so do whole processes: a `System` (`src/processes.cpp`)
+  owns the process table and runs the emulators round-robin. That is a correct
+  implementation rather than a shortcut — no program may assume anything about
+  how its threads interleave — but it does mean the *order* in which two
+  processes' output appears is not the host's order.
 - **No AVX, and CPUID says so.** The emulator advertises exactly the features it
   implements (SSE2 and CMOV, not SSE4.2 or AVX), because a libc picks its
   `memcpy`/`strlen` from those bits and would otherwise jump into instructions
@@ -297,13 +368,18 @@ misbehaving quietly.
   precision on real hardware can differ in its last bits. Loads and stores of an
   80-bit memory operand do convert exactly.
 - **No SEH or C++ exception unwinding.** Installing a handler is fine; actually
-  throwing is not (`tests/msvc/exc_msvc.cpp` is the test waiting for it).
-- **No dynamic linking for ELF.** `ET_DYN`/PIE and anything needing `ld.so` are
-  rejected at load time; statically linked `ET_EXEC` works. Windows DLLs *are*
-  loaded for real.
-- **No registry, processes or pipes.** The registry answers "not present", which
-  is a real answer: a runtime installed without registry entries has to cope, and
-  they all do.
+  throwing is not (`tests/msvc/exc_msvc.cpp` is the test waiting for it). This is
+  the single thing standing between the emulator and `cl.exe`: Microsoft's
+  compiler throws during its own initialisation, so it never reaches `main`.
+  Everything else it imports is implemented (`src/hooks_win32c.cpp`).
+- **`gcc` works; `cc1` from a Linux distribution does not, yet.** The mingw
+  toolchain compiles and links end to end, and Alpine's `as` and `ld` do too, but
+  Alpine's `cc1` gets through parsing and RTL expansion and then faults on a null
+  pointer in the first RTL pass. `resume.md` records the harness that localises
+  this kind of bug — diffing our block-execution order against
+  `qemu-x86_64 -d exec,nochain`.
+- **No registry.** It answers "not present", which is a real answer: a runtime
+  installed without registry entries has to cope, and they all do.
 - Segmentation is flat: `fs:`/`gs:` resolve to a synthetic TEB/PEB on Windows and
   to whatever `arch_prctl`/`set_thread_area` set on Linux; every other segment
   base is zero.

@@ -7,17 +7,123 @@ emulator *is*; this describes what is unfinished and what is known about it.
 
 Everything below is verified by diffing emulated output against native execution,
 byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
-33 tests):
+37 tests):
 
 - x86-32 and x86-64 integer, SSE/SSE2, x87
 - PE32/PE32+ and ELF32/ELF64 loading; real DLLs with relocation, exports,
-  forwarders, `DllMain`, static TLS
+  forwarders, `DllMain`, static TLS; ELF dynamic linking through the real `ld.so`
 - libc, math, files, Win32, UCRT hooks across three ABIs
-- threads (Windows), with per-thread stacks, TEBs and TLS
+- threads on both OSes (Windows `CreateThread`, Linux `clone` + a real `futex`)
+- **processes on both OSes**: `CreateProcess` + pipes, `fork`/`execve`/`wait4`
 - **a stock CPython 3.13 for Windows runs its own standard library**
+- **mingw-w64 `gcc` compiles and links inside the emulator**, producing a binary
+  byte-identical to the one it produces natively
+- **Alpine's `as` and `ld` (dynamically linked, musl) build a working binary**
 
-The remaining work is breadth, not architecture. Nothing below needs a new
-subsystem except the ELF dynamic linker.
+## Done 2026-08-05 (processes, threads, compilers)
+
+`src/processes.{h,cpp}` is the new subsystem: one `Emulator` is one guest
+process, and a `System` owns the process table and runs the emulators
+round-robin at the same quantum the thread scheduler uses. `Emulator::run()`
+builds one around itself, so every front end — CLI, wasm — gets processes without
+knowing. Pipes are byte queues shared through `FileTable` entries (a descriptor's
+`FILE*` is a `shared_ptr` now, so one file description can live in two processes);
+an empty pipe blocks the *reading thread* on a wake predicate rather than the
+emulator.
+
+- **Windows**: `CreateProcessA/W` (command-line splitting by the real rules, PATH
+  search, `STARTUPINFO` handle redirection, environment blocks), `CreatePipe`,
+  `PeekNamedPipe`, `GetExitCodeProcess`, `TerminateProcess` on a child,
+  `DuplicateHandle`. A child's handle is an ordinary waitable object whose state
+  the `System` answers, so `WaitForSingleObject` needed no changes.
+- **Linux**: `fork` copies the whole emulator (`Memory::clone_from`, the CPU
+  context, the layout cursors, a cloned descriptor table); `vfork` and
+  `CLONE_VFORK` also park the parent until the child execs or exits. `execve`
+  swaps the process's emulator outside guest execution. `wait4`, `pipe`/`pipe2`,
+  `dup3`, close-on-exec, `getppid`, `kill` are real.
+- **Linux threads**: `clone(CLONE_VM|CLONE_THREAD)` with raw clone semantics
+  (same RIP, `RAX=0`, caller's stack, `CLONE_SETTLS`), a `futex` that really
+  waits, `set_tid_address`/`CLONE_CHILD_CLEARTID` so `pthread_join` completes.
+- **`gcc hello.c -o hello.exe` works end to end** under the emulator: the driver
+  spawns `cc1`, `as` and `ld` as separate emulated processes and the resulting
+  executable is identical to the native build's. Needed `_setjmp`/`longjmp` (a
+  register snapshot kept inside the guest's own `jmp_buf`), `_findfirst64`,
+  `fgetpos`/`fsetpos`, `tmpfile`, `_pipe`, `_fullpath`, `strtok` and about thirty
+  smaller CRT and kernel32 corners.
+- **Five bugs the toolchain exposed**, each of the kind this project cares about
+  (silent, and surfacing far from the cause): `BT`/`BTS`/`BTR`/`BTC` truncating a
+  memory operand's bit offset; `munmap` as a no-op running the address space out;
+  `fstat` giving every file the same inode, which made musl's `ld.so` think the
+  second library was the first; `getrlimit` answering one value for every
+  resource, which reconfigured GCC's garbage collector; `fflush` not flushing the
+  guest's own buffer.
+
+The remaining work is breadth, not architecture, with two exceptions named below:
+x64 exception unwinding (for `cl.exe`) and whatever is wrong in the RTL path (for
+a distro `cc1`).
+
+## Next: the two things actually blocked
+
+### 1. `cl.exe` needs x64 exception unwinding
+
+Everything Microsoft's compiler imports is implemented (`src/hooks_win32c.cpp`:
+the UCRT's wide-character half, file mappings, synchronous thread pools,
+`_wspawnv` which runs its `_P_WAIT` child through `System::run_until_exit`). It
+still never reaches `main`, because it *throws* during initialisation and lands
+on `RtlPcToFileHeader`, which reports honestly that unwinding is not emulated.
+
+So this is the SEH work, and it is worth doing for its own sake:
+
+- x64: walk `.pdata`/`.xdata` (`RUNTIME_FUNCTION` → `UNWIND_INFO`), run the
+  prologue's unwind codes backwards to recover the caller's context, and call the
+  language handler (`__CxxFrameHandler3`/`4` for C++, `__C_specific_handler` for
+  SEH) at each frame until one accepts.
+- x86: the `fs:[0]` handler chain, which is much simpler and is what the 32-bit
+  MSVC tests need.
+- `tests/msvc/exc_msvc.cpp` is built and excluded, waiting for exactly this.
+
+### 2. A distribution `cc1` faults in the first RTL pass
+
+Given a sysroot of unpacked Alpine packages, that distribution's `as` and `ld`
+run perfectly; its `cc1` does not. It gets *far*: `-version`, preprocessing (`-E`), an
+empty translation unit, and `-fsyntax-only` all work, and with `-fdump-tree-all
+-fdump-rtl-all` the dumps show it completes gimplification, every tree pass and
+`255r.expand` — then faults reading `[rsi+0x28]` with `rsi == 0` at `0x7E18D1`,
+i.e. a null pointer inside the first RTL pass after expand.
+
+**The harness for finding it is the useful part, and it works.** WSL here has
+`qemu-x86_64`, which runs the same `cc1` correctly, so there is a reference:
+
+```sh
+# every block qemu executes, in order (nochain, or it only logs unlinked entries)
+qemu-x86_64 -d exec,nochain -L $ROOT $ROOT/usr/libexec/.../cc1 -quiet t.c -o /dev/null 2>&1 \
+  | awk -f seq.awk > qemu.seq        # seq.awk: split on '/', print field 2
+```
+
+and on our side, a temporary build with an address census (a `-D` guarded block
+in `Cpu::step` that appends every execution of an address listed in a filter file
+to a binary stream). Then compare: qemu's stream must appear *inside* ours in
+order, because where qemu starts a translation block is its own business. The
+first entry of qemu's that we cannot reach is the instant of divergence.
+
+Two things learned doing that, both of which cost hours:
+
+- **Compare only the program's own address range.** Shared libraries land at
+  different bases in the two implementations, so their addresses are noise.
+- **A benign difference stops the comparison dead.** Anything that makes the
+  guest take a different branch legitimately — a differing `getrlimit` answer,
+  say — sends it down a path the reference never took, and no window of
+  resynchronisation recovers. Both `getrlimit` divergences found this way were
+  bugs in *our* answers, and fixing them moved the divergence point forward;
+  expect to iterate.
+
+Where it stands: after those fixes the first divergence is at `0x1ABA81B`
+(`rep stosq` at the top of a small initialiser). The next step is a finer
+comparison — qemu's `-d cpu` gives register state per block, which turns "we
+branched differently" into "this instruction computed the wrong value" — for
+which the volume needs bounding (qemu has no "start logging at instruction N",
+so the practical route is comparing register state only at the ~2000 blocks
+around the known divergence).
 
 ## Done 2026-08-03 (MSVC, browser CPython, Linux CPython)
 
@@ -285,16 +391,20 @@ target is really wanted.
 
 ## Also unfinished
 
-- **C++ and SEH exception unwinding.** Installing a handler works; throwing does
-  not. Needs the `.pdata`/`.xdata` tables walked on x64 and the `fs:[0]` chain on
-  x86. `tests/msvc/exc_msvc.cpp` is built but excluded from the suite, waiting for
-  it.
-- **ELF `ET_DYN`/PIE and dynamic linking.** Rejected at load time today. This is
-  the "real libc.so" work — see the dedicated **Next: dynamic linking** section
-  above for the full plan (routes, mmap/MAP_FIXED, auxv, TLS, musl-first).
-- **Processes and pipes.** `CreateProcess`, `CreatePipe`, `fork`/`execve`. This is
-  the one thing CPython on Windows still cannot do: `platform.uname()` wants a
-  subprocess.
+- **C++ and SEH exception unwinding.** See "the two things actually blocked"
+  above: this is what `cl.exe` needs, and `tests/msvc/exc_msvc.cpp` waits for it.
+- **`_popen`/`_wsystem` and a shell.** Both fail cleanly (a guest that wants a
+  pipe to a *command* needs a shell to interpret it, and there is none). A guest
+  using them for a compiler driver would need `cmd.exe`-style parsing, or an
+  emulated `sh`. Nothing yet has demanded it — `gcc` uses `CreateProcess`.
+- **Per-process working directories.** `chdir` changes the *host's* directory, so
+  every emulated process shares it. `CreateProcess` says so out loud when a child
+  asks to start elsewhere (`lpCurrentDirectory ignored`) rather than quietly
+  running in the wrong place. Fixing it means a cwd string per emulator and
+  resolving relative paths against it in `FileTable`.
+- **A `SIGCHLD`-driven guest.** Signals are never delivered; `wait4` works by
+  blocking. A guest that installs a `SIGCHLD` handler and expects to be
+  interrupted would wait forever.
 - **`msvcp140.dll` and `/MD` C++.** The DLL loads and its `DllMain` runs, but
   `std::cout` is never constructed, so `tests/msvc/cpp_msvc_MD*` are excluded
   from the suite. `/MT` works fully. Not investigated; the trail starts with the
@@ -311,7 +421,7 @@ target is really wanted.
 
 ```sh
 sh build.sh                    # or cmake -B build && cmake --build build
-sh tests/run_tests.sh          # 33 tests; PYTHON=... to point at an interpreter
+sh tests/run_tests.sh          # 37 tests; PYTHON=... to point at an interpreter
 EMU=/path/to/other/x86emu sh tests/run_tests.sh   # test a different build
 sh tests/run_cross.sh          # every guest under one build, reporting the host
 ```
