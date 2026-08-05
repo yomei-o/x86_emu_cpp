@@ -230,8 +230,8 @@ void Emulator::install_win32_extra_hooks() {
     });
 
     // ---- handles and process information -----------------------------------------
-    ret1("DuplicateHandle", 7);
-    ret1("SetHandleInformation", 3);
+    // DuplicateHandle and SetHandleInformation are real implementations in
+    // hooks_process.cpp; stubs here would shadow them.
     ret1("GetHandleInformation", 2);
     win32("GetVersion", 0, [](Emulator& e) {
         // Windows 10: major 10, minor 0, build 19045, in the packed legacy form.
@@ -315,7 +315,7 @@ void Emulator::install_win32_extra_hooks() {
     });
     ucrt("_commit", [](Emulator& e) { e.set_result(e.files.flush(static_cast<int>(e.arg_slot(0)))); });
     ucrt("_umask", [](Emulator& e) { e.set_result(0); });
-    ucrt("_getpid", [](Emulator& e) { e.set_result(4242); });
+    ucrt("_getpid", [](Emulator& e) { e.set_result(e.pid()); });
     ucrt("_heapmin", [](Emulator& e) { e.set_result(0); });
     ucrt("_fdopen", [](Emulator& e) {
         int fd = static_cast<int>(e.arg_slot(0));
@@ -520,6 +520,436 @@ void Emulator::install_win32_extra_hooks() {
         std::string b = utf16_to_utf8(e, e.arg_slot(1), -1);
         int c = a.compare(b);
         e.set_result(static_cast<uint64_t>(static_cast<int64_t>(c < 0 ? -1 : (c > 0 ? 1 : 0))));
+    });
+
+    // ---- what a compiler driver needs --------------------------------------------
+    // gcc.exe (mingw) brought each of these in; they are ordinary CRT and
+    // kernel32 surface, just corners no earlier guest had touched.
+
+    // Console decoration: no console is being decorated here.
+    ret1("SetConsoleTextAttribute", 2);
+    ret1("SetConsoleCursorPosition", 2);
+    ret1("FillConsoleOutputAttribute", 5);
+    ret1("FillConsoleOutputCharacterW", 5);
+    ret0("GetThreadPriority", 1);
+    ret1("SetThreadPriority", 2);
+    ret0("GetThreadContext", 2);
+    ret0("SetThreadContext", 2);
+    win32("OpenProcess", 3, [](Emulator& e) {
+        e.set_last_error(5);  // ERROR_ACCESS_DENIED
+        e.set_result(0);
+    });
+    win32("GetProcessAffinityMask", 3, [](Emulator& e) {
+        if (e.arg_slot(1)) e.mem.write_sized(e.arg_slot(1), e.pointer_size(), 1);
+        if (e.arg_slot(2)) e.mem.write_sized(e.arg_slot(2), e.pointer_size(), 1);
+        e.set_result(1);
+    });
+    ret1("SetProcessAffinityMask", 2);
+    win32("GetVersionExA", 1, [](Emulator& e) {
+        uint64_t p = e.arg_slot(0);
+        if (p) {
+            e.mem.write32(p + 4, 10);      // dwMajorVersion
+            e.mem.write32(p + 8, 0);       // dwMinorVersion
+            e.mem.write32(p + 12, 19045);  // dwBuildNumber
+            e.mem.write32(p + 16, 2);      // dwPlatformId = VER_PLATFORM_WIN32_NT
+        }
+        e.set_result(1);
+    });
+    // (flags, source, message_id, language, buffer, size, arguments)
+    win32("FormatMessageA", 7, [](Emulator& e) {
+        char text[64];
+        std::snprintf(text, sizeof text, "error %u",
+                      static_cast<unsigned>(e.arg_slot(2)));
+        std::string msg = text;
+        uint64_t buf = e.arg_slot(4);
+        constexpr uint64_t kAllocateBuffer = 0x100;
+        if (e.arg_slot(0) & kAllocateBuffer) {
+            uint64_t mem = e.alloc_guest_string(msg);
+            if (buf) e.mem.write_sized(buf, e.pointer_size(), mem);
+        } else {
+            if (!buf || e.arg_slot(5) < msg.size() + 1) {
+                e.set_result(0);
+                return;
+            }
+            e.mem.write_cstring(buf, msg);
+        }
+        e.set_result(msg.size());
+    });
+    win32("GetTempPathA", 2, [](Emulator& e) {
+        std::string dir = "C:\\Temp";
+        if (const std::string* v = e.getenv("TMP"))
+            dir = *v;
+        else if (const std::string* v2 = e.getenv("TEMP"))
+            dir = *v2;
+        if (dir.empty() || (dir.back() != '\\' && dir.back() != '/')) dir += '\\';
+        uint64_t buf = e.arg_slot(1), size = e.arg_slot(0);
+        if (!buf || dir.size() + 1 > size) {
+            e.set_result(dir.size() + 1);
+            return;
+        }
+        e.mem.write_cstring(buf, dir);
+        e.set_result(dir.size());
+    });
+    auto absolutize = [](const std::string& in) {
+        bool absolute = (in.size() > 1 && in[1] == ':') ||
+                        (!in.empty() && (in[0] == '\\' || in[0] == '/'));
+        std::string full = absolute ? in : current_directory() + "\\" + in;
+        for (char& c : full)
+            if (c == '/') c = '\\';
+        return full;
+    };
+    win32("GetFullPathNameA", 4, [absolutize](Emulator& e) {
+        std::string full = absolutize(e.mem.read_cstring(e.arg_slot(0)));
+        uint64_t length = e.arg_slot(1), buf = e.arg_slot(2), part_out = e.arg_slot(3);
+        if (!buf || full.size() + 1 > length) {
+            e.set_result(full.size() + 1);
+            return;
+        }
+        e.mem.write_cstring(buf, full);
+        if (part_out) {
+            size_t slash = full.find_last_of('\\');
+            e.mem.write_sized(part_out, e.pointer_size(),
+                              slash == std::string::npos ? buf : buf + slash + 1);
+        }
+        e.set_result(full.size());
+    });
+    win32("GetFinalPathNameByHandleA", 4, [absolutize](Emulator& e) {
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        auto* entry = fd >= 0 ? e.files.get(fd) : nullptr;
+        if (!entry) {
+            e.set_last_error(6);  // ERROR_INVALID_HANDLE
+            e.set_result(0);
+            return;
+        }
+        std::string full = absolutize(entry->path);
+        uint64_t buf = e.arg_slot(1), size = e.arg_slot(2);
+        if (!buf || full.size() + 1 > size) {
+            e.set_result(full.size() + 1);
+            return;
+        }
+        e.mem.write_cstring(buf, full);
+        e.set_result(full.size());
+    });
+
+    // ---- msvcrt corners ------------------------------------------------------------
+    ucrt("_getcwd", [](Emulator& e) {
+        std::string cwd = current_directory();
+        for (char& c : cwd)
+            if (c == '/') c = '\\';
+        uint64_t buf = e.arg_slot(0), size = e.arg_slot(1);
+        if (!buf) {
+            buf = e.heap_alloc(cwd.size() + 1);  // getcwd(NULL, 0) mallocs
+        } else if (cwd.size() + 1 > size) {
+            e.set_result(0);
+            return;
+        }
+        e.mem.write_cstring(buf, cwd);
+        e.set_result(buf);
+    });
+    ucrt("_fullpath", [absolutize](Emulator& e) {
+        // (buffer, relative, size); NULL buffer means "malloc one".
+        std::string full = absolutize(e.mem.read_cstring(e.arg_slot(1)));
+        uint64_t buf = e.arg_slot(0);
+        if (!buf)
+            buf = e.heap_alloc(full.size() + 1);
+        else if (full.size() + 1 > e.arg_slot(2)) {
+            e.set_result(0);
+            return;
+        }
+        e.mem.write_cstring(buf, full);
+        e.set_result(buf);
+    });
+    ucrt("_pipe", [](Emulator& e) {
+        int fds[2];
+        if (e.files.make_pipe(fds) != 0) {
+            e.set_result(~0ull);
+            return;
+        }
+        e.mem.write32(e.arg_slot(0), static_cast<uint32_t>(fds[0]));
+        e.mem.write32(e.arg_slot(0) + 4, static_cast<uint32_t>(fds[1]));
+        e.set_result(0);
+    });
+
+    // setjmp/longjmp: the buffer belongs to the guest, so the emulator keeps its
+    // own register snapshot in it (nothing in the CRT reads a jmp_buf's fields).
+    // Layout, in pointer-sized slots: magic, return address, RSP after return,
+    // the general registers, RFLAGS.  That fits both CRTs' buffers (64 bytes on
+    // x86, 256 on x64).  XMM registers are not saved - noted in resume.md.
+    constexpr uint64_t kJmpMagic = 0x504D4A55; // "UJMP"
+    auto do_setjmp = [kJmpMagic](Emulator& e) {
+        uint64_t buf = e.arg_slot(0);
+        Cpu& c = e.cpu();
+        int ps = e.pointer_size();
+        int nregs = e.is64() ? 16 : 8;
+        uint64_t ret = e.mem.read_sized(c.regs[RSP], ps);
+        e.mem.write_sized(buf, ps, kJmpMagic);
+        e.mem.write_sized(buf + ps, ps, ret);
+        e.mem.write_sized(buf + 2 * ps, ps, c.regs[RSP] + ps);
+        for (int i = 0; i < nregs; ++i)
+            e.mem.write_sized(buf + (3 + i) * ps, ps, c.regs[i]);
+        e.mem.write_sized(buf + (3 + nregs) * ps, ps, c.rflags);
+        e.set_result(0);
+    };
+    ucrt("_setjmp", do_setjmp);
+    ucrt("_setjmpex", do_setjmp);
+    ucrt("setjmp", do_setjmp);
+    ucrt("longjmp", [kJmpMagic](Emulator& e) {
+        uint64_t buf = e.arg_slot(0);
+        uint64_t val = e.arg_slot(1);
+        Cpu& c = e.cpu();
+        int ps = e.pointer_size();
+        int nregs = e.is64() ? 16 : 8;
+        if (e.mem.read_sized(buf, ps) != kJmpMagic)
+            throw CpuError(c.rip, "longjmp on a buffer _setjmp never filled");
+        uint64_t ret = e.mem.read_sized(buf + ps, ps);
+        uint64_t rsp = e.mem.read_sized(buf + 2 * ps, ps);
+        for (int i = 0; i < nregs; ++i)
+            c.regs[i] = e.mem.read_sized(buf + (3 + i) * ps, ps);
+        c.rflags = e.mem.read_sized(buf + (3 + nregs) * ps, ps);
+        // The hook's epilogue pops a return address off RSP; point both at the
+        // setjmp caller's frame so control lands exactly where _setjmp returned.
+        c.regs[RSP] = rsp - ps;
+        e.mem.write_sized(c.regs[RSP], ps, ret);
+        e.set_result(val ? val : 1);
+    });
+
+    ucrt("_vscprintf", [](Emulator& e) {
+        Args va = Args::va_list_at(e, e.arg_slot(1));
+        e.set_result(format_guest(e, e.arg_slot(0), va).size());
+    });
+    ucrt("_vsnprintf", [](Emulator& e) {
+        uint64_t buf = e.arg_slot(0), count = e.arg_slot(1);
+        Args va = Args::va_list_at(e, e.arg_slot(3));
+        std::string s = format_guest(e, e.arg_slot(2), va);
+        size_t take = s.size() < count ? s.size() : static_cast<size_t>(count);
+        if (buf && take) e.mem.write(buf, s.data(), take);
+        if (take < count) e.mem.write8(buf + take, 0);
+        e.set_result(s.size() <= count ? s.size() : 0xFFFFFFFFull);  // -1 on truncation
+    });
+    ucrt("_vsnwprintf", [](Emulator& e) {
+        uint64_t buf = e.arg_slot(0), count = e.arg_slot(1);
+        Args va = Args::va_list_at(e, e.arg_slot(3));
+        std::u16string w = utf8_to_utf16(format_guest(e, e.arg_slot(2), va, true));
+        size_t take = w.size() < count ? w.size() : static_cast<size_t>(count);
+        for (size_t i = 0; i < take; ++i)
+            e.mem.write16(buf + i * 2, w[i]);
+        if (take < count) e.mem.write16(buf + take * 2, 0);
+        e.set_result(w.size() <= count ? w.size() : 0xFFFFFFFFull);
+    });
+    ucrt("asctime", [](Emulator& e) {
+        uint64_t p = e.arg_slot(0);
+        std::tm tm{};
+        tm.tm_sec = static_cast<int>(e.mem.read32(p));
+        tm.tm_min = static_cast<int>(e.mem.read32(p + 4));
+        tm.tm_hour = static_cast<int>(e.mem.read32(p + 8));
+        tm.tm_mday = static_cast<int>(e.mem.read32(p + 12));
+        tm.tm_mon = static_cast<int>(e.mem.read32(p + 16));
+        tm.tm_year = static_cast<int>(e.mem.read32(p + 20));
+        tm.tm_wday = static_cast<int>(e.mem.read32(p + 24));
+        tm.tm_yday = static_cast<int>(e.mem.read32(p + 28));
+        static const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+        static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        char text[64];
+        std::snprintf(text, sizeof text, "%s %s%3d %.2d:%.2d:%.2d %d\n",
+                      days[tm.tm_wday >= 0 && tm.tm_wday < 7 ? tm.tm_wday : 0],
+                      months[tm.tm_mon >= 0 && tm.tm_mon < 12 ? tm.tm_mon : 0],
+                      tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_year + 1900);
+        e.set_result(e.alloc_guest_string(text));
+    });
+    ucrt("fgetwc", [](Emulator& e) {
+        int fd = e.host_fd(e.arg_slot(0));
+        uint8_t b = 0;
+        int64_t got = fd >= 0 ? e.files.read(fd, &b, 1) : 0;
+        e.set_result(got == 1 ? b : 0xFFFFull);  // WEOF
+    });
+    // strtok's hidden cursor lives per-emulator, which is also per-process -
+    // exactly the scope the real one has (per-thread would be more faithful;
+    // no guest so far tokenises on two threads at once).
+    {
+        auto state = std::make_shared<uint64_t>(0);
+        ucrt("strtok", [state](Emulator& e) {
+            uint64_t s = e.arg_slot(0);
+            std::string delims = e.mem.read_cstring(e.arg_slot(1));
+            uint64_t p = s ? s : *state;
+            if (!p) {
+                e.set_result(0);
+                return;
+            }
+            auto is_delim = [&](uint8_t c) { return delims.find(static_cast<char>(c)) != std::string::npos; };
+            while (true) {
+                uint8_t c = e.mem.read8(p);
+                if (c == 0) {
+                    *state = p;
+                    e.set_result(0);
+                    return;
+                }
+                if (!is_delim(c)) break;
+                ++p;
+            }
+            uint64_t token = p;
+            while (true) {
+                uint8_t c = e.mem.read8(p);
+                if (c == 0) {
+                    *state = p;
+                    break;
+                }
+                if (is_delim(c)) {
+                    e.mem.write8(p, 0);
+                    *state = p + 1;
+                    break;
+                }
+                ++p;
+            }
+            e.set_result(token);
+        });
+    }
+
+    // _findfirst64 and friends: the CRT's directory walk, over the same listing
+    // machinery FindFirstFile uses.  struct _finddata64_t is layout-identical on
+    // both architectures (the 64-bit times force 8-byte alignment everywhere).
+    auto write_finddata = [](Emulator& e, uint64_t out, const Emulator::DirectoryEntry& de) {
+        e.mem.write32(out, de.is_dir ? 0x10u : 0x00u);          // attrib
+        e.mem.write64(out + 8, static_cast<uint64_t>(de.mtime));   // time_create
+        e.mem.write64(out + 16, static_cast<uint64_t>(de.mtime));  // time_access
+        e.mem.write64(out + 24, static_cast<uint64_t>(de.mtime));  // time_write
+        e.mem.write64(out + 32, de.size);
+        std::string name = de.name.substr(0, 259);
+        e.mem.write_cstring(out + 40, name);
+    };
+    ucrt("_findfirst64", [write_finddata](Emulator& e) {
+        std::string spec = e.mem.read_cstring(e.arg_slot(0));
+        auto entries = e.list_directory(spec);
+        if (entries.empty()) {
+            e.set_guest_errno(2);  // ENOENT
+            e.set_result(~0ull);
+            return;
+        }
+        uint64_t handle = e.open_find_handle(std::move(entries));
+        write_finddata(e, e.arg_slot(1), *e.find_current(handle));
+        e.set_result(handle);
+    });
+    ucrt("_findnext64", [write_finddata](Emulator& e) {
+        uint64_t handle = e.arg_slot(0);
+        if (!e.find_advance(handle)) {
+            e.set_result(~0ull);
+            return;
+        }
+        write_finddata(e, e.arg_slot(1), *e.find_current(handle));
+        e.set_result(0);
+    });
+    ucrt("_findclose", [](Emulator& e) {
+        e.close_find_handle(e.arg_slot(0));
+        e.set_result(0);
+    });
+
+    // ---- binutils' additions (as.exe, ld.exe) -------------------------------------
+    ucrt("_assert", [](Emulator& e) {
+        std::string msg = e.mem.read_cstring(e.arg_slot(0));
+        std::string file = e.mem.read_cstring(e.arg_slot(1));
+        char text[512];
+        std::snprintf(text, sizeof text, "Assertion failed: %s, file %s, line %u\n",
+                      msg.c_str(), file.c_str(), static_cast<unsigned>(e.arg_slot(2)));
+        e.write_text(2, text);
+        e.exit_process(3);  // what abort() reports on Windows
+    });
+    ucrt("_chmod", [](Emulator& e) { e.set_result(0); });
+    ucrt("_locking", [](Emulator& e) { e.set_result(0); });
+    ucrt("_ctime64", [](Emulator& e) {
+        auto t = static_cast<time_t>(e.mem.read64(e.arg_slot(0)));
+        const char* s = std::ctime(&t);
+        e.set_result(e.alloc_guest_string(s ? s : "Thu Jan  1 00:00:00 1970\n"));
+    });
+    ucrt("_filelengthi64", [](Emulator& e) {
+        int64_t size = e.files.size(static_cast<int>(e.arg_slot(0)));
+        e.set_result(static_cast<uint64_t>(size < 0 ? -1 : size));
+    });
+    ucrt("_wcsnicmp", [](Emulator& e) {
+        uint64_t a = e.arg_slot(0), b = e.arg_slot(1), n = e.arg_slot(2);
+        int r = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            uint16_t ca = e.mem.read16(a + i * 2), cb = e.mem.read16(b + i * 2);
+            if (ca >= 'A' && ca <= 'Z') ca += 32;
+            if (cb >= 'A' && cb <= 'Z') cb += 32;
+            if (ca != cb) {
+                r = ca < cb ? -1 : 1;
+                break;
+            }
+            if (!ca) break;
+        }
+        e.set_result(static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
+    // fpos_t is a 64-bit offset in every Windows CRT.
+    ucrt("fgetpos", [](Emulator& e) {
+        int fd = e.host_fd(e.arg_slot(0));
+        int64_t pos = fd >= 0 ? e.files.tell(fd) : -1;
+        if (pos < 0) {
+            e.set_result(static_cast<uint64_t>(-1));
+            return;
+        }
+        e.mem.write64(e.arg_slot(1), static_cast<uint64_t>(pos));
+        e.set_result(0);
+    });
+    ucrt("fsetpos", [](Emulator& e) {
+        int fd = e.host_fd(e.arg_slot(0));
+        int64_t pos = static_cast<int64_t>(e.mem.read64(e.arg_slot(1)));
+        e.set_result(fd >= 0 && e.files.seek(fd, pos, 0) >= 0 ? 0 : static_cast<uint64_t>(-1));
+    });
+    ucrt("strftime", [](Emulator& e) {
+        uint64_t buf = e.arg_slot(0), max = e.arg_slot(1);
+        std::string fmt = e.mem.read_cstring(e.arg_slot(2));
+        uint64_t p = e.arg_slot(3);
+        std::tm tm{};
+        tm.tm_sec = static_cast<int>(e.mem.read32(p));
+        tm.tm_min = static_cast<int>(e.mem.read32(p + 4));
+        tm.tm_hour = static_cast<int>(e.mem.read32(p + 8));
+        tm.tm_mday = static_cast<int>(e.mem.read32(p + 12));
+        tm.tm_mon = static_cast<int>(e.mem.read32(p + 16));
+        tm.tm_year = static_cast<int>(e.mem.read32(p + 20));
+        tm.tm_wday = static_cast<int>(e.mem.read32(p + 24));
+        tm.tm_yday = static_cast<int>(e.mem.read32(p + 28));
+        std::vector<char> out(static_cast<size_t>(max) + 1);
+        size_t n = std::strftime(out.data(), out.size(), fmt.c_str(), &tm);
+        if (buf && n) e.mem.write(buf, out.data(), n + 1);
+        e.set_result(n);
+    });
+    ucrt("tmpfile", [](Emulator& e) {
+        // A temp file that unlinks itself is more than FileTable models; a
+        // uniquely named file in the temp directory is close enough for a
+        // linker's scratch space.
+        std::string dir = ".";
+        if (const std::string* v = e.getenv("TMP")) dir = *v;
+        for (int i = 0; i < 100; ++i) {
+            char name[64];
+            std::snprintf(name, sizeof name, "/x86emu_tmp_%d_%d", e.pid(), i);
+            FileTable::OpenFlags f;
+            f.read = f.write = f.create = f.exclusive = true;
+            int fd = e.files.open(dir + name, f);
+            if (fd >= 0) {
+                e.set_result(e.guest_file(fd));
+                return;
+            }
+        }
+        e.set_result(0);
+    });
+    ucrt("_popen", [](Emulator& e) {
+        e.log_call("_popen(%s) unsupported, failing", e.mem.read_cstring(e.arg_slot(0)).c_str());
+        e.set_result(0);
+    });
+    ucrt("_pclose", [](Emulator& e) { e.set_result(static_cast<uint64_t>(-1)); });
+    win32("GlobalMemoryStatus", 1, [](Emulator& e) {
+        uint64_t p = e.arg_slot(0);
+        if (p) {
+            e.mem.write32(p, 32);          // dwLength
+            e.mem.write32(p + 4, 25);      // dwMemoryLoad
+            e.mem.write32(p + 8, 0x80000000u);   // dwTotalPhys: 2 GiB
+            e.mem.write32(p + 12, 0x60000000u);  // dwAvailPhys
+            e.mem.write32(p + 16, 0x80000000u);
+            e.mem.write32(p + 20, 0x60000000u);
+            e.mem.write32(p + 24, 0x80000000u);
+            e.mem.write32(p + 28, 0x60000000u);
+        }
+        e.set_result(1);
     });
 }
 

@@ -150,6 +150,13 @@ uint64_t Emulator::data_import(const std::string& symbol) {
         return remember(alloc_guest_data(&inf, sizeof inf));
     }
     if (symbol == "_iob") return remember(guest_file(0));  // the 3-entry FILE array
+    if (symbol == "_pgmptr" || symbol == "__progname") {
+        std::string path = args_.empty() ? "program.exe" : args_[0];
+        if (os() == Os::Windows)
+            for (char& c : path)
+                if (c == '/') c = '\\';
+        return pointer_var(alloc_guest_string(path));
+    }
     return 0;
 }
 
