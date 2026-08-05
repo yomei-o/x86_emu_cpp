@@ -157,13 +157,26 @@ void Emulator::install_library_hooks() {
     libc("_iob", [](Emulator& e) { e.set_result(e.guest_file(0)); });
 
     // ---- process control ---------------------------------------------------
-    libc("exit", [](Emulator& e) { e.exit_process(static_cast<int>(e.arg_slot(0))); });
+    // exit() runs the atexit handlers and _exit() does not - that is the whole
+    // difference between them, and this registration shadows the one in
+    // hooks_win32.cpp (add_hook keeps the first), so it must do the job itself.
+    libc("exit", [](Emulator& e) {
+        e.run_atexit();
+        e.exit_process(static_cast<int>(e.arg_slot(0)));
+    });
     libc("_exit", [](Emulator& e) { e.exit_process(static_cast<int>(e.arg_slot(0))); });
     libc("abort", [](Emulator& e) {
         std::fprintf(stderr, "[guest] abort()\n");
         e.exit_process(3);
     });
-    libc("atexit", [](Emulator& e) { e.set_result(0); });
+    // atexit must keep the function, not merely succeed: a /MD C++ program's
+    // static *destructors* arrive here (the /MT path goes through _crt_atexit),
+    // and a hook that returns 0 while dropping the argument cancels every one of
+    // them silently.
+    libc("atexit", [](Emulator& e) {
+        if (uint64_t fn = e.arg_slot(0)) e.add_atexit(fn);
+        e.set_result(0);
+    });
     // msvcrt's internal CRT locks: one guest thread runs at a time, so there is
     // nothing to take.
     libc("_lock", [](Emulator& e) { e.set_result(0); });

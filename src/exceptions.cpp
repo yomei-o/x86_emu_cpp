@@ -178,6 +178,10 @@ uint64_t Emulator::virtual_unwind(uint32_t handler_type, uint64_t image_base, ui
     uint64_t handler = 0;
     uint64_t frame_base = ctx_rsp(*this, ctx);
     bool frame_base_set = false;
+    // Set once the walk moves into a chained parent: a fragment exists only
+    // because the whole prologue already ran, so every one of the parent's codes
+    // applies regardless of code offsets.
+    bool in_chained_parent = false;
 
     for (int chain = 0; chain < 32; ++chain) {
         uint8_t version_flags = mem.read8(unwind_info);
@@ -202,7 +206,7 @@ uint64_t Emulator::virtual_unwind(uint32_t handler_type, uint64_t image_base, ui
         // How far into the prologue the interrupted instruction is: codes whose
         // offset is beyond that have not run yet and must not be undone.
         uint64_t prolog_offset = pc > function_start ? pc - function_start : 0;
-        bool past_prolog = prolog_offset >= size_of_prolog;
+        bool past_prolog = in_chained_parent || prolog_offset >= size_of_prolog;
 
         for (int i = 0; i < count_of_codes;) {
             uint64_t code = codes + static_cast<uint64_t>(i) * 2;
@@ -312,7 +316,13 @@ uint64_t Emulator::virtual_unwind(uint32_t handler_type, uint64_t image_base, ui
             uint64_t chained = codes + ((static_cast<uint64_t>(count_of_codes) + 1) & ~1ull) * 2;
             unwind_info = image_base + mem.read32(chained + 8);
             function_start = image_base + mem.read32(chained);
-            pc = function_start;  // the parent's codes all apply
+            // The parent's codes all apply - and that must be said explicitly,
+            // not by faking pc.  Setting pc to the parent's start (the old code)
+            // made prolog_offset zero, which *disables* every code instead: the
+            // fragment's frame never unwound and the walk read a garbage return
+            // address.  c2.dll found this, because a profile-optimised binary is
+            // full of split functions and small tests contain none.
+            in_chained_parent = true;
             continue;
         }
 

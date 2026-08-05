@@ -33,6 +33,22 @@ check_native() {                # check_native <exe>
     fi
 }
 
+# check_native, with an extra library path passed to the emulator only - the
+# native run resolves the same DLLs through the loader's own search.
+check_native_flags() {          # check_native_flags <exe> <libpath>
+    exe=$1; libpath=$2
+    nrc=0; "$exe" > "$tmp/native.out" 2>&1 || nrc=$?
+    erc=0; "$emu" -L "$libpath" "$exe" > "$tmp/emu.out" 2>&1 || erc=$?
+    if cmp -s "$tmp/native.out" "$tmp/emu.out" && [ "$nrc" = "$erc" ]; then
+        echo "  ok    $exe (matches native, exit $nrc)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  $exe (native exit $nrc, emulated exit $erc)"
+        diff "$tmp/native.out" "$tmp/emu.out" | head -20 || true
+        fail=$((fail + 1))
+    fi
+}
+
 check_expected() {              # check_expected <exe> <expected-exit> <expected-file>
     exe=$1; want_rc=$2; want=$3
     erc=0; "$emu" "$exe" > "$tmp/emu.out" 2>&1 || erc=$?
@@ -72,22 +88,24 @@ fi
 
 # Built by tests/msvc/build.bat: a real Visual Studio toolchain, so the CRT
 # startup runs before main and - with /MT - the C runtime itself executes inside
-# the guest.
+# the guest.  The /MD C++ builds need their runtime DLLs (msvcp140, vcruntime140)
+# loaded for real, which is what `-L <redist>` provides; without a redist on this
+# machine those two are skipped, everything else still runs.
 if ls tests/msvc/bin/*.exe >/dev/null 2>&1; then
     echo "MSVC guests (emulated output vs. native execution)"
+    redist64=$(ls -d "C:/Program Files/Microsoft Visual Studio"/*/*/VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT 2>/dev/null | head -1)
+    redist32=$(ls -d "C:/Program Files/Microsoft Visual Studio"/*/*/VC/Redist/MSVC/*/x86/Microsoft.VC143.CRT 2>/dev/null | head -1)
     for exe in tests/msvc/bin/*.exe; do
-        # Built, but not yet runnable, and each for a reason worth naming.  The
-        # /MD builds link their C++ runtime dynamically, so the *language* half
-        # of exception handling and the iostream objects live in vcruntime140.dll
-        # and msvcp140.dll; the emulator implements the kernel's half of
-        # unwinding, not those DLLs' contents.  The /MT builds - the same
-        # programs with the runtime statically linked - do run, exceptions and
-        # all.
         case "$exe" in
-            *exc_msvc_MD*) continue;;
-            *cpp_msvc_MD*) continue;;
+            *cpp_msvc_MD64*|*exc_msvc_MD64*)
+                [ -n "$redist64" ] || { echo "  skip  $exe (no VC redist found)"; continue; }
+                EMUFLAGS="-L $redist64" check_native_flags "$exe" "$redist64";;
+            *cpp_msvc_MD32*|*exc_msvc_MD32*)
+                [ -n "$redist32" ] || { echo "  skip  $exe (no VC redist found)"; continue; }
+                EMUFLAGS="-L $redist32" check_native_flags "$exe" "$redist32";;
+            *)
+                check_native "$exe";;
         esac
-        check_native "$exe"
     done
 fi
 

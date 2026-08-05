@@ -212,6 +212,42 @@ void Emulator::install_link_hooks() {
     // current thread is both the common case and the only one it can answer.
     win32("GetThreadId", 1, [](Emulator& e) { e.set_result(e.current_thread_id()); });
     win32("SetProcessWorkingSetSize", 3, [](Emulator& e) { e.set_result(1); });
+    // (buffer, in/out size in characters).  cl's C++ front end asks for the
+    // machine name while building its PCH/IFC identity; any stable name will do.
+    auto computer_name = [](Emulator& e, bool wide) {
+        const std::string name = "X86EMU";
+        uint64_t buf = e.arg_slot(0), size_ptr = e.arg_slot(1);
+        uint32_t capacity = size_ptr ? e.mem.read32(size_ptr) : 0;
+        if (!buf || capacity <= name.size()) {
+            if (size_ptr) e.mem.write32(size_ptr, static_cast<uint32_t>(name.size() + 1));
+            e.set_last_error(111);  // ERROR_BUFFER_OVERFLOW
+            e.set_result(0);
+            return;
+        }
+        if (wide)
+            write_utf16(e, buf, name);
+        else
+            e.mem.write_cstring(buf, name);
+        if (size_ptr) e.mem.write32(size_ptr, static_cast<uint32_t>(name.size()));
+        e.set_result(1);
+    };
+    win32("GetComputerNameA", 2, [computer_name](Emulator& e) { computer_name(e, false); });
+    win32("GetComputerNameW", 2, [computer_name](Emulator& e) { computer_name(e, true); });
+    // The Ex form takes a format enum first; every format may answer the same.
+    win32("GetComputerNameExW", 3, [](Emulator& e) {
+        const std::string name = "X86EMU";
+        uint64_t buf = e.arg_slot(1), size_ptr = e.arg_slot(2);
+        uint32_t capacity = size_ptr ? e.mem.read32(size_ptr) : 0;
+        if (!buf || capacity <= name.size()) {
+            if (size_ptr) e.mem.write32(size_ptr, static_cast<uint32_t>(name.size() + 1));
+            e.set_last_error(234);  // ERROR_MORE_DATA
+            e.set_result(0);
+            return;
+        }
+        write_utf16(e, buf, name);
+        if (size_ptr) e.mem.write32(size_ptr, static_cast<uint32_t>(name.size()));
+        e.set_result(1);
+    });
     win32("DebugBreak", 0, [](Emulator& e) { e.set_result(0); });
     // Windows Error Reporting: a crashing linker would attach these files to its
     // report.  Registering them successfully and never reporting anything is
@@ -247,6 +283,82 @@ void Emulator::install_link_hooks() {
         uint64_t first = e.mem.read_sized(head, ps);
         if (first) e.mem.write_sized(head, ps, e.mem.read_sized(first, ps));
         e.set_result(first);
+    });
+
+    // ---- oleaut32: BSTR and VARIANT -----------------------------------------
+    // A BSTR is a wide string with its byte length in the 4 bytes *before* the
+    // pointer, NUL-terminated after; SysFreeString must accept what
+    // SysAllocString made, so both sides live here and agree on that layout.
+    // c1xx reaches these by delay-loaded ordinal at shutdown.
+    auto alloc_bstr = [](Emulator& e, const uint8_t* data, uint32_t bytes) {
+        uint64_t block = e.heap_alloc(4 + bytes + 2);
+        e.mem.write32(block, bytes);
+        if (bytes) e.mem.write(block + 4, data, bytes);
+        e.mem.write16(block + 4 + bytes, 0);
+        return block + 4;
+    };
+    win32("SysAllocString", 1, [alloc_bstr](Emulator& e) {
+        uint64_t src = e.arg_slot(0);
+        if (!src) {
+            e.set_result(0);
+            return;
+        }
+        uint64_t units = 0;
+        while (e.mem.read16(src + units * 2) != 0) ++units;
+        std::vector<uint8_t> raw(static_cast<size_t>(units) * 2);
+        if (units) e.mem.read(src, raw.data(), raw.size());
+        e.set_result(alloc_bstr(e, raw.data(), static_cast<uint32_t>(raw.size())));
+    });
+    // (source, length in characters): the source may be null - that allocates
+    // uninitialised room - and may contain embedded NULs, which is the point of
+    // carrying an explicit length.
+    win32("SysAllocStringLen", 2, [alloc_bstr](Emulator& e) {
+        uint64_t src = e.arg_slot(0);
+        uint32_t units = static_cast<uint32_t>(e.arg_slot(1));
+        std::vector<uint8_t> raw(static_cast<size_t>(units) * 2, 0);
+        if (src && units) e.mem.read(src, raw.data(), raw.size());
+        e.set_result(alloc_bstr(e, raw.data(), units * 2));
+    });
+    win32("SysAllocStringByteLen", 2, [alloc_bstr](Emulator& e) {
+        uint64_t src = e.arg_slot(0);
+        uint32_t bytes = static_cast<uint32_t>(e.arg_slot(1));
+        std::vector<uint8_t> raw(bytes, 0);
+        if (src && bytes) e.mem.read(src, raw.data(), bytes);
+        e.set_result(alloc_bstr(e, raw.data(), bytes));
+    });
+    win32("SysFreeString", 1, [](Emulator& e) {
+        if (uint64_t b = e.arg_slot(0)) e.heap_free(b - 4);
+        e.set_result(0);
+    });
+    win32("SysStringLen", 1, [](Emulator& e) {
+        uint64_t b = e.arg_slot(0);
+        e.set_result(b ? e.mem.read32(b - 4) / 2 : 0);
+    });
+    win32("SysStringByteLen", 1, [](Emulator& e) {
+        uint64_t b = e.arg_slot(0);
+        e.set_result(b ? e.mem.read32(b - 4) : 0);
+    });
+    // A VARIANT is 24 bytes v-type first; Init zeroes it (VT_EMPTY), and Clear
+    // frees what the type says it owns.  Only the BSTR case owns anything a
+    // compiler produces.
+    win32("VariantInit", 1, [](Emulator& e) {
+        uint64_t v = e.arg_slot(0);
+        if (v)
+            for (int i = 0; i < 24; i += 8) e.mem.write64(v + i, 0);
+        e.set_result(0);
+    });
+    win32("VariantClear", 1, [](Emulator& e) {
+        uint64_t v = e.arg_slot(0);
+        if (!v) {
+            e.set_result(0x80070057);  // E_INVALIDARG
+            return;
+        }
+        constexpr uint16_t kVtBstr = 8;
+        if (e.mem.read16(v) == kVtBstr) {
+            if (uint64_t b = e.mem.read_sized(v + 8, e.pointer_size())) e.heap_free(b - 4);
+        }
+        for (int i = 0; i < 24; i += 8) e.mem.write64(v + i, 0);
+        e.set_result(0);
     });
 
     // ---- psapi --------------------------------------------------------------

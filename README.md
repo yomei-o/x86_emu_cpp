@@ -42,7 +42,8 @@ Verified by diffing emulated output against real native execution, byte for byte
 | Linux processes (`fork`, `execve`, `pipe`, `wait4`) | — | ✅ |
 | Linux threads (`clone`, `futex`) — a glibc `pthread` program | — | ✅ |
 | **mingw-w64 `gcc` compiling and linking a program** | — | ✅ |
-| **MSVC `cl.exe` + `link.exe` building a program, byte-identical output** | — | ✅ |
+| **MSVC `cl.exe` + `link.exe` building C *and C++*, byte-identical objects** | — | ✅ |
+| C++ with the runtime in DLLs (`/MD`): iostreams and exceptions | ✅ | ✅ |
 | **Alpine `as` and `ld` (musl, dynamically linked) building a binary** | — | ✅ |
 | **C++ exceptions**: throw, unwind through destructors, rethrow, catch-all | ✅ | ✅ |
 | C's `__try`/`__except`/`__finally` (`__C_specific_handler`) | — | ✅ |
@@ -64,7 +65,9 @@ hello from cl
 
 The object file it emits is **byte-for-byte identical** to what the same `cl.exe`
 produces natively, apart from the timestamp in the COFF header - which differs
-between any two builds, including two native ones. `tests/toolchain/run_msvc.sh`
+between any two builds, including two native ones. That holds for C++ too: an
+`iostream`-including translation unit (a 300 KB object, more than two billion
+emulated instructions to produce) comes out identical. `tests/toolchain/run_msvc.sh`
 checks exactly that, and it is the most useful test in the tree: a compiler with
 a subtly wrong hook does not crash, it quietly emits a slightly different object.
 The missing `.chks64` section that revealed we had no CNG hashing at all would
@@ -401,16 +404,12 @@ misbehaving quietly.
   true 80-bit extended values, so a computation carried out entirely in extended
   precision on real hardware can differ in its last bits. Loads and stores of an
   80-bit memory operand do convert exactly.
-- **C++ with the runtime in a DLL (`/MD`) does not work.** Its language half -
-  `_CxxThrowException`, `__CxxFrameHandler4`, and `std::cout` itself - lives in
-  `vcruntime140.dll` and `msvcp140.dll`. Those DLLs now load and run for real
-  (`-L` the redistributable directory), which is progress, but the iostream
-  objects are still never constructed. `/MT`, where the same code is linked into
-  the image, works fully - exceptions included.
-- **The MSVC toolchain works for C; C++ through it is untried.** `cl.exe` and
-  `link.exe` build a C program end to end and the object matches a native build
-  byte for byte, but only the C front end has been exercised. Anything that pulls
-  in `msvcp140.dll` runs into the `/MD` limitation above.
+- **`/MD` C++ needs `-L` pointed at the redistributable.** The language half of
+  the runtime - `msvcp140.dll`, `vcruntime140.dll` - has to be loaded for real,
+  and the emulator does not guess where a Visual Studio installation keeps it
+  (`VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT`). With that flag, iostreams and
+  exceptions match native output; without it, the program reports its DLLs
+  missing, exactly as real Windows would.
 - **`gcc` works; `cc1` from a Linux distribution does not, yet.** The mingw
   toolchain compiles and links end to end, and Alpine's `as` and `ld` do too, but
   Alpine's `cc1` gets through parsing and RTL expansion and then faults on a null

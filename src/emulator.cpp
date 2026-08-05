@@ -470,15 +470,50 @@ uint64_t Emulator::call_guest(uint64_t func, const std::vector<uint64_t>& args) 
     return result;
 }
 
-void Emulator::run_atexit() {
-    // Take the list first: a destructor may register more, and it must not see
-    // itself run twice.
-    std::vector<uint64_t> pending;
-    pending.swap(atexit_funcs_);
-    for (size_t i = pending.size(); i-- > 0;) {
-        if (cpu_->halted) break;
-        call_guest(pending[i], {});
+void Emulator::add_atexit(uint64_t func, uint64_t table) {
+    if (!table) {
+        atexit_funcs_.push_back(func);
+        return;
     }
+    for (auto& [key, funcs] : onexit_tables_) {
+        if (key == table) {
+            funcs.push_back(func);
+            return;
+        }
+    }
+    onexit_tables_.push_back({table, {func}});
+}
+
+void Emulator::run_onexit_table(uint64_t table) {
+    if (!table) {
+        // Take the list first: a destructor may register more, and it must not
+        // see itself run twice.
+        std::vector<uint64_t> pending;
+        pending.swap(atexit_funcs_);
+        for (size_t i = pending.size(); i-- > 0;) {
+            if (cpu_->halted) break;
+            call_guest(pending[i], {});
+        }
+        return;
+    }
+    for (auto& [key, funcs] : onexit_tables_) {
+        if (key != table) continue;
+        std::vector<uint64_t> pending;
+        pending.swap(funcs);
+        for (size_t i = pending.size(); i-- > 0;) {
+            if (cpu_->halted) break;
+            call_guest(pending[i], {});
+        }
+        return;
+    }
+}
+
+void Emulator::run_atexit() {
+    // The process-wide list first, then each table in the order it appeared:
+    // a module's own teardown should not run before the program's destructors.
+    run_onexit_table(0);
+    for (size_t i = 0; i < onexit_tables_.size() && !cpu_->halted; ++i)
+        run_onexit_table(onexit_tables_[i].first);
 }
 
 uint32_t Emulator::tls_alloc() {
@@ -1554,6 +1589,7 @@ std::unique_ptr<Emulator> Emulator::fork_clone() {
     child->tls_templates_ = tls_templates_;
     child->next_dynamic_tls_slot_ = next_dynamic_tls_slot_;
     child->atexit_funcs_ = atexit_funcs_;
+    child->onexit_tables_ = onexit_tables_;
     child->sync_objects_ = sync_objects_;
     child->next_sync_handle_ = next_sync_handle_;
     child->find_handles_ = find_handles_;

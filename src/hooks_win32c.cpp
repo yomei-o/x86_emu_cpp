@@ -1914,9 +1914,36 @@ void Emulator::install_cl_hooks() {
         if (out) e.mem.write_sized(out, e.pointer_size(), fd < 0 ? 0 : e.guest_file(fd));
         e.set_result(fd < 0 ? 2 : 0);
     });
+    // (stream, char*** base, char*** ptr, int** count): hands out the addresses
+    // of a FILE's own `_base`, `_ptr` and `_cnt`, so the caller can fill the
+    // stream's buffer itself instead of going through fwrite.
+    //
+    // msvcp140's basic_streambuf keeps these as its `_IPfirst`/`_IPnext`/
+    // `_IPcount` and dereferences them on every insertion.  This used to report
+    // success and write three nulls, so the first `std::cout << "..."` read
+    // through a null pointer - which is why C++ with the runtime in a DLL never
+    // printed anything.
+    //
+    // Handing out the real addresses is both truthful and enough: our FILE object
+    // has no buffer behind it, so `_cnt` stays zero, the caller finds no room and
+    // falls back to overflow() - which is one of our hooks.  An "out parameter
+    // left unwritten" and an out parameter filled with a plausible null are the
+    // same class of bug.
     ucrt("_get_stream_buffer_pointers", [](Emulator& e) {
-        for (int i = 1; i <= 3; ++i)
-            if (e.arg_slot(i)) e.mem.write_sized(e.arg_slot(i), e.pointer_size(), 0);
+        uint64_t stream = e.arg_slot(0);
+        int ps = e.pointer_size();
+        if (!stream || e.host_fd(stream) < 0) {
+            for (int i = 1; i <= 3; ++i)
+                if (e.arg_slot(i)) e.mem.write_sized(e.arg_slot(i), ps, 0);
+            e.set_result(22);  // EINVAL
+            return;
+        }
+        if (e.arg_slot(1))
+            e.mem.write_sized(e.arg_slot(1), ps, stream + e.file_object_base_offset());
+        if (e.arg_slot(2))
+            e.mem.write_sized(e.arg_slot(2), ps, stream + e.file_object_ptr_offset());
+        if (e.arg_slot(3))
+            e.mem.write_sized(e.arg_slot(3), ps, stream + e.file_object_count_offset());
         e.set_result(0);
     });
     ucrt("fputwc", [](Emulator& e) {

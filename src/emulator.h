@@ -49,7 +49,10 @@ public:
         bool trace = false;         // dump CPU state per instruction
         bool trace_calls = false;   // log intercepted library calls
         bool dump_map = false;      // print the guest memory map after loading
-        uint64_t max_instructions = 500000000ull;
+        // A runaway net, not a budget: big enough that no legitimate guest hits
+        // it (an emulated C++ compile runs beyond two billion instructions), yet
+        // an infinite loop still stops in bounded time.
+        uint64_t max_instructions = 100000000000ull;
         // Where to look for DLLs the guest imports, beyond the program's own
         // directory and the working directory.
         std::vector<std::string> library_paths;
@@ -268,6 +271,12 @@ public:
     // Resolves a symbol in a loaded module, following forwarders; 0 if absent.
     uint64_t find_export(uint64_t module_base, const std::string& symbol);
     uint64_t find_export_ordinal(uint64_t module_base, uint32_t ordinal);
+    // The classic name for a well-known DLL's ordinal, or empty.  oleaut32 is the
+    // one that matters: its ordinals have been fixed since the 16-bit days and
+    // are how both linkers and delay-load thunks refer to it, so a hooked (not
+    // loaded) oleaut32 must answer ordinal imports and ordinal GetProcAddress
+    // alike - through this one table, so the two can never disagree.
+    static const char* well_known_ordinal(const std::string& dll, uint32_t ordinal);
     Module* module_for(uint64_t base);
     Module* module_by_name(const std::string& name);
     const std::vector<std::unique_ptr<Module>>& modules() const { return modules_; }
@@ -296,6 +305,14 @@ public:
     bool alias_hook(const std::string& existing, const std::string& alias);
     // A stand-in HMODULE for a library the emulator implements rather than loads.
     uint64_t hooked_module_handle(const std::string& name);
+    // The name a sentinel handle was created for, or empty.  GetProcAddress by
+    // *ordinal* needs it: the hook table speaks names, so resolving an ordinal
+    // means first knowing which DLL's numbering to translate with.
+    std::string hooked_module_name(uint64_t handle) const {
+        for (const auto& [name, h] : hooked_modules_)
+            if (h == handle) return name;
+        return {};
+    }
 
     // ---- argument access for hook bodies ----------------------------------
     // One pointer-sized argument slot, 0-based, per the active ABI.
@@ -355,7 +372,18 @@ public:
 
     // atexit / static destructors: the C runtime registers them with us, and we
     // run them, newest first, when the guest exits.
-    void add_atexit(uint64_t func) { atexit_funcs_.push_back(func); }
+    //
+    // `table` is the onexit table the CRT passed, and keeping them apart matters
+    // once more than one module is involved: with the runtime in a DLL,
+    // msvcp140's DllMain registers 44 functions that tear the iostreams down, and
+    // the program's own static destructors - which still want to print - are on a
+    // different table. Pooling them lets one module's teardown run before the
+    // other module's destructors.  A null table is the process-wide list that
+    // plain atexit() uses.
+    void add_atexit(uint64_t func, uint64_t table = 0);
+    // Runs one table's functions, newest first, and forgets them.
+    void run_onexit_table(uint64_t table);
+    // Runs everything still registered, the process-wide list first.
     void run_atexit();
 
     // ---- guest services ----------------------------------------------------
@@ -432,6 +460,14 @@ public:
     // sizeof(FILE) as the guest's C runtime sees it, which is the stride of an
     // `_iob` array and therefore not ours to choose.
     uint64_t file_object_stride() const { return is64() ? 88 : 44; }
+    // Where the buffer fields sit inside that object, matching the UCRT's
+    // `__crt_stdio_stream_data`.  These are named because more than
+    // write_guest_file_object() needs them: `_get_stream_buffer_pointers` hands
+    // their *addresses* to the caller, and msvcp140's basic_filebuf writes
+    // through them.
+    uint64_t file_object_ptr_offset() const { return 0; }
+    uint64_t file_object_base_offset() const { return is64() ? 0x08 : 0x04; }
+    uint64_t file_object_count_offset() const { return is64() ? 0x10 : 0x08; }
 
     // Win32 HANDLEs for files are descriptors in disguise.  The offset keeps them
     // clear of 0 (NULL) and of the small integers a guest might treat specially.
@@ -654,6 +690,10 @@ private:
     std::vector<std::string> loading_;
     uint32_t next_dynamic_tls_slot_ = 0;  // TlsAlloc hands these out
     std::vector<uint64_t> atexit_funcs_;
+    // Per-onexit-table registrations, in registration order.  Insertion order of
+    // the map itself does not matter; run_atexit() walks the tables in the order
+    // they were first used, which is the order the modules initialised in.
+    std::vector<std::pair<uint64_t, std::vector<uint64_t>>> onexit_tables_;
 
     System* system_ = nullptr;
     int pid_ = 4242;  // the value getpid() always answered before processes existed

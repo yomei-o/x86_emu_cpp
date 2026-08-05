@@ -209,7 +209,10 @@ void Emulator::install_win32_hooks() {
             e.set_result(base);
             return;
         }
-        e.set_result(e.hooked_module_handle(name));
+        uint64_t handle = e.hooked_module_handle(name);
+        e.log_call("LoadLibrary(%s) -> %s", name.c_str(),
+                   handle ? "hooked sentinel" : "not found");
+        e.set_result(handle);
     };
     win32("LoadLibraryA", 1, [load_library_hook](Emulator& e) { load_library_hook(e, false); });
     win32("LoadLibraryW", 1, [load_library_hook](Emulator& e) { load_library_hook(e, true); });
@@ -220,7 +223,20 @@ void Emulator::install_win32_hooks() {
         uint64_t name_or_ordinal = e.arg_slot(1);
         // An argument below 0x10000 is an ordinal, not a pointer.
         if (name_or_ordinal < 0x10000) {
-            e.set_result(e.find_export_ordinal(module, static_cast<uint32_t>(name_or_ordinal)));
+            uint32_t ordinal = static_cast<uint32_t>(name_or_ordinal);
+            uint64_t addr = e.find_export_ordinal(module, ordinal);
+            if (!addr) {
+                // A hooked module has no export table, but a well-known ordinal
+                // may still be answerable - through the same table bind_imports
+                // uses, so the load-time and run-time answers cannot disagree.
+                std::string dll = e.hooked_module_name(module);
+                if (const char* name = Emulator::well_known_ordinal(dll, ordinal))
+                    addr = e.existing_hook(name);
+                if (!addr)
+                    e.log_call("GetProcAddress(%s, ordinal %u) found nothing",
+                               dll.empty() ? "?" : dll.c_str(), ordinal);
+            }
+            e.set_result(addr);
             return;
         }
         std::string symbol = e.mem.read_cstring(name_or_ordinal);
@@ -846,7 +862,8 @@ void Emulator::install_ucrt_hooks() {
             ++called;
             e.call_guest(fn, {});
         }
-        e.log_call("_initterm ran %d initialisers", called);
+        e.log_call("_initterm(0x%llX) ran %d initialisers [%s]",
+                   (unsigned long long)first, called, e.describe_address(first).c_str());
         e.set_result(0);
     });
     ucrt("_initterm_e", [](Emulator& e) {
@@ -861,8 +878,9 @@ void Emulator::install_ucrt_hooks() {
             ++called;
             if (result) break;  // a non-zero return aborts initialisation
         }
-        e.log_call("_initterm_e ran %d initialisers, result %llu", called,
-                   (unsigned long long)result);
+        e.log_call("_initterm_e(0x%llX) ran %d initialisers [%s], result %llu",
+                   (unsigned long long)first, called,
+                   e.describe_address(first).c_str(), (unsigned long long)result);
         e.set_result(result);
     });
     ret0("_configure_narrow_argv");
@@ -961,9 +979,13 @@ void Emulator::install_ucrt_hooks() {
     ret0("_crt_at_quick_exit");
     ret0("_query_app_type");
     ucrt("_register_onexit_function", [](Emulator& e) {
-        // (table, function) - the table is the CRT's business, the function ours.
-        uint64_t fn = e.arg_slot(1);
-        if (fn) e.add_atexit(fn);
+        // (table, function).  The table matters: with the runtime in a DLL,
+        // msvcp140 registers its own teardown on its own table and executes that
+        // table from DllMain(DLL_PROCESS_DETACH) - so functions must stay with
+        // the table they were registered on, or one module's teardown drags the
+        // others' along.
+        uint64_t table = e.arg_slot(0), fn = e.arg_slot(1);
+        if (fn) e.add_atexit(fn, table);
         e.set_result(0);
     });
     ucrt("_crt_atexit", [](Emulator& e) {
@@ -984,7 +1006,7 @@ void Emulator::install_ucrt_hooks() {
         e.set_result(fn);
     });
     ucrt("_execute_onexit_table", [](Emulator& e) {
-        e.run_atexit();
+        e.run_onexit_table(e.arg_slot(0));
         e.set_result(0);
     });
     auto do_exit = [](Emulator& e) {

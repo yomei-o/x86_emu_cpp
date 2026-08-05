@@ -109,6 +109,48 @@ else
     report FAIL "cl hello.c (no executable produced)"
 fi
 
+# The same two checks for C++, which is a different exercise entirely: the front
+# end becomes c1xx.dll, iostream headers push the compile beyond two billion
+# instructions, and c2.dll throws C++ exceptions internally - it was the guest
+# that found the chained-unwind-info bug.  This is the slow part of the suite
+# (a couple of minutes); set X86EMU_SKIP_CPP=1 to leave it out.
+if [ -z "$X86EMU_SKIP_CPP" ]; then
+    cat > "$work/build/hi.cpp" <<'EOF'
+#include <iostream>
+#include <vector>
+int main() {
+    std::vector<int> v{3, 1, 2};
+    int sum = 0;
+    for (int x : v) sum += x;
+    std::cout << "hello from C++ cl: " << sum << "\n";
+    return 0;
+}
+EOF
+    (cd "$work/build" && "$here/$emu" "$cl" -nologo -EHsc -MT -c hi.cpp >/dev/null 2>&1)
+    mv "$work/build/hi.obj" "$work/emulated-cpp.obj" 2>/dev/null || true
+    (cd "$work/build" && "$cl" -nologo -EHsc -MT -c hi.cpp >/dev/null 2>&1)
+    mv "$work/build/hi.obj" "$work/native-cpp.obj"
+    if [ -f "$work/emulated-cpp.obj" ] &&
+       cmp -s -n 4 "$work/emulated-cpp.obj" "$work/native-cpp.obj" &&
+       cmp -s -i 8 "$work/emulated-cpp.obj" "$work/native-cpp.obj"; then
+        report ok "cl -c hi.cpp (C++ object identical to native, timestamp aside)"
+    else
+        report FAIL "cl -c hi.cpp (C++ object differs from native)"
+    fi
+
+    (cd "$work/build" && rm -f hi.exe && "$here/$emu" "$cl" -nologo -EHsc -MT hi.cpp >/dev/null 2>&1)
+    if [ -f "$work/build/hi.exe" ]; then
+        got=$("$emu" "$work/build/hi.exe" 2>&1 || true)
+        if [ "$got" = "hello from C++ cl: 6" ]; then
+            report ok "cl hi.cpp (C++ compiled, linked and run in the emulator)"
+        else
+            report FAIL "cl hi.cpp (linked, but the result printed <$got>)"
+        fi
+    else
+        report FAIL "cl hi.cpp (no executable produced)"
+    fi
+fi
+
 rm -rf tests/toolchain/.work
 echo
 echo "$pass passed, $fail failed"

@@ -232,6 +232,27 @@ uint64_t Emulator::find_export_ordinal(uint64_t module_base, uint32_t ordinal) {
     return it == m->image.exports_by_ordinal.end() ? 0 : it->second;
 }
 
+const char* Emulator::well_known_ordinal(const std::string& dll, uint32_t ordinal) {
+    std::string lower;
+    for (char c : dll) lower += static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    if (lower == "oleaut32.dll" || lower == "oleaut32") {
+        switch (ordinal) {
+            case 2: return "SysAllocString";
+            case 3: return "SysReAllocString";
+            case 4: return "SysAllocStringLen";
+            case 5: return "SysReAllocStringLen";
+            case 6: return "SysFreeString";
+            case 7: return "SysStringLen";
+            case 8: return "VariantInit";
+            case 9: return "VariantClear";
+            case 149: return "SysAllocStringByteLen";
+            case 150: return "SysStringByteLen";
+            default: return nullptr;
+        }
+    }
+    return nullptr;
+}
+
 void Emulator::bind_imports(PeImage& img) {
     for (const auto& imp : img.imports) {
         uint64_t target = 0;
@@ -245,7 +266,12 @@ void Emulator::bind_imports(PeImage& img) {
             // it; a hook is the answer in both cases, and an unknown name becomes
             // a stub that only fails if it is actually called.
             std::string symbol = imp.symbol;
-            if (symbol.empty()) symbol = "#" + std::to_string(imp.ordinal);
+            if (symbol.empty()) {
+                if (const char* known = well_known_ordinal(imp.dll, imp.ordinal))
+                    symbol = known;
+                else
+                    symbol = "#" + std::to_string(imp.ordinal);
+            }
             target = resolve_import(imp.dll, symbol);
         }
         if (img.mode == Mode::X86_64)

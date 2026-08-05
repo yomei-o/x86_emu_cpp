@@ -21,9 +21,11 @@ byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
 - **mingw-w64 `gcc` compiles and links inside the emulator**, producing a binary
   byte-identical to the one it produces natively
 - **Alpine's `as` and `ld` (dynamically linked, musl) build a working binary**
-- **MSVC `cl.exe` compiles and `link.exe` links, inside the emulator**, and the
-  object file is byte-identical to a native build apart from its timestamp
-  (`sh tests/toolchain/run_msvc.sh`)
+- **MSVC `cl.exe` compiles and `link.exe` links, inside the emulator**, C and
+  C++ both, and the object files are byte-identical to a native build apart from
+  the timestamp (`sh tests/toolchain/run_msvc.sh`)
+- **`/MD` C++ works**: msvcp140/vcruntime140 loaded for real via `-L`, iostreams
+  and exceptions matching native output on x86 and x64
 
 ## Done 2026-08-05 (processes, threads, compilers)
 
@@ -176,7 +178,7 @@ changes behaviour only on machines where that file happens to be findable, so a
 guest that ships its own `ucrtbase.dll` - some Python distributions do - would
 have silently stopped printing.
 
-## Done 2026-08-05 (last): the MSVC toolchain end to end
+## Done 2026-08-05 (afternoon): the MSVC toolchain end to end
 
 `cl.exe -c hello.c` produces an object byte-identical to a native build, and
 `cl.exe hello.c` spawns `link.exe` as a child process and produces a working
@@ -253,40 +255,66 @@ different file, so the only test that finds these is one that compares the
 comparison against a real toolchain is worth more here than any number of
 programs that print things.
 
-## Next: the two things actually blocked
+## Done 2026-08-05 (evening): /MD C++, and C++ through the toolchain
 
-### 1. C++ with the runtime in a DLL (`/MD`)
+### `/MD` C++: three lies, none of them where the investigation pointed
 
-`msvcp140.dll` and `vcruntime140.dll` now load and *run* for real when `-L`
-points at the redistributable directory
-(`VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT`), which is new — and its `DllMain`
-gets a long way: it runs its own initialiser tables, creates its critical
-sections, and calls `__acrt_iob_func` a dozen times, which is the standard
-streams being built.
+The stall was `std::cout`'s streambuf holding null pointers, and the earlier
+analysis ("ios_base's locale pointer, maybe fed by a data import") was wrong in
+a useful way - the null was not a locale and not a data import:
 
-Where it stops, exactly: inside that initialiser run (the `_initterm` call never
-returns), at `msvcp140+0x97D6`, which is
+1. **`_get_stream_buffer_pointers` reported success and wrote three nulls.**
+   It is supposed to return the *addresses of* a FILE's `_base`/`_ptr`/`_cnt`
+   fields; msvcp140's `basic_streambuf` stores those addresses as its
+   `_IPfirst`/`_IPnext`/`_IPcount` and dereferences them on every insertion.
+   Handing out the real field addresses inside our synthetic FILE object (whose
+   layout already matched the UCRT's for cl.exe's sake) was the whole fix: the
+   fields hold zero, the streambuf finds no buffer room, and falls back to
+   overflow() - which is a hook.  An out parameter filled with a *plausible
+   null* is the same class of bug as one left unwritten.
+2. **`atexit` dropped its argument.**  A /MD program's static destructors arrive
+   through the imported `atexit`; the hook returned 0 and kept nothing, so every
+   destructor was silently cancelled.  (/MT never noticed: its atexit is inside
+   the image.)
+3. **Two `exit` hooks, and the wrong one won.**  hooks.cpp's `exit` (registered
+   first, so it shadows the hooks_win32.cpp one) did not run the atexit list.
+   exit()-runs-handlers versus _exit()-does-not is the entire difference between
+   those functions.
 
-```asm
-    mov rax,[rcx+0x40]     ; rcx = std::cout, inside msvcp140
-    mov r9,[rax]           ; faults: [cout+0x40] is NULL
-```
+Also: onexit tables are now kept *per table* rather than pooled, because
+msvcp140 registers 44 teardown functions on its own table and executes that
+table from its DllMain - pooled, one module's teardown drags the others' along.
 
-so a pointer field of `std::cout` — by its offset, `ios_base`'s locale pointer —
-is still zero while the object is being constructed. What that rules out: the
-missing value does *not* come from `_get_current_locale` or `_create_locale`
-(msvcp140 never calls them; it only takes `_lock_locales`/`_unlock_locales` and
-reads locale data through `___lc_locale_name_func`, `__pctype_func` and
-`localeconv`). The next step is to find which of those, or which *data* import,
-feeds that field — and note that a UCRT data import bound to a hook address
-yields code bytes rather than a plausible value, which is worth checking first.
+### C++ through the emulated toolchain: the chained-unwind bug
 
-Worth knowing before going further: msvcp140 was built against the real
-`ucrtbase.dll` and reads its structures directly, not only through functions.
-Some of this may be unreachable without loading a real UCRT too, which is a
-bigger decision than it looks (see "Windows is effectively already done" below).
+`cl -EHsc -MT hi.cpp` now builds a byte-identical object and a working
+executable.  Two real bugs stood in the way:
 
-### 2. A distribution `cc1` faults in the first RTL pass
+- **Chained UNWIND_INFO applied no codes at all.**  On following a chained entry
+  to its parent, the walker set `pc = parent's start` so that "the parent's
+  codes all apply" - but the applicability test compares code offsets against
+  `pc - function_start`, so a zero offset *disables* every code instead.  The
+  fragment's frame never unwound and the walk read a garbage return address.
+  c2.dll found it because a profile-optimised binary is full of split
+  functions; no test program contains any.  The fix is an explicit
+  `in_chained_parent` flag.  Symptom to remember: a C++ exception reported as
+  "no handler accepted it" when the handler plainly exists.
+- **oleaut32 is linked by ordinal, and a hooked module had no ordinals.**
+  c1xx delay-loads oleaut32 and imports it by ordinal at load time too.  One
+  shared table (`Emulator::well_known_ordinal`) now answers both bind_imports
+  and GetProcAddress-by-ordinal, so the two can never disagree - the first
+  attempt fixed only GetProcAddress, which made c1xx *enable* its VARIANT path
+  and then call the still-unbound load-time slot.  BSTR/VariantInit/VariantClear
+  are real implementations (length-prefixed wide strings) since c1xx frees what
+  it allocates.
+
+The default instruction cap moved from 500M to 100G: an iostream compile runs
+beyond two billion instructions, so the old "possible infinite loop" net was
+killing legitimate work.
+
+## Next: the one thing actually blocked
+
+### A distribution `cc1` faults in the first RTL pass
 
 Given a sysroot of unpacked Alpine packages, that distribution's `as` and `ld`
 run perfectly; its `cc1` does not. It gets *far*: `-version`, preprocessing (`-E`), an
