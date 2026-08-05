@@ -58,11 +58,24 @@ struct PeImage {
     // walk, only this table.
     uint64_t exception_table = 0;    // as an address, not an RVA
     uint32_t exception_table_size = 0;
+
+    // The resource directory, a three-level tree of type -> name -> language.
+    // A localised program keeps its strings in a resource-only DLL and cannot
+    // print anything at all until that DLL's resources can be found.
+    uint64_t resource_table = 0;     // as an address
+    uint32_t resource_table_size = 0;
 };
 
 // Reads just enough of the headers to know the CPU mode; throws LoadError if the
 // file is not a PE at all.
 void peek_pe(const std::vector<uint8_t>& file, Mode& mode, std::string& format, bool& is_dll);
+
+// The one address an image can be loaded at, or 0 if it can go anywhere.  Only
+// an image with no relocation directory - a resource-only DLL, say - is fixed,
+// and honouring that is what lets one load; every other DLL is deliberately
+// left to be relocated, because *where* a module lands changes which code paths
+// a guest takes and moving them all would be a needless change.
+uint64_t fixed_base_of(const std::vector<uint8_t>& file);
 
 // Maps an image.  load_base of 0 means "wherever it prefers"; anything else
 // relocates it there, which requires a relocation directory unless the addresses

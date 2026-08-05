@@ -229,6 +229,13 @@ void peek_pe(const std::vector<uint8_t>& f, Mode& mode, std::string& format, boo
     is_dll = (rd<uint16_t>(f, h.file_header + 18) & 0x2000) != 0;
 }
 
+uint64_t fixed_base_of(const std::vector<uint8_t>& f) {
+    Headers h = read_headers(f);
+    if (directory_rva(f, h, 5)) return 0;  // it has relocations: put it anywhere
+    return h.plus ? rd<uint64_t>(f, h.optional_header + 24)
+                  : rd<uint32_t>(f, h.optional_header + 28);
+}
+
 PeImage map_pe(const std::vector<uint8_t>& f, Memory& mem, uint64_t load_base) {
     Headers h = read_headers(f);
     PeImage img;
@@ -275,10 +282,22 @@ PeImage map_pe(const std::vector<uint8_t>& f, Memory& mem, uint64_t load_base) {
     if (delta != 0) {
         uint32_t reloc_rva = directory_rva(f, h, 5);
         uint32_t reloc_size = directory_size(f, h, 5);
-        if (!reloc_rva)
-            throw LoadError("image has no relocation directory but cannot load at its "
-                            "preferred base");
-        apply_relocations(mem, img.base, reloc_rva, reloc_size, delta, h.plus);
+        // An image with nothing to relocate can be mapped anywhere: a
+        // resource-only DLL - the localised message strings a toolchain prints -
+        // has no entry point and no imports, so no absolute address inside it is
+        // ever used.  Its resources are found by RVA from wherever it landed.
+        bool resource_only = entry_rva == 0 && directory_rva(f, h, 1) == 0;
+        if (!reloc_rva && !resource_only) {
+            char buf[176];
+            std::snprintf(buf, sizeof buf,
+                          "image has no relocation directory, so it can only load at its "
+                          "preferred base 0x%llX, but it was asked for 0x%llX",
+                          (unsigned long long)img.preferred, (unsigned long long)img.base);
+            throw LoadError(buf);
+        }
+        // With no relocation directory there is nothing to fix up: the mapping
+        // above was the whole job.
+        if (reloc_rva) apply_relocations(mem, img.base, reloc_rva, reloc_size, delta, h.plus);
         img.relocated = true;
     }
 
@@ -287,6 +306,11 @@ PeImage map_pe(const std::vector<uint8_t>& f, Memory& mem, uint64_t load_base) {
     if (uint32_t pdata_rva = directory_rva(f, h, 3)) {
         img.exception_table = img.base + pdata_rva;
         img.exception_table_size = directory_size(f, h, 3);
+    }
+    // Directory 2 is IMAGE_DIRECTORY_ENTRY_RESOURCE.
+    if (uint32_t rsrc_rva = directory_rva(f, h, 2)) {
+        img.resource_table = img.base + rsrc_rva;
+        img.resource_table_size = directory_size(f, h, 2);
     }
     read_imports(mem, f, h, img);
     read_exports(mem, f, h, img);

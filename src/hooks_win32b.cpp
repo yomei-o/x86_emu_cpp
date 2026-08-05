@@ -233,6 +233,10 @@ void Emulator::install_win32_extra_hooks() {
     // DuplicateHandle and SetHandleInformation are real implementations in
     // hooks_process.cpp; stubs here would shadow them.
     ret1("GetHandleInformation", 2);
+    // A DLL that has no per-thread work asks not to be told about threads.  With
+    // one guest thread per module initialisation there is nothing to disable,
+    // but the call must succeed - a DLL that gets a failure here may bail out.
+    ret1("DisableThreadLibraryCalls", 1);
     win32("GetVersion", 0, [](Emulator& e) {
         // Windows 10: major 10, minor 0, build 19045, in the packed legacy form.
         e.set_result(0x0000000A | (0u << 8) | (19045u << 16));

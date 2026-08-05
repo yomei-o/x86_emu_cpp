@@ -64,8 +64,21 @@ bool file_exists(const std::string& path) {
 }  // namespace
 
 std::string Emulator::find_library_file(const std::string& name) const {
+    // A guest may name a library by full path - a localised program builds
+    // "<its own directory>\<langid>\foo.dll" and loads that - in which case
+    // there is nothing to search for.
+    bool absolute = (name.size() > 1 && name[1] == ':') ||
+                    (!name.empty() && (name[0] == '/' || name[0] == '\\'));
+    if (absolute) return file_exists(name) ? name : std::string();
+
     std::vector<std::string> dirs;
     if (!args_.empty()) dirs.push_back(directory_of(args_[0]));
+    // A module's own directory, for the modules it depends on: a Python
+    // extension in DLLs\ finds the OpenSSL it links against beside itself, and
+    // that is what LOAD_WITH_ALTERED_SEARCH_PATH and AddDllDirectory arrange for
+    // on real Windows.
+    for (const auto& m : modules_)
+        if (!m->path.empty()) dirs.push_back(directory_of(m->path));
     dirs.push_back(".");
     for (const auto& d : opt_.library_paths) dirs.push_back(d);
 
@@ -136,8 +149,16 @@ uint64_t Emulator::load_library(const std::string& raw_name) {
     auto module = std::make_unique<Module>();
     module->name = name;
     module->path = path;
+    // Normally a DLL is relocated into the region set aside for them, but a
+    // resource-only DLL - the message strings a localised program prints - has
+    // no relocation directory at all, so it can only be mapped where it asks to
+    // be.  Where that address is taken, map_pe puts it elsewhere anyway: with no
+    // entry point and no imports, nothing inside it uses an absolute address.
+    uint64_t fixed = fixed_base_of(file);
+    uint64_t base = dll_next_base_;
+    if (fixed && !mem.is_mapped(fixed)) base = fixed;
     try {
-        module->image = map_pe(file, mem, dll_next_base_);
+        module->image = map_pe(file, mem, base);
     } catch (const LoadError& err) {
         loading_.pop_back();
         log_call("load_library(%s): %s", name.c_str(), err.what());

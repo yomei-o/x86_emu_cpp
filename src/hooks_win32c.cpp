@@ -6,7 +6,9 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "emulator.h"
@@ -27,6 +29,45 @@ int put_wide(Emulator& e, uint64_t dst, const std::string& s, uint64_t capacity_
 
 std::string wide_arg(Emulator& e, uint64_t ptr) {
     return ptr ? utf16_to_utf8(e, ptr, -1) : std::string();
+}
+
+#if defined(_WIN32)
+// Declared here rather than by including <windows.h>, which would drag the whole
+// Win32 namespace into a file that defines its own CONTEXT-shaped things.
+extern "C" __declspec(dllimport) unsigned short __stdcall GetUserDefaultUILanguage(void);
+#endif
+
+// The language a guest with localised resources should be told to look for.
+// Taking it from the host is what makes a real toolchain find its message DLL:
+// a Japanese Visual Studio ships only 1041, an English one only 1033, and a
+// guest that asks for the wrong one has nothing to print its errors with.
+uint32_t host_ui_language() {
+#if defined(_WIN32)
+    unsigned short id = GetUserDefaultUILanguage();
+    if (id) return id;
+#endif
+    return 0x0409;  // en-US
+}
+
+// LANGID -> the RFC-style name Windows uses for the same language.  Only the
+// languages a toolchain is actually shipped in are worth listing; anything else
+// falls back to English, which every localised program also carries.
+std::string language_name(uint32_t langid) {
+    switch (langid & 0x3FF) {
+        case 0x11: return "ja-JP";
+        case 0x04: return "zh-CN";
+        case 0x07: return "de-DE";
+        case 0x0A: return "es-ES";
+        case 0x0C: return "fr-FR";
+        case 0x10: return "it-IT";
+        case 0x12: return "ko-KR";
+        case 0x15: return "pl-PL";
+        case 0x16: return "pt-BR";
+        case 0x19: return "ru-RU";
+        case 0x1F: return "tr-TR";
+        case 0x0B: return "fi-FI";
+        default: return "en-US";
+    }
 }
 
 }  // namespace
@@ -120,11 +161,96 @@ void Emulator::install_cl_hooks() {
     win32("CreateToolhelp32Snapshot", 2, [](Emulator& e) { e.set_result(~0ull); });
     ret0("Process32FirstW", 2);
     ret0("Process32NextW", 2);
-    ret0("FindResourceW", 3);
-    ret0("FindResourceExW", 4);
-    ret0("LoadResource", 2);
-    ret0("LockResource", 1);
-    ret0("SizeofResource", 2);
+    // ---- resources -----------------------------------------------------------------
+    // The resource directory is a three-level tree: type, then name, then
+    // language.  A localised program keeps every string it prints in a
+    // resource-only DLL, so without this it cannot even report why it failed.
+    // An HRSRC here is the address of the IMAGE_RESOURCE_DATA_ENTRY, which is
+    // what real Windows hands out too.
+    auto find_resource = [](Emulator& e, uint64_t module, uint64_t name, uint64_t type,
+                            uint64_t language) -> uint64_t {
+        Module* m = e.module_for(module ? module : e.image().image_base);
+        if (!m || !m->image.resource_table) return 0;
+        uint64_t root = m->image.resource_table;
+
+        // One level of the tree: match by integer id or by name.
+        auto find_entry = [&e](uint64_t dir, uint64_t key, uint64_t base) -> uint64_t {
+            uint32_t named = e.mem.read16(dir + 12);
+            uint32_t ids = e.mem.read16(dir + 14);
+            bool by_name = key >= 0x10000;
+            std::string wanted;
+            if (by_name) {
+                wanted = utf16_to_utf8(e, key, -1);
+                for (char& c : wanted)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
+            for (uint32_t i = 0; i < named + ids; ++i) {
+                uint64_t entry = dir + 16 + static_cast<uint64_t>(i) * 8;
+                uint32_t id = e.mem.read32(entry);
+                uint32_t offset = e.mem.read32(entry + 4);
+                bool entry_named = (id & 0x80000000u) != 0;
+                if (by_name != entry_named) continue;
+                if (entry_named) {
+                    uint64_t str = base + (id & 0x7FFFFFFFu);
+                    uint32_t len = e.mem.read16(str);
+                    std::string got;
+                    for (uint32_t k = 0; k < len; ++k) {
+                        uint16_t c = e.mem.read16(str + 2 + k * 2);
+                        got += static_cast<char>(c < 128 ? std::toupper(static_cast<int>(c))
+                                                         : '?');
+                    }
+                    if (got != wanted) continue;
+                } else if (id != static_cast<uint32_t>(key)) {
+                    continue;
+                }
+                // Every offset in the tree is measured from its base; the high
+                // bit only says whether this points at a subdirectory or at a
+                // leaf, and the caller already knows which level it is on.
+                return base + (offset & 0x7FFFFFFFu);
+            }
+            return 0;
+        };
+
+        uint64_t by_type = find_entry(root, type, root);
+        if (!by_type) return 0;
+        uint64_t by_name = find_entry(by_type, name, root);
+        if (!by_name) return 0;
+        // The language level: take the requested one, else the first entry,
+        // because a resource DLL usually holds exactly one language.
+        uint64_t leaf = language ? find_entry(by_name, language, root) : 0;
+        if (!leaf) {
+            uint32_t count = e.mem.read16(by_name + 12) + e.mem.read16(by_name + 14);
+            if (!count) return 0;
+            leaf = root + (e.mem.read32(by_name + 16 + 4) & 0x7FFFFFFFu);
+        }
+        return leaf;
+    };
+    win32("FindResourceW", 3, [find_resource](Emulator& e) {
+        e.set_result(find_resource(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2), 0));
+    });
+    win32("FindResourceA", 3, [find_resource](Emulator& e) {
+        e.set_result(find_resource(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2), 0));
+    });
+    win32("FindResourceExW", 4, [find_resource](Emulator& e) {
+        e.set_result(
+            find_resource(e, e.arg_slot(0), e.arg_slot(2), e.arg_slot(1), e.arg_slot(3)));
+    });
+    win32("LoadResource", 2, [](Emulator& e) {
+        uint64_t data_entry = e.arg_slot(1);
+        Module* m = e.module_for(e.arg_slot(0) ? e.arg_slot(0) : e.image().image_base);
+        if (!data_entry || !m) {
+            e.set_result(0);
+            return;
+        }
+        // OffsetToData is an RVA, unlike every other offset in the tree.
+        e.set_result(m->image.base + e.mem.read32(data_entry));
+    });
+    win32("LockResource", 1, [](Emulator& e) { e.set_result(e.arg_slot(0)); });
+    win32("FreeResource", 1, [](Emulator& e) { e.set_result(1); });
+    win32("SizeofResource", 2, [](Emulator& e) {
+        uint64_t data_entry = e.arg_slot(1);
+        e.set_result(data_entry ? e.mem.read32(data_entry + 4) : 0);
+    });
     ret0("FlushProcessWriteBuffers", 0);
     ret0("FreeLibraryWhenCallbackReturns", 2);
     win32("GetDiskFreeSpaceExW", 4, [](Emulator& e) {
@@ -133,19 +259,89 @@ void Emulator::install_cl_hooks() {
         e.set_result(1);
     });
     ret0("GetLocaleInfoEx", 4);
+    // Same answer as GetSystemInfo: there is no WOW64 layer to differ about.
     win32("GetNativeSystemInfo", 1, [](Emulator& e) {
-        uint64_t p = e.arg_slot(0);
-        if (p) {
-            std::vector<uint8_t> zeros(e.is64() ? 48 : 36, 0);
-            e.mem.write(p, zeros.data(), zeros.size());
-            e.mem.write16(p, 9);  // PROCESSOR_ARCHITECTURE_AMD64
-            e.mem.write32(p + 4, 0x1000);
-            e.mem.write32(p + (e.is64() ? 32 : 20), 1);
+        if (uint64_t hook = e.existing_hook("GetSystemInfo")) {
+            // Reuse the real implementation rather than keeping a second copy of
+            // a structure whose zero fields a guest divides by.
+            e.cpu().rip = hook;
+            e.retry_current_call();
+            return;
         }
         e.set_result(0);
     });
-    ret0("GetThreadPreferredUILanguages", 4);
-    ret1("SetThreadPreferredUILanguages", 3);
+    // The preferred UI languages, which a program with localised resources uses
+    // to decide which resource DLL to load.  A guest typically *sets* a
+    // candidate and reads it back to see whether the system accepted it, so the
+    // faithful implementation is to remember what it set: it then goes looking
+    // for that language's resources and copes with their absence itself.
+    {
+        // {flags, the double-NUL-terminated list as the guest wrote it}, seeded
+        // with the host's own UI language in both spellings a guest may ask for.
+        uint32_t langid = host_ui_language();
+        char id_text[8];
+        std::snprintf(id_text, sizeof id_text, "%04X", langid);
+        std::u16string default_id = utf8_to_utf16(id_text);
+        default_id.push_back(0);
+        std::u16string default_name = utf8_to_utf16(language_name(langid));
+        default_name.push_back(0);
+        auto stored = std::make_shared<std::pair<uint32_t, std::u16string>>(0u, default_name);
+        // (flags, languages, *count)
+        win32("SetThreadPreferredUILanguages", 3, [stored](Emulator& e) {
+            uint32_t flags = static_cast<uint32_t>(e.arg_slot(0));
+            uint64_t p = e.arg_slot(1);
+            std::u16string list;
+            if (p) {
+                // Two NULs in a row end the list.
+                for (uint64_t i = 0; i < 4096; ++i) {
+                    uint16_t c = e.mem.read16(p + i * 2);
+                    if (!c && (i == 0 || list.back() == 0)) break;
+                    list.push_back(static_cast<char16_t>(c));
+                }
+            }
+            if (!list.empty()) *stored = {flags, list};
+            if (e.arg_slot(2)) {
+                uint32_t n = 0;
+                for (size_t i = 0; i < list.size(); ++i)
+                    if (list[i] == 0 && i && list[i - 1] != 0) ++n;
+                e.mem.write32(e.arg_slot(2), n);
+            }
+            e.set_result(1);
+        });
+        // (flags, *count, buffer, *size in characters)
+        win32("GetThreadPreferredUILanguages", 4,
+              [stored, default_id, default_name](Emulator& e) {
+            uint32_t flags = static_cast<uint32_t>(e.arg_slot(0));
+            constexpr uint32_t kLanguageId = 0x4, kLanguageName = 0x8;
+            std::u16string list = stored->second;
+            // If the guest wants a different spelling than the one it set, fall
+            // back to a default in that spelling rather than handing back
+            // something it cannot parse.
+            bool stored_is_id = (stored->first & kLanguageId) != 0;
+            bool want_id = (flags & kLanguageId) != 0;
+            if ((flags & (kLanguageId | kLanguageName)) && want_id != stored_is_id)
+                list = want_id ? default_id : default_name;
+            list.push_back(0);  // the list's own terminator
+
+            uint64_t count_out = e.arg_slot(1), buf = e.arg_slot(2), size_out = e.arg_slot(3);
+            uint32_t languages = 0;
+            for (size_t i = 0; i + 1 < list.size(); ++i)
+                if (list[i] == 0 && i && list[i - 1] != 0) ++languages;
+            if (count_out) e.mem.write32(count_out, languages);
+            uint64_t have = size_out ? e.mem.read32(size_out) : 0;
+            if (size_out) e.mem.write32(size_out, static_cast<uint32_t>(list.size()));
+            if (!buf || have < list.size()) {
+                // Reporting the size needed is success for the query form and
+                // ERROR_INSUFFICIENT_BUFFER otherwise; both leave the buffer be.
+                e.set_result(buf ? 0 : 1);
+                if (buf) e.set_last_error(122);
+                return;
+            }
+            for (size_t i = 0; i < list.size(); ++i)
+                e.mem.write16(buf + i * 2, list[i]);
+            e.set_result(1);
+        });
+    }
     win32("RtlCaptureStackBackTrace", 4, [](Emulator& e) { e.set_result(0); });
     win32("SearchPathW", 6, [](Emulator& e) {
         // (path, file, extension, buflen, buf, filepart)

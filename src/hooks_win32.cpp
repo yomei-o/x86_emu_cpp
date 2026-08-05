@@ -78,6 +78,27 @@ std::string program_path(const Emulator& e) {
     return path;
 }
 
+// SYSTEM_INFO, whose fields a guest does arithmetic with - cl.exe divides by
+// dwAllocationGranularity, so leaving a field zero is not a harmless omission.
+void write_system_info(Emulator& e, uint64_t p) {
+    if (!p) return;
+    bool w64 = e.is64();
+    std::vector<uint8_t> zeros(w64 ? 48 : 36, 0);
+    e.mem.write(p, zeros.data(), zeros.size());
+    e.mem.write16(p + 0, w64 ? 9 : 0);       // PROCESSOR_ARCHITECTURE_AMD64 / INTEL
+    e.mem.write32(p + 4, 0x1000);            // dwPageSize
+    int ps = e.pointer_size();
+    e.mem.write_sized(p + 8, ps, 0x10000);   // lpMinimumApplicationAddress
+    e.mem.write_sized(p + 8 + ps, ps, w64 ? 0x00007FFFFFFEFFFFull : 0x7FFEFFFFull);
+    e.mem.write_sized(p + 8 + 2 * ps, ps, 1);  // dwActiveProcessorMask
+    uint64_t after_mask = p + 8 + 3 * ps;
+    e.mem.write32(after_mask, 1);            // dwNumberOfProcessors
+    e.mem.write32(after_mask + 4, w64 ? 8664 : 586);  // dwProcessorType
+    e.mem.write32(after_mask + 8, 0x10000);  // dwAllocationGranularity
+    e.mem.write16(after_mask + 12, 6);       // wProcessorLevel
+    e.mem.write16(after_mask + 14, 0x3A09);  // wProcessorRevision
+}
+
 std::string command_line(const Emulator& e) {
     // A child process gets the parent's exact CreateProcess string; quoting
     // reconstructed from argv can never be more faithful than the original.
@@ -207,6 +228,10 @@ void Emulator::install_win32_hooks() {
         uint64_t buf = e.arg_slot(1);
         uint64_t size = e.arg_slot(2);
         const std::string* value = e.getenv(name);
+        // Which variables a guest reads is most of what it needs from its
+        // environment, and a missing one is a common reason to fail obscurely.
+        e.log_call("GetEnvironmentVariable(%s) = %s", name.c_str(),
+                   value ? value->c_str() : "(not set)");
         if (!value) {
             e.set_last_error(203);  // ERROR_ENVVAR_NOT_FOUND
             e.set_result(0);
@@ -265,12 +290,7 @@ void Emulator::install_win32_hooks() {
         e.set_result(0);
     });
     win32("GetSystemInfo", 1, [](Emulator& e) {
-        uint64_t p = e.arg_slot(0);
-        zero_fill(e, p, e.is64() ? 48 : 36);
-        if (p) {
-            e.mem.write32(p + 4, 0x1000);  // dwPageSize
-            e.mem.write32(p + (e.is64() ? 32 : 20), 1);  // dwNumberOfProcessors
-        }
+        write_system_info(e, e.arg_slot(0));
         e.set_result(0);
     });
 
