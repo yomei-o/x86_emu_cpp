@@ -65,6 +65,11 @@ public:
     // Terminates a process from outside (TerminateProcess, kill).
     void terminate(int pid, int exit_code);
 
+    // Runs the machine until `pid` finishes, never scheduling `except_pid` -
+    // for a hook (_wspawnv with _P_WAIT) that must wait for a child while its
+    // own process is paused inside the hook.  Returns the child's exit code.
+    int run_until_exit(int pid, int except_pid);
+
 private:
     void make_zombie(Process& p, int exit_code);
     void do_exec(Process& p, Emulator::ExecRequest req);

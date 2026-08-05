@@ -443,6 +443,7 @@ public:
     void install_win32_fs_hooks();
     void install_ucrt_hooks();
     void install_process_hooks();
+    void install_cl_hooks();
     void install_syscall_handlers();
 
 private:

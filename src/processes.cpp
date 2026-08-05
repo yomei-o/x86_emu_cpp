@@ -144,6 +144,60 @@ void System::do_exec(Process& p, Emulator::ExecRequest req) {
     p.exec_done = true;
 }
 
+int System::run_until_exit(int pid, int except_pid) {
+    while (true) {
+        Process* target = find(pid);
+        if (!target) return -1;
+        if (target->zombie) return target->exit_code;
+
+        bool progress = false;
+        for (size_t i = 0; i < procs_.size(); ++i) {
+            Process& p = *procs_[i];
+            if (p.zombie || !p.emu || p.pid == except_pid) continue;
+            if (p.emu->has_exec_request()) {
+                do_exec(p, std::move(*p.emu->take_exec_request()));
+                progress = true;
+                continue;
+            }
+            Emulator::SliceStatus st;
+            try {
+                st = p.emu->run_slice(kQuantum);
+            } catch (...) {
+                if (p.pid == root_pid_) throw;
+                try {
+                    throw;
+                } catch (const std::exception& err) {
+                    std::fflush(stdout);
+                    std::fprintf(stderr, "x86emu: child pid %d (%s) crashed: %s\n", p.pid,
+                                 p.emu->args().empty() ? "?" : p.emu->args()[0].c_str(),
+                                 err.what());
+                }
+                make_zombie(p, 127);
+                progress = true;
+                continue;
+            }
+            if (st == Emulator::SliceStatus::Exited) {
+                make_zombie(p, p.emu->cpu().exit_code);
+                progress = true;
+            } else if (st == Emulator::SliceStatus::Ran) {
+                progress = true;
+            }
+        }
+        if (!progress) {
+            bool advanced = false;
+            for (auto& p : procs_) {
+                if (p->zombie || !p->emu || p->pid == except_pid) continue;
+                uint64_t wake = p->emu->next_timer_wake();
+                if (wake) {
+                    p->emu->advance_time_to(wake);
+                    advanced = true;
+                }
+            }
+            if (!advanced) return -1;  // the child cannot finish; report failure
+        }
+    }
+}
+
 int System::run() {
     while (true) {
         bool progress = false;

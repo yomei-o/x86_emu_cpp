@@ -1086,6 +1086,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         install_win32_fs_hooks();
         install_ucrt_hooks();
         install_process_hooks();
+        install_cl_hooks();
     }
 
     if (os_kind == Os::Windows) {
