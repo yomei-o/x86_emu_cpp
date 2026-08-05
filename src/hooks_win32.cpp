@@ -201,6 +201,11 @@ void Emulator::install_win32_hooks() {
             // a guest probing for an optional API expects NULL.
             addr = e.existing_hook(symbol);
         }
+        // A guest that resolves a symbol *at run time* and finds nothing usually
+        // says so in a way that names neither the symbol nor the reason - a
+        // delay-load failure surfaces as an exception code, for instance - so the
+        // name is worth recording here.
+        if (!addr) e.log_call("GetProcAddress(%s) found nothing", symbol.c_str());
         e.set_result(addr);
     });
     ret1("FreeLibrary", 1);
@@ -399,7 +404,16 @@ void Emulator::install_win32_hooks() {
         e.heap_free(e.arg_slot(0));
         e.set_result(0);
     });
-    win32("VirtualAlloc", 4, [](Emulator& e) { e.set_result(e.alloc_pages(e.arg_slot(1))); });
+    // (address, size, type, protect).  The address it returns must be aligned to
+    // the *allocation granularity*, 64 KiB, not to a page: a guest that keeps
+    // metadata by masking an allocation's low bits - a compiler's arena
+    // allocator does - computes a wild pointer otherwise.
+    win32("VirtualAlloc", 4, [](Emulator& e) {
+        e.set_result(e.alloc_pages(e.arg_slot(1), 0x10000));
+    });
+    win32("VirtualAllocEx", 5, [](Emulator& e) {
+        e.set_result(e.alloc_pages(e.arg_slot(2), 0x10000));
+    });
     ret1("VirtualFree", 3);
     ret1("VirtualProtect", 4);
     win32("VirtualQuery", 3, [](Emulator& e) {

@@ -342,7 +342,8 @@ public:
     // free_pages(), which matters more than it sounds: a compiler's garbage
     // collector cycles through mmap/munmap thousands of times, and never
     // reusing an address exhausts the mmap window mid-compilation.
-    uint64_t alloc_pages(uint64_t size);
+    // `alignment` must be a power of two; VirtualAlloc needs 64 KiB.
+    uint64_t alloc_pages(uint64_t size, uint64_t alignment = 0x1000);
     // Returns an mmap()ed range, dropping its pages.
     void free_pages(uint64_t addr, uint64_t size);
     // The Linux program break; set_brk returns the value after the request.

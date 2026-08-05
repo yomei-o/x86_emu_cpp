@@ -88,7 +88,17 @@ void Emulator::install_cl_hooks() {
     };
 
     // ---- advapi32: crypto and event tracing ---------------------------------------
-    ret1("CryptAcquireContextW", 5);
+    // (phProv, container, provider, type, flags).  Returning success is not
+    // enough: the *handle* is the answer, and a caller that checks it - cl.exe
+    // does, and reports an unknown error when it is zero - sees nothing.  An
+    // out parameter left unwritten is the quietest way for a hook to lie.
+    auto acquire_context = [](Emulator& e) {
+        constexpr uint64_t kProviderHandle = 0xC0DE0001;
+        if (e.arg_slot(0)) e.mem.write_sized(e.arg_slot(0), e.pointer_size(), kProviderHandle);
+        e.set_result(1);
+    };
+    win32("CryptAcquireContextW", 5, acquire_context);
+    win32("CryptAcquireContextA", 5, acquire_context);
     ret1("CryptReleaseContext", 2);
     win32("CryptGenRandom", 3, [](Emulator& e) {
         uint64_t len = e.arg_slot(1), buf = e.arg_slot(2);
@@ -238,7 +248,8 @@ void Emulator::install_cl_hooks() {
             // the instruction history at the moment it looks up a particular
             // string shows which code decided to print it.
             if (e.arg_slot(1) == static_cast<uint64_t>(std::atoi(want))) {
-                std::fprintf(stderr, "[dbg] history at resource %s lookup:\n", want);
+                std::fprintf(stderr, "[dbg] resource %s looked up from:\n%s", want,
+                             e.stack_trace(24).c_str());
                 for (uint64_t a : e.cpu().history())
                     std::fprintf(stderr, "    %012llX\n", (unsigned long long)a);
             }
@@ -270,6 +281,38 @@ void Emulator::install_cl_hooks() {
     });
     ret0("FlushProcessWriteBuffers", 0);
     ret0("FreeLibraryWhenCallbackReturns", 2);
+
+    // version.dll, which a toolchain *delay-loads* to read a file's version
+    // resource.  Reporting "no version information" is a normal answer that
+    // callers handle; not being there at all is not - the delay-load helper
+    // raises 0xC06D007F for a missing procedure, and cl.exe turns that into an
+    // internal compiler error naming nothing.
+    win32("GetFileVersionInfoSizeW", 2, [](Emulator& e) {
+        if (e.arg_slot(1)) e.mem.write32(e.arg_slot(1), 0);
+        e.set_last_error(1813);  // ERROR_RESOURCE_TYPE_NOT_FOUND
+        e.set_result(0);
+    });
+    win32("GetFileVersionInfoSizeA", 2, [](Emulator& e) {
+        if (e.arg_slot(1)) e.mem.write32(e.arg_slot(1), 0);
+        e.set_last_error(1813);
+        e.set_result(0);
+    });
+    ret0("GetFileVersionInfoW", 4);
+    ret0("GetFileVersionInfoA", 4);
+    ret0("VerQueryValueW", 4);
+    ret0("VerQueryValueA", 4);
+    // Two more a modern toolchain probes for and can live without; naming them
+    // here means GetProcAddress answers NULL rather than a delay-load failing.
+    ret0("GetCurrentPackageId", 2);
+    win32("GetTempPath2W", 2, [](Emulator& e) {
+        // Windows 10+ spelling of GetTempPathW; the older one is implemented.
+        if (uint64_t hook = e.existing_hook("GetTempPathW")) {
+            e.cpu().rip = hook;
+            e.retry_current_call();
+            return;
+        }
+        e.set_result(0);
+    });
     win32("GetDiskFreeSpaceExW", 4, [](Emulator& e) {
         for (int i = 1; i <= 3; ++i)
             if (e.arg_slot(i)) e.mem.write64(e.arg_slot(i), 64ull << 30);  // plenty

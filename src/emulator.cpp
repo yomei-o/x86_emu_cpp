@@ -701,8 +701,20 @@ uint64_t Emulator::heap_alloc(uint64_t size) {
     return addr;
 }
 
-uint64_t Emulator::alloc_pages(uint64_t size) {
+uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment) {
     uint64_t need = (size + 0xFFF) & ~0xFFFull;
+    if (alignment > 0x1000) {
+        // Round the frontier up instead of searching the free list: an
+        // over-aligned request is rare (VirtualAlloc) and mixing the two
+        // policies would fragment the window for no gain.
+        mmap_next_ = (mmap_next_ + alignment - 1) & ~(alignment - 1);
+        if (mmap_next_ + need > mmap_limit_) return 0;
+        uint64_t addr = mmap_next_;
+        mmap_next_ += need;
+        mem.map(addr, need);
+        mmap_live_[addr] = need;
+        return addr;
+    }
 
     // Best fit among the ranges munmap() returned, so that a long run of
     // equal-sized allocate/free cycles reuses one range forever.
