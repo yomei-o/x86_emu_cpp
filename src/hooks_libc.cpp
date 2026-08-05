@@ -79,10 +79,21 @@ void Emulator::install_libc_hooks() {
         const uint8_t c_locale[4] = {'C', 0, 0, 0};
         e.set_result(e.alloc_guest_data(c_locale, sizeof c_locale));
     });
-    libc("_create_locale", [](Emulator& e) { e.set_result(0); });
-    libc("_wcreate_locale", [](Emulator& e) { e.set_result(0); });
+    // These hand out a `_locale_t`, and there is nothing honest to hand out: it
+    // points at the UCRT's own `__crt_locale_data`, whose layout a C++ runtime
+    // reads *directly* rather than through functions, so inventing one would mean
+    // committing to an undocumented structure.  NULL is the closest available
+    // answer - "no locale could be made" - and a guest that does not check it
+    // will fault on the NULL later, which the log line is there to explain.
+    auto no_locale = [](Emulator& e) {
+        e.log_call("a _locale_t was asked for; NULL is the only honest answer, and a "
+                   "guest that stores it without checking will fault on it later");
+        e.set_result(0);
+    };
+    libc("_create_locale", no_locale);
+    libc("_wcreate_locale", no_locale);
+    libc("_get_current_locale", no_locale);
     libc("_free_locale", [](Emulator& e) { e.set_result(0); });
-    libc("_get_current_locale", [](Emulator& e) { e.set_result(0); });
     libc("localeconv", [this](Emulator& e) {
         // struct lconv, with the C locale's values: "." for the decimal point and
         // empty strings everywhere else.

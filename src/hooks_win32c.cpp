@@ -3,6 +3,7 @@
 // guests already exercised.  Almost all of it is the UCRT's wide-character
 // dialect plus a few kernel32 corners (thread pools, file mappings).
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -226,7 +227,23 @@ void Emulator::install_cl_hooks() {
         return leaf;
     };
     win32("FindResourceW", 3, [find_resource](Emulator& e) {
-        e.set_result(find_resource(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2), 0));
+        uint64_t found = find_resource(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2), 0);
+        // Which resource a guest looked for, and whether it was there, is the
+        // whole story when a localised program prints the wrong message.
+        e.log_call("FindResource(module 0x%llX, type %llu, name %llu) = 0x%llX",
+                   (unsigned long long)e.arg_slot(0), (unsigned long long)e.arg_slot(2),
+                   (unsigned long long)e.arg_slot(1), (unsigned long long)found);
+        if (const char* want = std::getenv("X86EMU_TRACE_RESOURCE")) {
+            // Debugging aid for a guest that prints the wrong message: dumping
+            // the instruction history at the moment it looks up a particular
+            // string shows which code decided to print it.
+            if (e.arg_slot(1) == static_cast<uint64_t>(std::atoi(want))) {
+                std::fprintf(stderr, "[dbg] history at resource %s lookup:\n", want);
+                for (uint64_t a : e.cpu().history())
+                    std::fprintf(stderr, "    %012llX\n", (unsigned long long)a);
+            }
+        }
+        e.set_result(found);
     });
     win32("FindResourceA", 3, [find_resource](Emulator& e) {
         e.set_result(find_resource(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2), 0));
