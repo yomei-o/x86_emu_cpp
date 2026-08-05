@@ -1,8 +1,30 @@
 #include "memory.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace x86emu {
+
+uint64_t g_watch_addr = 0;
+bool g_watch_on = false;
+uint64_t g_watch_rip = 0;
+
+// Reads X86EMU_WATCH once, before main() runs.
+static const bool g_watch_initialized = [] {
+    if (const char* w = std::getenv("X86EMU_WATCH")) {
+        g_watch_addr = std::strtoull(w, nullptr, 16);
+        g_watch_on = g_watch_addr != 0;
+    }
+    return true;
+}();
+
+void watch_report(uint64_t addr, uint64_t len, const void* bytes) {
+    uint64_t v = 0;
+    std::memcpy(&v, bytes, len > 8 ? 8 : len);
+    std::fprintf(stderr, "[watch] write %llu bytes at %llX (value %llX) rip=%llX\n",
+                 (unsigned long long)len, (unsigned long long)addr,
+                 (unsigned long long)v, (unsigned long long)g_watch_rip);
+}
 
 void Memory::map(uint64_t addr, uint64_t size, const std::string& name) {
     if (size == 0) return;
@@ -49,6 +71,8 @@ void Memory::read(uint64_t addr, void* dst, uint64_t len) const {
 
 void Memory::write(uint64_t addr, const void* src, uint64_t len) {
     const auto* in = static_cast<const uint8_t*>(src);
+    if (g_watch_on && addr <= g_watch_addr && g_watch_addr < addr + len)
+        watch_report(addr, len, in + (g_watch_addr - addr));
     while (len > 0) {
         uint64_t off = addr & kPageMask;
         uint64_t n = kPageSize - off;

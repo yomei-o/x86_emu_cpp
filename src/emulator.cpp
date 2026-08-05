@@ -69,6 +69,22 @@ void Emulator::choose_layout() {
     // pages are only created when touched.
     mmap_next_ = heap_limit_;
     mmap_limit_ = mmap_next_ + (is64() ? (16ull << 30) : (1ull << 28));
+
+    // X86EMU_QEMU_LAYOUT makes a 64-bit Linux guest see qemu-x86_64's address
+    // layout: the stack below 0x4000800000, mmap climbing from 0x40008A6000,
+    // and no address reuse (qemu's mmap_find_vma is a monotonic cursor).  With
+    // brk already identical - it follows the image in both - every pointer the
+    // guest ever compares or hashes comes out numerically equal to the qemu
+    // run's, which is what lets tools/qemu-diff push past address-dependent
+    // branches.  Diagnostics only; nothing sets it in normal use.
+    if (os() == Os::Linux && is64() && std::getenv("X86EMU_QEMU_LAYOUT")) {
+        stack_size_ = 8ull << 20;
+        stack_base_ = 0x4000000000ull;
+        mmap_next_ = 0x40008A6000ull;
+        mmap_limit_ = mmap_next_ + (64ull << 30);
+        mmap_no_reuse_ = true;
+        stack_top_ = stack_base_ + stack_size_;
+    }
     stack_top_ = stack_base_ + stack_size_;
     heap_next_ = heap_base_;
     misc_next_ = misc_base_;
@@ -766,9 +782,11 @@ uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment) {
     }
 
     // Best fit among the ranges munmap() returned, so that a long run of
-    // equal-sized allocate/free cycles reuses one range forever.
+    // equal-sized allocate/free cycles reuses one range forever.  (Under
+    // X86EMU_QEMU_LAYOUT the free list is never consulted - qemu's cursor is
+    // monotonic and matching its addresses is the whole point.)
     size_t best = mmap_free_.size();
-    for (size_t i = 0; i < mmap_free_.size(); ++i) {
+    for (size_t i = 0; !mmap_no_reuse_ && i < mmap_free_.size(); ++i) {
         if (mmap_free_[i].second < need) continue;
         if (best == mmap_free_.size() || mmap_free_[i].second < mmap_free_[best].second) best = i;
     }
@@ -1217,6 +1235,20 @@ void Emulator::setup_linux_stack(const std::vector<std::string>& args) {
 
     std::vector<uint64_t> argv_ptrs;
     for (const auto& a : args) argv_ptrs.push_back(push_bytes(a));
+
+    // The environment.  A guest whose parent set one (execve) gets exactly
+    // that; a root process gets a standard PATH rather than the host's
+    // Windows variables - gcc's collect2 finds `ld` through PATH, and a
+    // Linux guest reading LANG=Japanese_Japan.932 would be worse off than
+    // reading nothing.
+    std::vector<std::pair<std::string, std::string>> guest_env;
+    if (env_explicit_)
+        guest_env = env_;
+    else
+        guest_env.emplace_back("PATH",
+                               "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    std::vector<uint64_t> env_ptrs;
+    for (const auto& [k, v] : guest_env) env_ptrs.push_back(push_bytes(k + "=" + v));
     // 16 random bytes for AT_RANDOM, which libc uses to seed stack guards.
     uint8_t random[16] = {0x5A, 0x17, 0x3C, 0x91, 0x2B, 0x44, 0xE0, 0x77,
                           0x1F, 0x63, 0xB8, 0x0A, 0xD5, 0x29, 0x8E, 0x46};
@@ -1243,8 +1275,8 @@ void Emulator::setup_linux_stack(const std::vector<std::string>& args) {
         auxv.push_back({7, image_.interp_base});   // AT_BASE
     auxv.push_back({0, 0});                         // AT_NULL
 
-    // Total slots: argc + argv + NULL + envp NULL + auxv pairs.
-    uint64_t slots = 1 + argv_ptrs.size() + 1 + 1 + auxv.size() * 2;
+    // Total slots: argc + argv + NULL + envp + NULL + auxv pairs.
+    uint64_t slots = 1 + argv_ptrs.size() + 1 + env_ptrs.size() + 1 + auxv.size() * 2;
     sp -= slots * ps;
     sp &= ~0xFull;  // the ABI requires a 16-byte aligned stack at entry
 
@@ -1256,7 +1288,8 @@ void Emulator::setup_linux_stack(const std::vector<std::string>& args) {
     put(argv_ptrs.size());
     for (uint64_t a : argv_ptrs) put(a);
     put(0);  // end of argv
-    put(0);  // empty environment
+    for (uint64_t a : env_ptrs) put(a);
+    put(0);  // end of environment
     for (const auto& a : auxv) {
         put(a.key);
         put(a.val);

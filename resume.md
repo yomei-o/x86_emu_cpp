@@ -20,7 +20,9 @@ byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
 - **a stock CPython 3.13 for Windows runs its own standard library**
 - **mingw-w64 `gcc` compiles and links inside the emulator**, producing a binary
   byte-identical to the one it produces natively
-- **Alpine's `as` and `ld` (dynamically linked, musl) build a working binary**
+- **Alpine's whole gcc (dynamically linked, musl) compiles and links**: the
+  driver spawns cc1/as/collect2/ld as emulated processes, cc1's output is
+  byte-identical to qemu's, and the linked binary runs under the emulator
 - **MSVC `cl.exe` compiles and `link.exe` links, inside the emulator**, C and
   C++ both, and the object files are byte-identical to a native build apart from
   the timestamp (`sh tests/toolchain/run_msvc.sh`)
@@ -312,50 +314,99 @@ The default instruction cap moved from 500M to 100G: an iostream compile runs
 beyond two billion instructions, so the old "possible infinite loop" net was
 killing legitimate work.
 
-## Next: the one thing actually blocked
+## Done 2026-08-05 (night): the Alpine cc1 crash — one SSE instruction
 
-### A distribution `cc1` faults in the first RTL pass
+**Alpine's whole toolchain now works end to end**: `gcc /h.c -o /h` inside the
+emulator spawns cc1, as, collect2 and ld, and the binary it links runs under
+the same emulator (`fib=6765`). cc1's assembly output is byte-identical to
+qemu-x86_64 running the same cc1, at -O0 and -O2.
 
-Given a sysroot of unpacked Alpine packages, that distribution's `as` and `ld`
-run perfectly; its `cc1` does not. It gets *far*: `-version`, preprocessing (`-E`), an
-empty translation unit, and `-fsyntax-only` all work, and with `-fdump-tree-all
--fdump-rtl-all` the dumps show it completes gimplification, every tree pass and
-`255r.expand` — then faults reading `[rsi+0x28]` with `rsi == 0` at `0x7E18D1`,
-i.e. a null pointer inside the first RTL pass after expand.
+**The bug was `MOVHLPS`.** `0F 12` with a register operand moves the *high*
+half of the source xmm to the low half of the destination; `xmm_read_q()`
+returns the low half, so ours moved the wrong one. GCC's
+`init_loops_structure` loads `{entry_block, exit_block}` with one `movdqu`,
+extracts entry with `movq %xmm0,%rdx` and exit with `movhlps %xmm0,%xmm1` —
+so with the low half in both, the loop root was stored through the wrong
+pointers and `entry->loop_father` stayed NULL, which nothing read until
+`construct_init_block`, five million instructions and forty passes later.
+Classic silent data-only corruption: control flow stayed *identical to
+qemu's* the whole way, which is also what made it findable.
 
-**The harness for finding it is the useful part, and it works.** WSL here has
-`qemu-x86_64`, which runs the same `cc1` correctly, so there is a reference:
+### How it was found, because the method is the asset
+
+The sequence-diff harness (tools/qemu-diff) works, but pushing it to a
+data-only bug took four upgrades, all now in-tree:
+
+1. **The census needs no special build.** `X86EMU_CENSUS_FILTER=` (file of
+   hex block addresses, i.e. `sort -u qemu.seq`) and `X86EMU_CENSUS_OUT=`
+   (binary stream) enable it at run time; consecutive duplicates are
+   collapsed to match a deduping seq.awk on qemu's side.
+2. **Align the environment first, or chase ghosts.** Three found here:
+   - qemu's `-L` falls back to the *host* filesystem for paths missing under
+     the sysroot, so the reference saw WSL's `/usr/local/include` while we
+     answered ENOENT (and cc1 then dropped the directory as a duplicate,
+     shifting everything after). `mkdir` in the sysroot aligned it. Any
+     "reference" path qemu resolves on the host is a lie.
+   - `getrlimit(RLIMIT_STACK)`: we answer 8MB/8MB (not raisable); the WSL
+     reference had max=infinity, so gcc setrlimit'd to 64MB and branched
+     differently. `ulimit -S -s 8192; ulimit -H -s 8192` before qemu aligned
+     it — and qemu still compiled fine, which proved our answer benign.
+   - The guest environment: run qemu under `env -i` (and see below — Linux
+     guests now get a PATH, so match that when regenerating).
+3. **Know the comparison's artifacts.** qemu re-enters the block of a `rep
+   stosq` once per iteration, so its stream holds N consecutive entries
+   where we execute the instruction once — the old "divergence at 0x1ABA81B"
+   was exactly this, not a bug. And the census logs *every* execution of a
+   filtered address while qemu logs only TB entries, so per-address counts
+   compare only for addresses that are always jump targets; mid-block
+   addresses produce phantom count differences.
+4. **The decisive move: make the guest's address space equal to qemu's.**
+   `X86EMU_QEMU_LAYOUT=1` puts a 64-bit Linux guest's stack below
+   0x4000800000, starts mmap at 0x40008A6000, and never reuses a freed range
+   (qemu's mmap cursor is monotonic); brk already matched, since it follows
+   the image in both. With every pointer numerically equal,
+   address-dependent branches (hash tables, pointer comparisons — a compiler
+   is full of them) stop being noise, and the comparison ran **exactly** to
+   the crash: the same 11.8M blocks, then the reference reads a loop pointer
+   where we read NULL. That turned "somewhere in 12M blocks" into "this one
+   field was never written".
+5. **Then watch the field.** `X86EMU_WATCH=<hexaddr>` logs every guest write
+   covering that address, with the writing rip. (The address came from gdb
+   on `qemu-x86_64 -g`, and is valid in our run too because of the layout
+   matching.) One write appeared — memset zeroing the freshly allocated
+   block — and the real store never did, which pointed at the two
+   pointer-extraction instructions, and MOVHLPS confessed on inspection.
+
+**Also fixed: Linux guests now get an environment.** `setup_linux_stack`
+wrote `envp = {NULL}` always. A root process now gets a standard `PATH` —
+collect2 finds `ld` through it, which was the last blocker for the driver —
+and an execve'd child gets exactly what its parent passed, as before. A
+Windows host's own variables are deliberately *not* forwarded to a Linux
+guest.
+
+The rlimit question this raised is worth keeping: gcc wants a 64MB stack and
+we cap the guest at 8MB non-raisable. qemu under the same hard cap compiles
+fine, so the configuration is legitimate — but a guest that genuinely needs a
+deep stack will hit it, and the honest next step is a real
+setrlimit(RLIMIT_STACK) that grows the stack mapping.
+
+### Reproducing the whole loop (this machine is x86-64, with WSL)
 
 ```sh
-# every block qemu executes, in order (nochain, or it only logs unlinked entries)
-qemu-x86_64 -d exec,nochain -L $ROOT $ROOT/usr/libexec/.../cc1 -quiet t.c -o /dev/null 2>&1 \
-  | awk -f seq.awk > qemu.seq        # seq.awk: split on '/', print field 2
+# sysroot: Alpine v3.20 x86_64 packages for gcc/binutils/musl(+dev)/libgcc/
+#   gmp/mpc1/mpfr4/isl26/zlib/zstd-libs/jansson, tar xzf into gccroot/;
+#   copy soname names by hand (Windows tar drops apk symlinks), and
+#   mkdir -p gccroot/usr/local/include
+./x86emu -r gccroot gccroot/usr/bin/gcc /h.c -o /h     # end to end
+./x86emu -r gccroot gccroot/h                          # runs the result
+
+# reference stream (WSL; note the ulimits and env -i)
+qemu-x86_64 -d exec,nochain -L gccroot -0 <same argv0> <cc1> -quiet /t.c -o /out.s   2>&1 | awk -F/ '/^Trace/{a=$2; if (a>="0000000000400000" && a<"0000000002500000" && a!=prev){print a; prev=a}}' > qemu.seq
+# ours
+X86EMU_QEMU_LAYOUT=1 X86EMU_CENSUS_FILTER=census_filter.txt X86EMU_CENSUS_OUT=ours.seq.bin   ./x86emu -r gccroot <cc1> -quiet /t.c -o /out.s
+python tools/qemu-diff/cmp_seq.py ours.seq.bin qemu.seq
 ```
 
-and on our side, a temporary build with an address census (a `-D` guarded block
-in `Cpu::step` that appends every execution of an address listed in a filter file
-to a binary stream). Then compare: qemu's stream must appear *inside* ours in
-order, because where qemu starts a translation block is its own business. The
-first entry of qemu's that we cannot reach is the instant of divergence.
-
-Two things learned doing that, both of which cost hours:
-
-- **Compare only the program's own address range.** Shared libraries land at
-  different bases in the two implementations, so their addresses are noise.
-- **A benign difference stops the comparison dead.** Anything that makes the
-  guest take a different branch legitimately — a differing `getrlimit` answer,
-  say — sends it down a path the reference never took, and no window of
-  resynchronisation recovers. Both `getrlimit` divergences found this way were
-  bugs in *our* answers, and fixing them moved the divergence point forward;
-  expect to iterate.
-
-Where it stands: after those fixes the first divergence is at `0x1ABA81B`
-(`rep stosq` at the top of a small initialiser). The next step is a finer
-comparison — qemu's `-d cpu` gives register state per block, which turns "we
-branched differently" into "this instruction computed the wrong value" — for
-which the volume needs bounding (qemu has no "start logging at instruction N",
-so the practical route is comparing register state only at the ~2000 blocks
-around the known divergence).
 
 ## Done 2026-08-03 (MSVC, browser CPython, Linux CPython)
 

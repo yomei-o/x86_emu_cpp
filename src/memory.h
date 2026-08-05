@@ -18,6 +18,15 @@
 
 namespace x86emu {
 
+// Diagnostics: X86EMU_WATCH=hexaddr logs every guest write covering that
+// address, with the guest rip that made it (g_watch_rip, kept current by
+// Cpu::step).  Zero cost when the variable is unset.
+extern uint64_t g_watch_addr;
+extern bool g_watch_on;
+extern uint64_t g_watch_rip;
+void watch_init();
+void watch_report(uint64_t addr, uint64_t len, const void* bytes);
+
 struct MemoryFault : std::runtime_error {
     uint64_t addr;
     bool is_write;
@@ -59,7 +68,10 @@ public:
     uint32_t read32(uint64_t addr) const { return read_int<uint32_t>(addr); }
     uint64_t read64(uint64_t addr) const { return read_int<uint64_t>(addr); }
 
-    void write8(uint64_t addr, uint8_t v) { *host_ptr(addr, true) = v; }
+    void write8(uint64_t addr, uint8_t v) {
+        if (g_watch_on && addr == g_watch_addr) watch_report(addr, 1, &v);
+        *host_ptr(addr, true) = v;
+    }
     void write16(uint64_t addr, uint16_t v) { write_int(addr, v); }
     void write32(uint64_t addr, uint32_t v) { write_int(addr, v); }
     void write64(uint64_t addr, uint64_t v) { write_int(addr, v); }
@@ -118,6 +130,8 @@ private:
 
     template <typename T>
     void write_int(uint64_t addr, T v) {
+        if (g_watch_on && addr <= g_watch_addr && g_watch_addr < addr + sizeof(T))
+            watch_report(addr, sizeof(T), &v);
         if ((addr & kPageMask) + sizeof(T) <= kPageSize) {
             std::memcpy(host_ptr(addr, true), &v, sizeof(T));
             return;

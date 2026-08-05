@@ -145,7 +145,11 @@ bool Cpu::execute_sse(uint8_t op) {
                 return true;
             }
             if (op == 0x12)
-                xmm[modrm_reg_].q[0] = xmm_read_q(rm);
+                // With a register operand this is MOVHLPS - the *high* half of
+                // the source.  xmm_read_q would hand back the low half, which
+                // moves the wrong pointer without disturbing control flow: cc1
+                // lost a basic block's loop_father exactly this way.
+                xmm[modrm_reg_].q[0] = rm.is_reg ? xmm[rm.reg].q[1] : mem_.read64(rm.addr);
             else if (rm.is_reg)
                 xmm[rm.reg].q[0] = xmm[modrm_reg_].q[0];
             else

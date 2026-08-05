@@ -1,10 +1,48 @@
 #include "cpu.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <unordered_set>
 
 namespace x86emu {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Address census, for diffing an execution against qemu's (tools/qemu-diff).
+// Enabled by environment variables so it needs no special build:
+//   X86EMU_CENSUS_FILTER  file of hex addresses, one per line (qemu's block set)
+//   X86EMU_CENSUS_OUT     binary stream this appends to, 8 bytes per execution
+// Consecutive duplicates are collapsed, matching what seq.awk does to qemu's
+// stream (qemu re-enters the block once per REP iteration; we run the whole
+// REP in one step).
+struct Census {
+    std::unordered_set<uint64_t> filter;
+    std::FILE* out = nullptr;
+    uint64_t last = ~0ull;
+    Census() {
+        const char* ff = std::getenv("X86EMU_CENSUS_FILTER");
+        const char* of = std::getenv("X86EMU_CENSUS_OUT");
+        if (!ff || !of) return;
+        std::FILE* f = std::fopen(ff, "r");
+        if (!f) return;
+        char line[64];
+        while (std::fgets(line, sizeof line, f))
+            filter.insert(std::strtoull(line, nullptr, 16));
+        std::fclose(f);
+        out = std::fopen(of, "wb");
+    }
+    void record(uint64_t addr) {
+        if (addr == last || !filter.count(addr)) return;
+        last = addr;
+        std::fwrite(&addr, 8, 1, out);
+    }
+};
+
+Census* census() {
+    static Census c;
+    return c.out ? &c : nullptr;
+}
 
 uint64_t mask_of(int size) {
     return size == 8 ? ~0ull : ((1ull << (size * 8)) - 1);
@@ -880,6 +918,8 @@ void Cpu::step() {
     }
 
     uint64_t start = rip;
+    g_watch_rip = start;
+    if (Census* c = census()) c->record(start);
     if (!history_.empty()) {
         history_[history_pos_] = start;
         history_pos_ = (history_pos_ + 1) % history_.size();

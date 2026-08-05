@@ -633,6 +633,9 @@ private:
     // mmap gets its own region: it must not hand out addresses that a later
     // brk() would also claim.
     uint64_t mmap_next_ = 0, mmap_limit_ = 0;
+    // X86EMU_QEMU_LAYOUT: allocate like qemu's monotonic cursor, never reusing
+    // a freed range, so addresses match a qemu run's (see choose_layout).
+    bool mmap_no_reuse_ = false;
     // Ranges munmap() gave back, and the size of every live mmap allocation so
     // that munmap of a whole allocation can be recognised.
     std::vector<std::pair<uint64_t, uint64_t>> mmap_free_;
