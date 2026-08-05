@@ -137,15 +137,60 @@ What is known:
   working run (no arguments) against a failing one is what localised it; that
   technique is cheap and worth reaching for first.
 
+**Ruled out** - do not spend time on these again:
+
+- *Option parsing.* It works. Logging `wcsncmp`'s arguments shows cl comparing
+  `help` against its option table by prefix, fifty entries of it, with correct
+  answers; `wcsncmp` is the only comparison function it uses.
+- *The option table itself.* The 300,000 instructions before the error are cl
+  building a hash map of options (bucket masking, load-factor `divss`, list
+  splicing at `0x140013300`) - normal work, not a spin.
+- *`argv`.* `__p___wargv` hands over exactly the right strings; the trace prints
+  them. Passing the program with backslashes instead of forward slashes changes
+  nothing.
+- *The message lookup.* `FindResource(type 6, name 501)` succeeds - bundle 501 is
+  string ids 8000-8015, so cl really did choose D8000 rather than failing to find
+  D8003's text. `X86EMU_TRACE_RESOURCE=501` dumps the instruction history at that
+  lookup, but 300k entries of history still do not reach back to the decision;
+  the next attempt should instead find the *caller* of the error-reporting
+  function by reading the stack at that moment.
+
+Native cl for comparison: `-nologo`, `-c` and `-nonsenseoption` all end in
+`D8003 : source file not found` (plus a `D9002` warning for the bad option), and
+`-help` prints the option list. So the divergence is cl choosing 8000 where the
+real one chooses 8003 - an internal error code with no D-number, produced before
+it looks at the file list.
+
 ### 2. C++ with the runtime in a DLL (`/MD`)
 
 `msvcp140.dll` and `vcruntime140.dll` now load and *run* for real when `-L`
 points at the redistributable directory
-(`VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT`), which is new. `cpp_msvc_MD64` gets
-into msvcp140's own code and reads a null pointer at `0x1800097D6`; the iostream
-objects are still not constructed. The trail starts with what msvcp140's
-initialisation calls that we answer with zero - `_get_current_locale` and
-`_create_locale` both return NULL today, which is a lie a real CRT never tells.
+(`VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT`), which is new — and its `DllMain`
+gets a long way: it runs its own initialiser tables, creates its critical
+sections, and calls `__acrt_iob_func` a dozen times, which is the standard
+streams being built.
+
+Where it stops, exactly: inside that initialiser run (the `_initterm` call never
+returns), at `msvcp140+0x97D6`, which is
+
+```asm
+    mov rax,[rcx+0x40]     ; rcx = std::cout, inside msvcp140
+    mov r9,[rax]           ; faults: [cout+0x40] is NULL
+```
+
+so a pointer field of `std::cout` — by its offset, `ios_base`'s locale pointer —
+is still zero while the object is being constructed. What that rules out: the
+missing value does *not* come from `_get_current_locale` or `_create_locale`
+(msvcp140 never calls them; it only takes `_lock_locales`/`_unlock_locales` and
+reads locale data through `___lc_locale_name_func`, `__pctype_func` and
+`localeconv`). The next step is to find which of those, or which *data* import,
+feeds that field — and note that a UCRT data import bound to a hook address
+yields code bytes rather than a plausible value, which is worth checking first.
+
+Worth knowing before going further: msvcp140 was built against the real
+`ucrtbase.dll` and reads its structures directly, not only through functions.
+Some of this may be unreachable without loading a real UCRT too, which is a
+bigger decision than it looks (see "Windows is effectively already done" below).
 
 ### 3. A distribution `cc1` faults in the first RTL pass
 
@@ -514,10 +559,16 @@ so **rebuild and recommit it whenever `src/` changes**.
 
 ### Debugging, in order of usefulness
 
+0. **Diff the hook sequence of a working run against a failing one.** Two
+   `--trace-calls` runs, `grep -oE '^\[hook\] [A-Za-z_0-9]+'`, `diff`. It costs a
+   minute and points straight at where the two runs part company; it is what
+   localised both compiler failures. Only then reach for the rest.
 1. `--imports` — lists imports that resolved to a "not implemented" stub. This is
    how to bring up a new guest: read the list, implement what is on it.
 2. `--trace-calls` — logs intercepted calls and syscalls. Several hooks log their
-   arguments here (paths, in particular), which is usually what you want.
+   arguments here — paths, environment variables and what they resolved to,
+   resource lookups — which is usually what you want. Adding one `log_call` to
+   the hook under suspicion beats guessing.
 3. The fault report — names what the address was (null, a hook for an imported
    variable, inside the stack) and lists stack slots that look like return
    addresses. That crude backtrace found a buffer overrun in the emulator's own
@@ -525,7 +576,11 @@ so **rebuild and recommit it whenever `src/` changes**.
 4. `--dump ADDR[:N]` — hex dump after loading, before the first instruction.
    Good for checking an image was mapped correctly.
 5. `--map` — the guest memory map and the hook region's extent.
-6. `--trace` — every instruction. Only for the last few hundred.
+6. `--history N` — the last N instruction addresses, printed after a fault, with
+   straight-line runs collapsed. For a guest that *does not* fault,
+   `X86EMU_TRACE_RESOURCE=<id>` dumps the same history when it looks up a given
+   string resource, which is how to find the code that chose an error message.
+7. `--trace` — every instruction. Only for the last few hundred.
 
 For a guest that prints its own diagnostics, use them: `PYTHONVERBOSE=2` was what
 finally located CPython's import failure, and CPython's own traceback identified
