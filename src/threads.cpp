@@ -17,6 +17,7 @@
 
 #include "emulator.h"
 #include "guest_printf.h"
+#include "processes.h"
 
 namespace x86emu {
 
@@ -82,10 +83,21 @@ size_t Emulator::pick_runnable() {
         if (t->wake_at && cpu_->instructions_executed >= t->wake_at) {
             t->wake_at = 0;
             t->wait_handle = 0;
+            t->wait_predicate = nullptr;
             t->state = GuestThread::State::Runnable;
             continue;
         }
         if (t->wait_handle && try_acquire(t->wait_handle)) {
+            t->wait_handle = 0;
+            t->wake_at = 0;
+            t->wait_predicate = nullptr;
+            t->state = GuestThread::State::Runnable;
+            continue;
+        }
+        // The general wake condition: bytes arrived in a pipe, a child process
+        // exited, a futex was woken - anything the scheduler can only ask about.
+        if (t->wait_predicate && t->wait_predicate()) {
+            t->wait_predicate = nullptr;
             t->wait_handle = 0;
             t->wake_at = 0;
             t->state = GuestThread::State::Runnable;
@@ -146,6 +158,11 @@ bool Emulator::try_acquire(uint64_t handle) {
             }
             return false;
         }
+        case SyncObject::Kind::Process:
+            // The System is the authority on whether the child has finished;
+            // asking it every time keeps the handle from needing notification.
+            return o->signalled ||
+                   (system_ && system_->is_zombie(static_cast<int>(o->owner)));
         default:  // Thread: signalled once it has finished
             return o->signalled;
     }

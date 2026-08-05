@@ -4,15 +4,50 @@
 // table maps them onto real host files.  Everything above it - the Linux
 // syscalls, the Win32 file API and the C stdio layer - is a different spelling of
 // the same operations, so they all go through here.
+//
+// A descriptor can also name a pipe: an in-memory byte queue shared between
+// guest processes.  The buffer is unbounded, so a writer never blocks; a reader
+// with an empty buffer gets kEAGAINPipe while a writer still exists, and the
+// caller is expected to block its guest thread and retry.
 #pragma once
 
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace x86emu {
+
+// What FileTable::read returns when a pipe is empty but not at end-of-file.
+// The value is Linux's -EAGAIN, so the syscall layer can also pass it through.
+constexpr int64_t kEAGAINPipe = -11;
+
+// One pipe, shared by every descriptor that references either of its ends -
+// including descriptors in *other processes'* tables, which is what makes
+// `gcc | as` style plumbing work.
+struct Pipe {
+    std::deque<uint8_t> buffer;
+    int readers = 0;  // open read ends, counted across all processes
+    int writers = 0;  // open write ends
+};
+
+// One *end* of a pipe.  Duplicated descriptors share a single end object; the
+// pipe's reader/writer count drops only when the last duplicate closes, which
+// is exactly the rule that makes "close your copy of the child's write end"
+// produce EOF at the right moment.
+struct PipeEnd {
+    std::shared_ptr<Pipe> pipe;
+    bool writer = false;
+    PipeEnd(std::shared_ptr<Pipe> p, bool w) : pipe(std::move(p)), writer(w) {
+        (writer ? pipe->writers : pipe->readers)++;
+    }
+    ~PipeEnd() { (writer ? pipe->writers : pipe->readers)--; }
+    PipeEnd(const PipeEnd&) = delete;
+    PipeEnd& operator=(const PipeEnd&) = delete;
+};
 
 class FileTable {
 public:
@@ -29,7 +64,12 @@ public:
     };
 
     struct Entry {
-        std::FILE* fp = nullptr;
+        // Shared, because dup() and child processes reference the same host
+        // stream - and with it the same file offset, as POSIX specifies.  The
+        // deleter closes the stream when the last reference goes, and is a no-op
+        // for the host's own standard streams.
+        std::shared_ptr<std::FILE> fp;
+        std::shared_ptr<PipeEnd> pipe_end;
         std::string path;
         bool readable = false;
         bool writable = false;
@@ -44,6 +84,7 @@ public:
         // a directory to ask about its attributes, which no C library can do.
         bool is_directory = false;
         bool text_mode = false;  // a Windows guest opened it without "b"
+        bool cloexec = false;    // closed by execve(), as FD_CLOEXEC asks
         bool closed = false;
         // getdents64 iteration state for a directory descriptor: the listing is
         // snapshotted on the first read and a cursor walks it across calls.
@@ -56,6 +97,8 @@ public:
         // write() has no such rule, so the table tracks the direction and
         // resynchronises for it.
         bool last_was_write = false;
+
+        bool is_pipe() const { return pipe_end != nullptr; }
     };
 
     FileTable();
@@ -71,7 +114,9 @@ public:
     // metadata operations work on it, which is all Windows allows either.
     int open_directory(const std::string& path);
     int close(int fd);
-    // Negative return values are errno-style; otherwise a byte count.
+    // Negative return values are errno-style; otherwise a byte count.  A pipe
+    // with nothing buffered returns kEAGAINPipe while a writer exists and 0
+    // (end of file) once the last write end has closed.
     int64_t read(int fd, void* dst, uint64_t len);
     int64_t write(int fd, const void* src, uint64_t len);
     // whence: 0 = set, 1 = current, 2 = end.
@@ -84,6 +129,19 @@ public:
     // Duplicates a descriptor onto the lowest free slot, or onto `to`.
     int dup(int fd, int to = -1);
 
+    // Creates a pipe; fds[0] is the read end, fds[1] the write end.
+    // Returns 0 or a negative errno-style code.
+    int make_pipe(int fds[2]);
+    // Installs a copy of another table's descriptor at `fd` here.  This is how a
+    // child process inherits its standard handles: both tables then reference
+    // the same host stream or pipe end.
+    void install(int fd, const Entry& entry);
+    // A copy of the whole table, for fork(): every descriptor shared, offsets
+    // and all.
+    FileTable clone() const;
+    // Closes every descriptor marked close-on-exec, for execve().
+    void close_cloexec();
+
     Entry* get(int fd);
     bool valid(int fd) const;
 
@@ -95,6 +153,7 @@ public:
         uint64_t size = 0;
         bool is_dir = false;
         bool is_char_device = false;
+        bool is_fifo = false;
         int64_t mtime = 0;
     };
     static int stat_path(const std::string& path, Stat& out);
@@ -108,7 +167,6 @@ private:
     int alloc_slot();
 
     std::unordered_map<int, Entry> files_;
-    int next_fd_ = 3;
     bool translate_newlines_ = false;
 };
 

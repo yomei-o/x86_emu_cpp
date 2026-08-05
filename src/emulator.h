@@ -25,6 +25,8 @@
 
 namespace x86emu {
 
+class System;
+
 // How arguments reach a called function.
 enum class Abi {
     Cdecl32,  // 32-bit: everything on the stack
@@ -62,8 +64,76 @@ public:
     // Where guest stdout/stderr bytes go.  Unset means the host's own streams;
     // a front end that is not a terminal (the browser demo) installs its own.
     std::function<void(int /*fd*/, const char* /*data*/, size_t /*len*/)> output_sink;
-    // Runs until the guest exits.  Returns its exit code.
+    // Runs until the guest exits.  Returns its exit code.  Internally this
+    // builds a System around the emulator, so a guest that spawns child
+    // processes works from every front end without them knowing.
     int run();
+
+    // ---- processes -----------------------------------------------------------
+    // One Emulator is one guest process.  The System (process.h) owns the
+    // process table and schedules the emulators round-robin; these are the
+    // pieces of the emulator it talks to.
+    System* system() const { return system_; }
+    int pid() const { return pid_; }
+    void set_system(System* sys, int pid) {
+        system_ = sys;
+        pid_ = pid;
+    }
+
+    // What one call to run_slice() did.
+    enum class SliceStatus {
+        Ran,     // executed instructions; call again
+        Exited,  // the process finished; cpu().exit_code holds the answer
+        Idle,    // every thread is blocked; nothing to do until something changes
+    };
+    // Runs at most one scheduling quantum of one thread.  The System calls this
+    // in rotation over all live processes.
+    SliceStatus run_slice(uint64_t quantum);
+    // The earliest instruction-count deadline any blocked thread waits for, or
+    // 0 if no thread is blocked on time.  When every process is idle the System
+    // advances the clocks instead of declaring deadlock.
+    uint64_t next_timer_wake() const;
+    void advance_time_to(uint64_t when) {
+        if (cpu_ && when > cpu_->instructions_executed) cpu_->instructions_executed = when;
+    }
+
+    // Blocks the current thread until `pred` returns true, then re-runs the
+    // current hook (Win32 path) or the current syscall instruction (Linux
+    // path).  The operation must be idempotent up to the blocking point, which
+    // reads and waits are.
+    void block_hook_retry(std::function<bool()> pred);
+    void block_syscall_retry(std::function<bool()> pred);
+
+    // execve: the request is recorded here and the System swaps the process's
+    // emulator outside of guest execution.  fail_exec() resumes the old image
+    // with the error when the new one cannot be loaded.
+    struct ExecRequest {
+        std::string path;
+        std::vector<std::string> argv;
+        std::vector<std::pair<std::string, std::string>> env;
+    };
+    void request_exec(ExecRequest req);
+    bool has_exec_request() const { return exec_request_ != nullptr; }
+    std::unique_ptr<ExecRequest> take_exec_request() { return std::move(exec_request_); }
+    void fail_exec(int64_t err);
+    // True (once) if the last syscall blocked its thread; the dispatcher must
+    // then leave RAX holding the syscall number for the retry.
+    bool take_syscall_block();
+
+    // A copy of this process for fork(): same memory image, same registers,
+    // shared file descriptions, one thread (the caller's).  Linux-only - a
+    // Windows guest gets processes through CreateProcess, which builds fresh.
+    std::unique_ptr<Emulator> fork_clone();
+
+    // Seeds the guest environment explicitly instead of from the host, which is
+    // how a child process inherits its *parent's* (possibly modified)
+    // environment.  Call before load().
+    void set_environment(std::vector<std::pair<std::string, std::string>> env);
+    // The exact command line string for GetCommandLine(), when the parent gave
+    // one; joining argv with spaces loses quoting, and a real child sees the
+    // parent's exact bytes.  Call before load().
+    void set_raw_command_line(std::string cmd) { raw_command_line_ = std::move(cmd); }
+    const std::string& raw_command_line() const { return raw_command_line_; }
 
     Memory mem;
 
@@ -107,17 +177,25 @@ public:
         // What this thread is blocked on, if anything.
         uint64_t wait_handle = 0;
         uint64_t wake_at = 0;  // an instruction count, for Sleep
+        // An arbitrary wake condition, evaluated by the scheduler.  This is how
+        // a thread waits for things that live outside its own process: bytes in
+        // a pipe, a child process's exit.
+        std::function<bool()> wait_predicate;
+        // Linux: where to write 0 and wake a futex waiter when this thread
+        // exits (CLONE_CHILD_CLEARTID / set_tid_address).
+        uint64_t clear_child_tid = 0;
     };
 
     // A Win32 waitable object.  Threads are objects too, which is what makes
-    // joining one the same operation as waiting on an event.
+    // joining one the same operation as waiting on an event.  So are child
+    // processes: their handle signals when the System reports them finished.
     struct SyncObject {
-        enum class Kind { Event, Mutex, Semaphore, Thread };
+        enum class Kind { Event, Mutex, Semaphore, Thread, Process };
         Kind kind = Kind::Event;
         bool manual_reset = false;
         bool signalled = false;
         int64_t count = 0;       // a semaphore's remaining permits
-        uint32_t owner = 0;      // a mutex's holder, or a thread's id
+        uint32_t owner = 0;      // a mutex's holder, a thread's id, or a child's pid
         int64_t recursion = 0;   // a mutex may be taken repeatedly by its owner
     };
 
@@ -178,6 +256,9 @@ public:
     // this never creates a stub, so a guest probing for an optional API gets the
     // NULL it is looking for.
     uint64_t existing_hook(const std::string& symbol) const;
+    // Guest memory standing in for an imported CRT *variable* (__argc,
+    // _environ, _iob...), or 0 if the symbol is not one of those.
+    uint64_t data_import(const std::string& symbol);
     // A stand-in HMODULE for a library the emulator implements rather than loads.
     uint64_t hooked_module_handle(const std::string& name);
 
@@ -361,6 +442,7 @@ public:
     void install_win32_extra_hooks();
     void install_win32_fs_hooks();
     void install_ucrt_hooks();
+    void install_process_hooks();
     void install_syscall_handlers();
 
 private:
@@ -410,6 +492,7 @@ private:
 
     std::vector<Hook> hooks_;
     std::unordered_map<std::string, uint64_t> hook_by_name_;
+    std::unordered_map<std::string, uint64_t> data_imports_;
 
     // Guest layout, chosen from the image's bitness in choose_layout().
     uint64_t hook_base_ = 0;
@@ -470,6 +553,14 @@ private:
     std::vector<std::string> loading_;
     uint32_t next_dynamic_tls_slot_ = 0;  // TlsAlloc hands these out
     std::vector<uint64_t> atexit_funcs_;
+
+    System* system_ = nullptr;
+    int pid_ = 4242;  // the value getpid() always answered before processes existed
+    std::unique_ptr<ExecRequest> exec_request_;
+    uint32_t exec_waiter_tid_ = 0;
+    bool syscall_blocked_ = false;
+    std::string raw_command_line_;
+    bool env_explicit_ = false;  // set_environment() was called; skip host seeding
 };
 
 }  // namespace x86emu

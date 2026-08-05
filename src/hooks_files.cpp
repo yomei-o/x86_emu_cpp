@@ -363,9 +363,20 @@ void Emulator::install_file_hooks() {
         uint64_t buf = e.arg_slot(1), len = e.arg_slot(2), read_ptr = e.arg_slot(3);
         std::vector<uint8_t> tmp(static_cast<size_t>(len));
         int64_t got = (fd >= 0 && len) ? e.files.read(fd, tmp.data(), len) : 0;
+        if (got == kEAGAINPipe) {
+            // An empty pipe with a live writer: block this thread and run the
+            // whole call again once bytes (or end-of-file) arrive.
+            auto end = e.files.get(fd)->pipe_end;
+            e.block_hook_retry([end] {
+                return !end->pipe->buffer.empty() || end->pipe->writers <= 0;
+            });
+            return;
+        }
         if (got > 0) e.mem.write(buf, tmp.data(), static_cast<uint64_t>(got));
         if (read_ptr) e.mem.write32(read_ptr, static_cast<uint32_t>(got > 0 ? got : 0));
-        e.set_result(got < 0 ? 0 : 1);
+        if (got == 0 && e.files.get(fd) && e.files.get(fd)->is_pipe())
+            e.set_last_error(109);  // ERROR_BROKEN_PIPE: how Windows spells pipe EOF
+        e.set_result(got < 0 ? 0 : (got == 0 && e.files.get(fd) && e.files.get(fd)->is_pipe()) ? 0 : 1);
     });
     win32("WriteFile", 5, [](Emulator& e) {
         int fd = Emulator::fd_from_handle(e.arg_slot(0));
@@ -418,7 +429,9 @@ void Emulator::install_file_hooks() {
         }
         // A redirected standard stream really is a disk file, which is what a
         // guest choosing its buffering strategy needs to know.
-        e.set_result(entry->is_tty ? 2u /* FILE_TYPE_CHAR */ : 1u /* FILE_TYPE_DISK */);
+        e.set_result(entry->is_pipe() ? 3u /* FILE_TYPE_PIPE */
+                     : entry->is_tty ? 2u /* FILE_TYPE_CHAR */
+                                     : 1u /* FILE_TYPE_DISK */);
     });
     auto delete_file = [](Emulator& e, bool wide) {
         std::string path = wide ? utf16_to_utf8(e, e.arg_slot(0), -1)

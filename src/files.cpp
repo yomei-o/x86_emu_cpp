@@ -29,6 +29,7 @@ constexpr int kEACCES = -13;
 constexpr int kEEXIST = -17;
 constexpr int kEINVAL = -22;
 constexpr int kEMFILE = -24;
+constexpr int kEPIPE = -32;
 
 int from_errno(int e) {
     switch (e) {
@@ -40,6 +41,17 @@ int from_errno(int e) {
     }
 }
 
+// The host's standard streams are never fclosed; everything else is closed when
+// its last reference goes.
+std::shared_ptr<std::FILE> own_stream(std::FILE* fp) {
+    return std::shared_ptr<std::FILE>(fp, [](std::FILE* f) {
+        if (f) std::fclose(f);
+    });
+}
+std::shared_ptr<std::FILE> borrow_stream(std::FILE* fp) {
+    return std::shared_ptr<std::FILE>(fp, [](std::FILE*) {});
+}
+
 }  // namespace
 
 FileTable::FileTable() {
@@ -48,7 +60,7 @@ FileTable::FileTable() {
     // GetFileType or isatty gets the truth about where its output is going.
     auto standard = [](std::FILE* fp, const char* name, bool readable, bool writable) {
         Entry e;
-        e.fp = fp;
+        e.fp = borrow_stream(fp);
         e.path = name;
         e.readable = readable;
         e.writable = writable;
@@ -73,6 +85,12 @@ std::string FileTable::host_path(const std::string& guest_path) {
     std::string out;
     out.reserve(guest_path.size());
     for (char c : guest_path) out += (c == '\\') ? '/' : c;
+    // A Linux guest needs absolute paths that start with '/', and the emulator
+    // hands it "/C:/dir/file" spellings for host paths on a Windows host (see
+    // /proc/self/exe).  Undo that on the way back to the host filesystem.
+    if (out.size() >= 3 && out[0] == '/' &&
+        ((out[1] >= 'A' && out[1] <= 'Z') || (out[1] >= 'a' && out[1] <= 'z')) && out[2] == ':')
+        out.erase(0, 1);
     return out;
 }
 
@@ -117,7 +135,7 @@ int FileTable::open(const std::string& path, const OpenFlags& flags) {
         return kEMFILE;
     }
     Entry e;
-    e.fp = fp;
+    e.fp = own_stream(fp);
     e.path = path;
     e.readable = flags.read || (flags.write && flags.read);
     e.writable = flags.write || flags.append;
@@ -141,10 +159,63 @@ int FileTable::open_directory(const std::string& path) {
     return fd;
 }
 
+int FileTable::make_pipe(int fds[2]) {
+    int rd = alloc_slot();
+    if (rd < 0) return kEMFILE;
+    auto pipe = std::make_shared<Pipe>();
+    Entry read_end;
+    read_end.pipe_end = std::make_shared<PipeEnd>(pipe, false);
+    read_end.path = "<pipe:r>";
+    read_end.readable = true;
+    files_[rd] = read_end;
+
+    int wr = alloc_slot();
+    if (wr < 0) {
+        files_.erase(rd);
+        return kEMFILE;
+    }
+    Entry write_end;
+    write_end.pipe_end = std::make_shared<PipeEnd>(pipe, true);
+    write_end.path = "<pipe:w>";
+    write_end.writable = true;
+    files_[wr] = write_end;
+
+    fds[0] = rd;
+    fds[1] = wr;
+    return 0;
+}
+
+void FileTable::install(int fd, const Entry& entry) {
+    auto it = files_.find(fd);
+    if (it != files_.end()) close(fd);
+    Entry copy = entry;
+    // The inherited descriptor is the child's now; whether it may be closed is
+    // the child's own affair, and close-on-exec does not survive inheritance.
+    copy.cloexec = false;
+    files_[fd] = copy;
+}
+
+FileTable FileTable::clone() const {
+    FileTable out;
+    out.translate_newlines_ = translate_newlines_;
+    out.files_.clear();
+    // Entry copies share the stream and the pipe end, which is what fork()
+    // means: one file description, two tables.
+    for (const auto& [fd, e] : files_) out.files_[fd] = e;
+    return out;
+}
+
+void FileTable::close_cloexec() {
+    std::vector<int> doomed;
+    for (const auto& [fd, e] : files_)
+        if (e.cloexec) doomed.push_back(fd);
+    for (int fd : doomed) close(fd);
+}
+
 bool FileTable::valid(int fd) const {
     auto it = files_.find(fd);
     return it != files_.end() && !it->second.closed &&
-           (it->second.fp != nullptr || it->second.is_directory);
+           (it->second.fp != nullptr || it->second.is_directory || it->second.pipe_end);
 }
 
 FileTable::Entry* FileTable::get(int fd) {
@@ -156,13 +227,8 @@ FileTable::Entry* FileTable::get(int fd) {
 int FileTable::close(int fd) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (e->standard_stream || e->is_directory) {
-        // Nothing to close: a standard stream belongs to the host, and a
-        // directory handle never had a stream at all.
-        files_.erase(fd);
-        return 0;
-    }
-    std::fclose(e->fp);
+    // The shared_ptr closes the stream when the last duplicate goes, and the
+    // pipe end adjusts its pipe's reader/writer count the same way.
     files_.erase(fd);
     return 0;
 }
@@ -172,11 +238,23 @@ int64_t FileTable::read(int fd, void* dst, uint64_t len) {
     if (!e) return kEBADF;
     if (!e->readable || e->is_directory) return kEBADF;
     if (len == 0) return 0;
+    if (e->is_pipe()) {
+        Pipe& p = *e->pipe_end->pipe;
+        if (p.buffer.empty())
+            return p.writers > 0 ? kEAGAINPipe : 0;  // block-and-retry, or EOF
+        size_t n = std::min<size_t>(static_cast<size_t>(len), p.buffer.size());
+        auto* out = static_cast<uint8_t*>(dst);
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = p.buffer.front();
+            p.buffer.pop_front();
+        }
+        return static_cast<int64_t>(n);
+    }
     if (e->last_was_write) {
-        std::fflush(e->fp);
+        std::fflush(e->fp.get());
         e->last_was_write = false;
     }
-    size_t got = std::fread(dst, 1, static_cast<size_t>(len), e->fp);
+    size_t got = std::fread(dst, 1, static_cast<size_t>(len), e->fp.get());
     if (e->text_mode && got) {
         // Text mode collapses CRLF to LF, so the guest sees fewer bytes than
         // were on disk - which is exactly what a real CRT reports.
@@ -196,10 +274,17 @@ int64_t FileTable::write(int fd, const void* src, uint64_t len) {
     if (!e) return kEBADF;
     if (!e->writable || e->is_directory) return kEBADF;
     if (len == 0) return 0;
+    if (e->is_pipe()) {
+        Pipe& p = *e->pipe_end->pipe;
+        if (p.readers <= 0) return kEPIPE;  // nobody will ever read this
+        const auto* in = static_cast<const uint8_t*>(src);
+        p.buffer.insert(p.buffer.end(), in, in + len);
+        return static_cast<int64_t>(len);
+    }
     if (!e->last_was_write && !e->standard_stream) {
         // Seeking to the current position is the standard way to switch a stream
         // from reading to writing.
-        std::fseek(e->fp, 0, SEEK_CUR);
+        std::fseek(e->fp.get(), 0, SEEK_CUR);
     }
     e->last_was_write = true;
     if (e->text_mode) {
@@ -210,12 +295,12 @@ int64_t FileTable::write(int fd, const void* src, uint64_t len) {
             if (p[i] == '\n') expanded.push_back('\r');
             expanded.push_back(p[i]);
         }
-        if (std::fwrite(expanded.data(), 1, expanded.size(), e->fp) != expanded.size())
+        if (std::fwrite(expanded.data(), 1, expanded.size(), e->fp.get()) != expanded.size())
             return 0;
         // Report the count the guest asked about, not the expanded one.
         return static_cast<int64_t>(len);
     }
-    size_t put = std::fwrite(src, 1, static_cast<size_t>(len), e->fp);
+    size_t put = std::fwrite(src, 1, static_cast<size_t>(len), e->fp.get());
     return static_cast<int64_t>(put);
 }
 
@@ -223,24 +308,26 @@ int64_t FileTable::seek(int fd, int64_t offset, int whence) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
     if (e->standard_stream || e->is_directory) return kEINVAL;
+    if (e->is_pipe()) return -29;  // ESPIPE
     e->last_was_write = false;
     int origin = whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET;
 #if defined(_WIN32)
-    if (_fseeki64(e->fp, offset, origin) != 0) return kEINVAL;
-    return _ftelli64(e->fp);
+    if (_fseeki64(e->fp.get(), offset, origin) != 0) return kEINVAL;
+    return _ftelli64(e->fp.get());
 #else
-    if (fseeko(e->fp, static_cast<off_t>(offset), origin) != 0) return kEINVAL;
-    return static_cast<int64_t>(ftello(e->fp));
+    if (fseeko(e->fp.get(), static_cast<off_t>(offset), origin) != 0) return kEINVAL;
+    return static_cast<int64_t>(ftello(e->fp.get()));
 #endif
 }
 
 int64_t FileTable::tell(int fd) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
+    if (e->is_pipe() || !e->fp) return -29;  // ESPIPE
 #if defined(_WIN32)
-    return _ftelli64(e->fp);
+    return _ftelli64(e->fp.get());
 #else
-    return static_cast<int64_t>(ftello(e->fp));
+    return static_cast<int64_t>(ftello(e->fp.get()));
 #endif
 }
 
@@ -253,13 +340,18 @@ int64_t FileTable::size(int fd) {
 int FileTable::flush(int fd) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
-    if (e->is_directory) return 0;
-    return std::fflush(e->fp) == 0 ? 0 : kEINVAL;
+    if (e->is_directory || e->is_pipe()) return 0;
+    return std::fflush(e->fp.get()) == 0 ? 0 : kEINVAL;
 }
 
 bool FileTable::eof(int fd) {
     Entry* e = get(fd);
-    return e ? std::feof(e->fp) != 0 : true;
+    if (!e) return true;
+    if (e->is_pipe()) {
+        Pipe& p = *e->pipe_end->pipe;
+        return p.buffer.empty() && p.writers <= 0;
+    }
+    return e->fp ? std::feof(e->fp.get()) != 0 : true;
 }
 
 int FileTable::dup(int fd, int to) {
@@ -269,14 +361,13 @@ int FileTable::dup(int fd, int to) {
     if (target < 0) {
         target = alloc_slot();
         if (target < 0) return kEMFILE;
-    } else if (target != fd && files_.find(target) != files_.end()) {
-        close(target);
+    } else if (target == fd) {
+        return target;
     }
-    // The two descriptors share one host FILE*, so only the standard streams and
-    // the original owner may close it; mark the copy as a shared view.
+    // Both descriptors share one file description: stream, offset, pipe end.
     Entry copy = *e;
-    // Both descriptors share one host stream, so neither may close it.
-    copy.standard_stream = true;
+    copy.cloexec = false;  // dup() clears close-on-exec on the new descriptor
+    if (files_.find(target) != files_.end()) close(target);
     files_[target] = copy;
     return target;
 }
@@ -305,6 +396,11 @@ int FileTable::stat_path(const std::string& path, Stat& out) {
 int FileTable::stat_fd(int fd, Stat& out) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
+    if (e->is_pipe()) {
+        out.is_fifo = true;
+        out.size = e->pipe_end->pipe->buffer.size();
+        return 0;
+    }
     if (e->standard_stream) {
         out.is_char_device = true;
         out.size = 0;
@@ -319,22 +415,22 @@ int FileTable::stat_fd(int fd, Stat& out) {
     int r = stat_path(e->path, out);
     if (r != 0) return r;
     if (e->last_was_write) {
-        std::fflush(e->fp);
+        std::fflush(e->fp.get());
         e->last_was_write = false;
     }
 #if defined(_WIN32)
-    long long here = _ftelli64(e->fp);
-    if (here >= 0 && _fseeki64(e->fp, 0, SEEK_END) == 0) {
-        long long end = _ftelli64(e->fp);
+    long long here = _ftelli64(e->fp.get());
+    if (here >= 0 && _fseeki64(e->fp.get(), 0, SEEK_END) == 0) {
+        long long end = _ftelli64(e->fp.get());
         if (end >= 0) out.size = static_cast<uint64_t>(end);
-        _fseeki64(e->fp, here, SEEK_SET);
+        _fseeki64(e->fp.get(), here, SEEK_SET);
     }
 #else
-    off_t here = ftello(e->fp);
-    if (here >= 0 && fseeko(e->fp, 0, SEEK_END) == 0) {
-        off_t end = ftello(e->fp);
+    off_t here = ftello(e->fp.get());
+    if (here >= 0 && fseeko(e->fp.get(), 0, SEEK_END) == 0) {
+        off_t end = ftello(e->fp.get());
         if (end >= 0) out.size = static_cast<uint64_t>(end);
-        fseeko(e->fp, here, SEEK_SET);
+        fseeko(e->fp.get(), here, SEEK_SET);
     }
 #endif
     return 0;

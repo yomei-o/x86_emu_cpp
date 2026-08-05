@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <limits>
 #include <cstring>
+
+#include "processes.h"
 
 #if defined(_WIN32)
 #include <fcntl.h>
@@ -83,6 +86,11 @@ uint64_t Emulator::resolve_import(const std::string& dll, const std::string& sym
     for (char c : dll) lower += static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
     if (lower.compare(0, 6, "msvcrt") == 0) three_digit_exponents_ = true;
 
+    // A few CRT imports are variables, not functions; binding those to a hook
+    // address plants a bomb that goes off when the guest reads them as data.
+    // They get real guest memory instead.
+    if (uint64_t var = data_import(symbol)) return var;
+
     auto it = hook_by_name_.find(symbol);
     if (it != hook_by_name_.end()) return it->second;
 
@@ -100,6 +108,49 @@ uint64_t Emulator::resolve_import(const std::string& dll, const std::string& sym
         throw CpuError(e.cpu().rip, "call to unimplemented import " + label +
                                        " (add a hook for it in hooks.cpp)");
     });
+}
+
+uint64_t Emulator::data_import(const std::string& symbol) {
+    auto it = data_imports_.find(symbol);
+    if (it != data_imports_.end()) return it->second;
+
+    auto remember = [&](uint64_t addr) {
+        data_imports_[symbol] = addr;
+        return addr;
+    };
+    auto pointer_var = [&](uint64_t value) {
+        // A pointer-sized variable holding `value` - the shape of _environ,
+        // __argv and friends, whose import is the variable's address.
+        uint64_t var = alloc_guest_data(nullptr, 0);
+        mem.write_sized(var, pointer_size(), value);
+        return remember(var);
+    };
+
+    if (symbol == "__initenv" || symbol == "_environ")
+        return pointer_var(environment_vector());
+    if (symbol == "__argc") {
+        uint32_t argc = static_cast<uint32_t>(args_.size());
+        return remember(alloc_guest_data(&argc, sizeof argc));
+    }
+    if (symbol == "__argv") {
+        int ps = pointer_size();
+        std::vector<uint64_t> ptrs;
+        for (const auto& a : args_) ptrs.push_back(alloc_guest_string(a));
+        std::vector<uint8_t> table((ptrs.size() + 1) * ps, 0);
+        uint64_t base = alloc_guest_data(table.data(), table.size());
+        for (size_t i = 0; i < ptrs.size(); ++i) mem.write_sized(base + i * ps, ps, ptrs[i]);
+        return pointer_var(base);
+    }
+    if (symbol == "_fmode" || symbol == "_commode" || symbol == "__mb_cur_max") {
+        uint32_t v = symbol == "__mb_cur_max" ? 1 : 0;
+        return remember(alloc_guest_data(&v, sizeof v));
+    }
+    if (symbol == "_HUGE") {
+        double inf = std::numeric_limits<double>::infinity();
+        return remember(alloc_guest_data(&inf, sizeof inf));
+    }
+    if (symbol == "_iob") return remember(guest_file(0));  // the 3-entry FILE array
+    return 0;
 }
 
 uint64_t Emulator::existing_hook(const std::string& symbol) const {
@@ -705,6 +756,13 @@ uint64_t Emulator::alloc_guest_string(const std::string& s) {
 
 void Emulator::write_raw(int fd, const void* data, size_t len) {
     if (!len) return;
+    // A child process whose stdout is a pipe or a redirected file has a
+    // non-standard entry at descriptor 1; those bytes belong in the descriptor,
+    // not on the host's console.
+    if (FileTable::Entry* e = files.get(fd); e && !e->standard_stream) {
+        files.write(fd, data, len);
+        return;
+    }
     // Deliberately does *not* flush the stdio buffer first.  WriteFile knows
     // nothing about the C runtime's buffer on real Windows either, so a guest
     // that mixes the two sees its raw writes overtake its buffered ones - and
@@ -719,6 +777,10 @@ void Emulator::flush_guest_output() {
     if (stdout_buffer_.empty()) return;
     std::string out;
     out.swap(stdout_buffer_);
+    if (FileTable::Entry* e = files.get(1); e && !e->standard_stream) {
+        files.write(1, out.data(), out.size());
+        return;
+    }
     if (output_sink)
         output_sink(1, out.data(), out.size());
     else
@@ -762,12 +824,17 @@ uint64_t Emulator::guest_file(int fd) {
     if (it != guest_files_.end()) return it->second;
 
     // The first three are allocated as one contiguous block, because a guest may
-    // reach them through an imported _iob[] array rather than one at a time.
+    // reach them through an imported _iob[] array rather than one at a time -
+    // and msvcrt code computes `stderr` as `_iob + 2 * sizeof(FILE)`, so the
+    // stride must be the *CRT's* FILE size (48 bytes on x64, 32 on x86), not a
+    // number of our choosing, or the pointer lands between objects and stderr
+    // silently resolves to the default stream.
     if (guest_files_.empty()) {
-        std::vector<uint8_t> blob(3 * kFileObjectSize, 0);
+        uint64_t stride = os() == Os::Windows ? (is64() ? 48 : 32) : kFileObjectSize;
+        std::vector<uint8_t> blob(3 * stride, 0);
         uint64_t base = alloc_guest_data(blob.data(), blob.size());
         for (int i = 0; i < 3; ++i) {
-            uint64_t obj = base + static_cast<uint64_t>(i) * kFileObjectSize;
+            uint64_t obj = base + static_cast<uint64_t>(i) * stride;
             mem.write32(obj, 0x554D4546);  // 'FEMU', so a stray pointer is obvious
             mem.write32(obj + 4, static_cast<uint32_t>(i));
             guest_files_[i] = obj;
@@ -817,10 +884,12 @@ void Emulator::setup_windows_env(const std::vector<std::string>& args) {
     const int ps = pointer_size();
 
     // Command line and image path, as UNICODE_STRINGs.
-    std::string cmd;
-    for (const auto& a : args) {
-        if (!cmd.empty()) cmd += ' ';
-        cmd += a;
+    std::string cmd = raw_command_line_;
+    if (cmd.empty()) {
+        for (const auto& a : args) {
+            if (!cmd.empty()) cmd += ' ';
+            cmd += a;
+        }
     }
     auto put_unicode_string = [&](uint64_t at, const std::string& text) {
         std::u16string w(text.begin(), text.end());  // ASCII widening is enough here
@@ -963,7 +1032,9 @@ void Emulator::load(const std::string& path, const std::vector<std::string>& arg
 
 void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<std::string>& args) {
     args_ = args;
-    seed_environment();
+    // A child process inherits its parent's environment, which set_environment
+    // installed; only a root process starts from the host's.
+    if (!env_explicit_) seed_environment();
 
     // The layout and the hook addresses depend on the bitness, and PE import
     // binding needs the hook addresses, so peek at the headers first.
@@ -1007,6 +1078,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         install_win32_extra_hooks();
         install_win32_fs_hooks();
         install_ucrt_hooks();
+        install_process_hooks();
     }
 
     if (os_kind == Os::Windows) {
@@ -1109,50 +1181,199 @@ int Emulator::run() {
         ~FlushOnExit() { e->flush_guest_output(); }
     } flush_guard{this};
 
-    // The scheduler: give the running thread a slice, then look for another.
-    // With one thread this is the plain interpreter loop with a counter around
-    // it, which is why the single-threaded path costs nothing.
-    constexpr uint64_t kQuantum = 20000;
-    while (!cpu_->halted) {
+    // The System schedules processes the way this emulator schedules threads;
+    // with no children it degenerates to the plain interpreter loop.
+    System sys(this);
+    int code = sys.run();
+    std::fflush(stdout);
+    return code;
+}
+
+Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
+    if (cpu_->halted) return SliceStatus::Exited;
+
+    // Wake anything whose wait is satisfied, and choose who runs this slice.
+    size_t next = pick_runnable();
+    if (next >= threads_.size()) return SliceStatus::Idle;
+    switch_to_thread(next);
+
+    uint64_t deadline = cpu_->instructions_executed + quantum;
+    reschedule_ = false;
+    while (!cpu_->halted && !reschedule_ && cpu_->instructions_executed < deadline) {
+        cpu_->step();
         if (opt_.max_instructions && cpu_->instructions_executed >= opt_.max_instructions)
             throw CpuError(cpu_->rip, "instruction limit reached (possible infinite loop)");
-
-        uint64_t deadline = cpu_->instructions_executed + kQuantum;
-        reschedule_ = false;
-        while (!cpu_->halted && !reschedule_ && cpu_->instructions_executed < deadline) {
-            cpu_->step();
-            if (opt_.max_instructions && cpu_->instructions_executed >= opt_.max_instructions)
-                throw CpuError(cpu_->rip, "instruction limit reached (possible infinite loop)");
-        }
-        if (cpu_->halted) break;
-        if (threads_.size() <= 1) continue;  // nothing to switch to
-
-        size_t next = pick_runnable();
-        if (next >= threads_.size()) {
-            bool any_alive = false;
-            for (const auto& t : threads_)
-                if (t->state != GuestThread::State::Finished) any_alive = true;
-            if (!any_alive) break;
-
-            // Nothing can run.  If someone is waiting on a timer, the answer is
-            // that time has to pass - and here time *is* the instruction count,
-            // so with every thread idle it can simply be moved forward to the
-            // earliest deadline.  Otherwise the wait can never be satisfied.
-            uint64_t earliest = 0;
-            for (const auto& t : threads_) {
-                if (t->state != GuestThread::State::Blocked || !t->wake_at) continue;
-                if (!earliest || t->wake_at < earliest) earliest = t->wake_at;
-            }
-            if (!earliest) throw CpuError(cpu_->rip, "all threads are blocked: deadlock");
-            cpu_->instructions_executed = earliest;
-            next = pick_runnable();
-            if (next >= threads_.size())
-                throw CpuError(cpu_->rip, "all threads are blocked: deadlock");
-        }
-        switch_to_thread(next);
     }
-    std::fflush(stdout);
-    return cpu_->exit_code;
+    return cpu_->halted ? SliceStatus::Exited : SliceStatus::Ran;
+}
+
+uint64_t Emulator::next_timer_wake() const {
+    uint64_t earliest = 0;
+    for (const auto& t : threads_) {
+        if (t->state != GuestThread::State::Blocked || !t->wake_at) continue;
+        if (!earliest || t->wake_at < earliest) earliest = t->wake_at;
+    }
+    return earliest;
+}
+
+void Emulator::block_hook_retry(std::function<bool()> pred) {
+    GuestThread* t = current_thread();
+    if (!t) throw CpuError(cpu_->rip, "cannot block: no current thread");
+    t->state = GuestThread::State::Blocked;
+    t->wait_predicate = std::move(pred);
+    retry_current_call();
+    yield_now();
+}
+
+void Emulator::block_syscall_retry(std::function<bool()> pred) {
+    GuestThread* t = current_thread();
+    if (!t) throw CpuError(cpu_->rip, "cannot block: no current thread");
+    // Both `syscall` (0F 05) and `int 0x80` (CD 80) are two bytes; stepping back
+    // makes the whole call happen again once the wait is over.
+    cpu_->rip -= 2;
+    t->state = GuestThread::State::Blocked;
+    t->wait_predicate = std::move(pred);
+    syscall_blocked_ = true;  // tells the dispatcher to leave RAX (the number) alone
+    yield_now();
+}
+
+bool Emulator::take_syscall_block() {
+    bool b = syscall_blocked_;
+    syscall_blocked_ = false;
+    return b;
+}
+
+void Emulator::request_exec(ExecRequest req) {
+    exec_request_ = std::make_unique<ExecRequest>(std::move(req));
+    GuestThread* t = current_thread();
+    if (t) {
+        exec_waiter_tid_ = t->id;
+        // Parked until the System either swaps the image (this thread ends with
+        // it) or reports failure through fail_exec().
+        t->state = GuestThread::State::Blocked;
+        t->wait_predicate = [] { return false; };
+    }
+    yield_now();
+}
+
+void Emulator::fail_exec(int64_t err) {
+    for (auto& t : threads_) {
+        if (t->id != exec_waiter_tid_) continue;
+        t->state = GuestThread::State::Runnable;
+        t->wait_predicate = nullptr;
+        // The thread's context is live in the CPU if it is still the current
+        // one (nothing else ran since it blocked), saved otherwise.
+        if (threads_[current_thread_].get() == t.get())
+            cpu_->regs[RAX] = static_cast<uint64_t>(err);
+        else
+            t->regs[RAX] = static_cast<uint64_t>(err);
+        break;
+    }
+}
+
+void Emulator::set_environment(std::vector<std::pair<std::string, std::string>> env) {
+    env_ = std::move(env);
+    env_explicit_ = true;
+}
+
+std::unique_ptr<Emulator> Emulator::fork_clone() {
+    if (os() != Os::Linux)
+        throw CpuError(cpu_->rip, "fork() is only supported for Linux guests");
+
+    auto child = std::make_unique<Emulator>(opt_);
+    child->image_ = image_;
+    child->args_ = args_;
+    child->env_ = env_;
+    child->env_explicit_ = true;
+    child->raw_command_line_ = raw_command_line_;
+    child->output_sink = output_sink;
+
+    child->mem.clone_from(mem);
+    child->cpu_ = std::make_unique<Cpu>(child->mem, image_.mode);
+    Cpu& c = *child->cpu_;
+    std::memcpy(c.regs, cpu_->regs, sizeof c.regs);
+    std::memcpy(c.xmm, cpu_->xmm, sizeof c.xmm);
+    std::memcpy(c.st, cpu_->st, sizeof c.st);
+    std::memcpy(c.st_used, cpu_->st_used, sizeof c.st_used);
+    c.st_top = cpu_->st_top;
+    c.fpu_control = cpu_->fpu_control;
+    c.fpu_status = cpu_->fpu_status;
+    c.mxcsr = cpu_->mxcsr;
+    c.rip = cpu_->rip;  // already past the syscall instruction
+    c.rflags = cpu_->rflags;
+    c.fs_base = cpu_->fs_base;
+    c.gs_base = cpu_->gs_base;
+    c.instructions_executed = cpu_->instructions_executed;
+    c.trace = cpu_->trace;
+    c.regs[RAX] = 0;  // fork() returns 0 in the child
+
+    child->files = files.clone();
+
+    // The guest layout is state, not configuration; the child continues from
+    // the parent's exact allocation frontier.
+    child->hook_base_ = hook_base_;
+    child->stack_base_ = stack_base_;
+    child->stack_size_ = stack_size_;
+    child->stack_top_ = stack_top_;
+    child->heap_base_ = heap_base_;
+    child->heap_next_ = heap_next_;
+    child->heap_limit_ = heap_limit_;
+    child->mmap_next_ = mmap_next_;
+    child->mmap_limit_ = mmap_limit_;
+    child->misc_base_ = misc_base_;
+    child->misc_next_ = misc_next_;
+    child->teb_base_ = teb_base_;
+    child->brk_ = brk_;
+    child->heap_blocks_ = heap_blocks_;
+    child->guest_files_ = guest_files_;
+    child->guest_file_fds_ = guest_file_fds_;
+    child->last_error_ = last_error_;
+    child->three_digit_exponents_ = three_digit_exponents_;
+    child->stdout_buffer_ = stdout_buffer_;
+    child->buffer_stdout_ = buffer_stdout_;
+    child->errno_address_ = errno_address_;
+    child->lconv_address_ = lconv_address_;
+    child->tls_array_ = tls_array_;
+    child->next_tls_slot_ = next_tls_slot_;
+    child->tls_templates_ = tls_templates_;
+    child->next_dynamic_tls_slot_ = next_dynamic_tls_slot_;
+    child->atexit_funcs_ = atexit_funcs_;
+    child->sync_objects_ = sync_objects_;
+    child->next_sync_handle_ = next_sync_handle_;
+    child->find_handles_ = find_handles_;
+    child->next_find_handle_ = next_find_handle_;
+
+    // Hooks are installed in the same order load_bytes() uses for a Linux
+    // guest, which reproduces the same addresses - although a Linux guest never
+    // calls them by address anyway, only the two thunks matter.
+    child->exit_thunk_ = child->add_hook("__emu_exit__", 0, [](Emulator& e) {
+        e.exit_process(static_cast<int>(static_cast<int32_t>(e.cpu().regs[RAX])));
+    });
+    child->nested_return_ = child->add_hook("__emu_nested_return__", 0, [](Emulator&) {});
+    child->install_library_hooks();
+    child->install_math_hooks();
+    child->install_file_hooks();
+    child->install_libc_hooks();
+    Emulator* raw = child.get();
+    child->cpu_->on_hook_call = [raw](uint64_t addr) { return raw->dispatch_hook(addr); };
+    child->install_syscall_handlers();
+
+    // fork() keeps only the calling thread.
+    auto t = std::make_unique<GuestThread>();
+    const GuestThread& cur = *threads_[current_thread_];
+    t->id = cur.id;
+    t->handle = cur.handle;
+    t->stack_base = cur.stack_base;
+    t->stack_size = cur.stack_size;
+    t->teb = cur.teb;
+    t->tls_array = cur.tls_array;
+    t->tls_slots = cur.tls_slots;
+    t->clear_child_tid = cur.clear_child_tid;
+    child->threads_.push_back(std::move(t));
+    child->current_thread_ = 0;
+    child->next_thread_id_ = next_thread_id_;
+
+    return child;
 }
 
 }  // namespace x86emu

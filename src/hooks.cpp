@@ -71,6 +71,19 @@ void Emulator::install_library_hooks() {
         write_out(e, fd, s);
         e.set_result(s.size());
     });
+    libc("vfprintf", [](Emulator& e) {
+        int fd = stream_fd(e, e.arg_slot(0));
+        Args va = Args::va_list_at(e, e.arg_slot(2));
+        std::string s = format_guest(e, e.arg_slot(1), va);
+        write_out(e, fd, s);
+        e.set_result(s.size());
+    });
+    libc("vprintf", [](Emulator& e) {
+        Args va = Args::va_list_at(e, e.arg_slot(1));
+        std::string s = format_guest(e, e.arg_slot(0), va);
+        write_out(e, 1, s);
+        e.set_result(s.size());
+    });
     libc("fputs", [](Emulator& e) {
         std::string s = e.mem.read_cstring(e.arg_slot(0));
         write_out(e, stream_fd(e, e.arg_slot(1)), s);
@@ -139,7 +152,30 @@ void Emulator::install_library_hooks() {
         e.exit_process(3);
     });
     libc("atexit", [](Emulator& e) { e.set_result(0); });
-    libc("_initterm", [](Emulator& e) { e.set_result(0); });
+    // msvcrt's internal CRT locks: one guest thread runs at a time, so there is
+    // nothing to take.
+    libc("_lock", [](Emulator& e) { e.set_result(0); });
+    libc("_unlock", [](Emulator& e) { e.set_result(0); });
+    libc("___lc_codepage_func", [](Emulator& e) { e.set_result(1252); });
+    libc("___mb_cur_max_func", [](Emulator& e) { e.set_result(1); });
+    // (argc*, argv*, env*, doWildCard, startupInfo*) - mingw's msvcrt startup.
+    libc("__getmainargs", [](Emulator& e) {
+        int ps = e.pointer_size();
+        std::vector<uint64_t> ptrs;
+        for (const auto& a : e.args()) ptrs.push_back(e.alloc_guest_string(a));
+        std::vector<uint8_t> table((ptrs.size() + 1) * ps, 0);
+        uint64_t argv = e.alloc_guest_data(table.data(), table.size());
+        for (size_t i = 0; i < ptrs.size(); ++i)
+            e.mem.write_sized(argv + i * ps, ps, ptrs[i]);
+        if (e.arg_slot(0)) e.mem.write32(e.arg_slot(0), static_cast<uint32_t>(e.args().size()));
+        if (e.arg_slot(1)) e.mem.write_sized(e.arg_slot(1), ps, argv);
+        if (e.arg_slot(2)) e.mem.write_sized(e.arg_slot(2), ps, e.environment_vector());
+        e.set_result(0);
+    });
+    // _initterm deliberately has no stub here: the real implementation in
+    // hooks_win32.cpp walks the table and calls the initialisers, and a no-op
+    // registered first would shadow it - mingw's startup sets argv inside one
+    // of those initialisers, so the no-op cost every guest its argument list.
     libc("__set_app_type", [](Emulator& e) { e.set_result(0); });
     libc("_amsg_exit", [](Emulator& e) { e.exit_process(static_cast<int>(e.arg_slot(0))); });
     libc("signal", [](Emulator& e) { e.set_result(0); });

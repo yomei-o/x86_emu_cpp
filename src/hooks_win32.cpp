@@ -79,6 +79,9 @@ std::string program_path(const Emulator& e) {
 }
 
 std::string command_line(const Emulator& e) {
+    // A child process gets the parent's exact CreateProcess string; quoting
+    // reconstructed from argv can never be more faithful than the original.
+    if (!e.raw_command_line().empty()) return e.raw_command_line();
     std::string cmd;
     for (const auto& a : e.args()) {
         if (!cmd.empty()) cmd += ' ';
@@ -115,12 +118,10 @@ void Emulator::install_win32_hooks() {
         e.run_atexit();
         e.exit_process(static_cast<int>(e.arg_slot(0)));
     });
-    win32("TerminateProcess", 2, [](Emulator& e) {
-        e.exit_process(static_cast<int>(e.arg_slot(1)));
-    });
+    // TerminateProcess lives with the process hooks: the handle may name a child.
     win32("GetCurrentProcess", 0, [](Emulator& e) { e.set_result(~0ull); });
     win32("GetCurrentThread", 0, [](Emulator& e) { e.set_result(~1ull); });
-    win32("GetCurrentProcessId", 0, [](Emulator& e) { e.set_result(4242); });
+    win32("GetCurrentProcessId", 0, [](Emulator& e) { e.set_result(e.pid()); });
     win32("GetCurrentThreadId", 0, [](Emulator& e) { e.set_result(1234); });
     win32("GetModuleHandleA", 1, [](Emulator& e) {
         e.set_result(e.arg_slot(0) == 0 ? e.image().image_base : 0);
@@ -283,6 +284,8 @@ void Emulator::install_win32_hooks() {
         e.set_result(processor_feature(static_cast<uint32_t>(e.arg_slot(0))) ? 1 : 0);
     });
     ret0("IsDebuggerPresent", 0);
+    ret0("IsDBCSLeadByteEx", 2);
+    ret0("IsDBCSLeadByte", 1);
     // EncodePointer/DecodePointer obfuscate a stored function pointer against
     // tampering.  An identity transform is a valid implementation - the CRT only
     // requires that decode undoes encode.
@@ -812,6 +815,18 @@ void Emulator::install_ucrt_hooks() {
         uint64_t fn = e.arg_slot(0);
         if (fn) e.add_atexit(fn);
         e.set_result(0);
+    });
+    // msvcrt's older spelling; returns the function on success.
+    ucrt("_onexit", [](Emulator& e) {
+        uint64_t fn = e.arg_slot(0);
+        if (fn) e.add_atexit(fn);
+        e.set_result(fn);
+    });
+    // (onexit table begin/end pointers, function) - mingw's DLL-aware variant.
+    ucrt("__dllonexit", [](Emulator& e) {
+        uint64_t fn = e.arg_slot(0);
+        if (fn) e.add_atexit(fn);
+        e.set_result(fn);
     });
     ucrt("_execute_onexit_table", [](Emulator& e) {
         e.run_atexit();

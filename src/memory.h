@@ -82,6 +82,15 @@ public:
     std::string read_cstring(uint64_t addr, uint64_t max_len = 1ull << 20) const;
     void write_cstring(uint64_t addr, const std::string& s);
 
+    // Replaces this memory with a page-for-page copy of another - the whole of
+    // what fork() means for an address space.
+    void clone_from(const Memory& other) {
+        pages_.clear();
+        for (const auto& [index, page] : other.pages_)
+            pages_[index] = std::make_unique<Page>(*page);
+        regions_ = other.regions_;
+    }
+
     const std::vector<Region>& regions() const { return regions_; }
 
 private:
