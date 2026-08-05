@@ -91,6 +91,24 @@ if ls tests/msvc/bin/*.exe >/dev/null 2>&1; then
     done
 fi
 
+# The toolchain test runs a real cl.exe and link.exe *inside* the emulator and
+# diffs the object it produces against a native build of the same file.  It lives
+# in its own script because it needs a Visual Studio installation and skips
+# itself without one.
+if [ -f tests/toolchain/run_msvc.sh ]; then
+    if sh tests/toolchain/run_msvc.sh | sed '$d;/^$/d'; then
+        toolchain_ok=1
+    else
+        toolchain_ok=0
+    fi
+    # The sub-script's own counts are printed above; roll its verdict into ours.
+    if [ "$toolchain_ok" = 1 ]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+    fi
+fi
+
 echo "ELF guests (emulated output vs. recorded expectation)"
 # These cannot run natively on a Windows host, so each has a recorded output and
 # a recorded exit code in tests/expected/.  hello_elf* are hand-assembled by

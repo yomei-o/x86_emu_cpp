@@ -1,0 +1,115 @@
+#!/bin/sh
+# Runs the Visual Studio toolchain *inside* the emulator and checks the result
+# against the same toolchain run natively.
+#
+# This is the strongest test in the tree, and not because compilers are large: it
+# is the strongest because the answer is checkable to the byte.  cl.exe is
+# deterministic apart from the timestamp it stamps into the object header, so an
+# emulated build that differs from a native one anywhere else has a real bug -
+# and one that is otherwise invisible, since a compiler with a subtly wrong hook
+# still prints nothing and exits 0.  Noticing that `.chks64` was missing from the
+# object is how the absence of CNG hashing turned up.
+#
+# The second case exercises the process machinery for real: `cl hello.c` writes a
+# response file, spawns link.exe as a child, waits for it, and deletes the file.
+#
+# Skips itself when no Visual Studio is installed, which is why it is a separate
+# script rather than part of run_tests.sh.
+set -e
+cd "$(dirname "$0")/../.."
+emu=./x86emu
+[ -x "$emu" ] || emu=./x86emu.exe
+
+# Paths reach the guest as strings and the guest resolves them itself, so
+# everything here has to be spelled the way Windows spells it.  A shell-style
+# /c/... prefix means nothing to cl.exe, and what it does instead of failing
+# cleanly is report an internal compiler error from its include cache.
+program_files=$(echo "${PROGRAMFILES:-C:/Program Files}" | tr '\\' /)
+program_files_x86="C:/Program Files (x86)"
+
+find_msvc() {
+    for root in "$program_files/Microsoft Visual Studio"/*/*/VC/Tools/MSVC/*; do
+        [ -x "$root/bin/Hostx64/x64/cl.exe" ] && echo "$root" && return 0
+    done
+    return 1
+}
+find_sdk() {
+    for inc in "$program_files_x86/Windows Kits/10/Include"/*; do
+        [ -d "$inc/ucrt" ] && echo "$inc" && return 0
+    done
+    return 1
+}
+
+msvc=$(find_msvc) || { echo "MSVC toolchain: skipped (no Visual Studio found)"; exit 0; }
+sdk_inc=$(find_sdk) || { echo "MSVC toolchain: skipped (no Windows SDK found)"; exit 0; }
+sdk_lib=$(echo "$sdk_inc" | sed 's|/Include/|/Lib/|')
+
+export INCLUDE="$msvc/include;$sdk_inc/ucrt;$sdk_inc/shared;$sdk_inc/um;$sdk_inc/winrt"
+export LIB="$msvc/lib/x64;$sdk_lib/ucrt/x64;$sdk_lib/um/x64"
+cl="$msvc/bin/Hostx64/x64/cl.exe"
+
+# The scratch directory sits inside the tree rather than under /tmp, because the
+# guest must be able to open it by the name we hand it, and a shell's idea of
+# /tmp is not a path Windows resolves.
+rm -rf tests/toolchain/.work
+mkdir -p tests/toolchain/.work/build
+here=$(pwd -W 2>/dev/null || pwd)
+work="$here/tests/toolchain/.work"
+cat > "$work/build/hello.c" <<'EOF'
+#include <stdio.h>
+int main(void) {
+    printf("hello from cl\n");
+    return 0;
+}
+EOF
+
+pass=0
+fail=0
+report() {
+    if [ "$1" = ok ]; then
+        echo "  ok    $2"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  $2"
+        fail=$((fail + 1))
+    fi
+}
+
+echo "MSVC toolchain (emulated cl.exe/link.exe vs. native)"
+
+# Both builds happen in the same directory, because the object records the
+# absolute path of its own source in .debug$S: compiling one file from two
+# directories legitimately produces two different objects.  The only byte that
+# may differ is the COFF TimeDateStamp at offset 4, which differs between any two
+# builds including two native ones.
+(cd "$work/build" && "$here/$emu" "$cl" -nologo -c hello.c >/dev/null 2>&1)
+mv "$work/build/hello.obj" "$work/emulated.obj"
+(cd "$work/build" && "$cl" -nologo -c hello.c >/dev/null 2>&1)
+mv "$work/build/hello.obj" "$work/native.obj"
+if cmp -s -n 4 "$work/emulated.obj" "$work/native.obj" &&
+   cmp -s -i 8 "$work/emulated.obj" "$work/native.obj"; then
+    report ok "cl -c hello.c (object identical to native, timestamp aside)"
+else
+    report FAIL "cl -c hello.c (object differs from native)"
+fi
+
+# Compile and link, which makes cl spawn link.exe as a child process, then run
+# what came out - under the emulator, not natively.  That is the stronger check
+# and the portable one: nothing in this script then depends on the host being
+# Windows, which is the point of emulating the toolchain in the first place.
+(cd "$work/build" && rm -f hello.exe && "$here/$emu" "$cl" -nologo hello.c >/dev/null 2>&1)
+if [ -f "$work/build/hello.exe" ]; then
+    got=$("$emu" "$work/build/hello.exe" 2>&1 || true)
+    if [ "$got" = "hello from cl" ]; then
+        report ok "cl hello.c (linked through a child link.exe; the result runs)"
+    else
+        report FAIL "cl hello.c (linked, but the result printed <$got>)"
+    fi
+else
+    report FAIL "cl hello.c (no executable produced)"
+fi
+
+rm -rf tests/toolchain/.work
+echo
+echo "$pass passed, $fail failed"
+[ "$fail" = 0 ]
