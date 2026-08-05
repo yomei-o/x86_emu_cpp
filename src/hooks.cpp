@@ -126,7 +126,11 @@ void Emulator::install_library_hooks() {
         if (take < n) e.mem.write8(buf + take, 0);
         e.set_result(s.size() < n ? s.size() : 0xFFFFFFFFull);
     });
-    libc("fwrite", [](Emulator& e) {
+    // The "_nolock" variants exist because a caller has already taken the
+    // stream's lock; with one guest thread at a time the two are the same
+    // function, and registering both is what keeps a guest from finding one
+    // missing at the worst moment.
+    auto do_fwrite = [](Emulator& e) {
         uint64_t ptr = e.arg_slot(0), size = e.arg_slot(1), count = e.arg_slot(2);
         int fd = stream_fd(e, e.arg_slot(3));
         uint64_t total = size * count;
@@ -134,7 +138,8 @@ void Emulator::install_library_hooks() {
         if (total) e.mem.read(ptr, data.data(), total);
         write_out(e, fd, data);
         e.set_result(count);
-    });
+    };
+    libc("fwrite", do_fwrite);
     libc("fflush", [](Emulator& e) {
         // The guest's own buffered stdout has to go out too, not just the host's
         // streams: a guest that flushes before writing to another descriptor is

@@ -103,6 +103,12 @@ std::string FileTable::host_path(const std::string& guest_path) {
     // Any other absolute Unix path lives inside the sysroot, when one is set.
     else if (!g_sysroot.empty() && !out.empty() && out[0] == '/')
         out = g_sysroot + out;
+    // A trailing separator is how a guest spells a directory, and how the NT
+    // path form arrives, but stat() rejects it on Windows.  Drop it unless the
+    // path is a root ("/" or "C:/"), which needs it to mean anything.
+    while (out.size() > 1 && out.back() == '/' &&
+           !(out.size() == 3 && out[1] == ':'))
+        out.pop_back();
     return out;
 }
 

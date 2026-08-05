@@ -40,10 +40,13 @@ bool is_system_library(const std::string& lower_name) {
         "oleaut32", "ws2_32", "wsock32", "rpcrt4", "sechost", "shlwapi", "psapi",
         "version", "comdlg32", "comctl32", "winmm", "imm32", "setupapi", "crypt32",
         "bcrypt", "ncrypt", "userenv", "netapi32", "iphlpapi", "dbghelp",
-        // msvcp (the C++ standard library) is deliberately absent: it exports
-        // std::cout as *data*, so there is nothing to hook - it has to be the
-        // real DLL, and its own dependencies are all on this list.
-        "msvcrt", "msvcr", "ucrtbase", "vcruntime", "concrt",
+        // msvcp (the C++ standard library) and vcruntime (the C++ *language*
+        // runtime) are deliberately absent.  Both export things that cannot be
+        // hooked: msvcp exports std::cout as *data*, and vcruntime owns the
+        // language half of exception handling - __CxxFrameHandler4 is called by
+        // the unwinder with an ABI no hook can stand in for.  They have to be the
+        // real DLLs, and everything they in turn import is on this list.
+        "msvcrt", "msvcr", "ucrtbase", "concrt",
         "api-ms-win-", "ext-ms-win-", "ntdll",
     };
     for (const char* p : kPrefixes)

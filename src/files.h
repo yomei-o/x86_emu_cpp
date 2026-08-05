@@ -92,6 +92,9 @@ public:
         std::vector<uint8_t> dir_types;   // DT_DIR=4, DT_REG=8
         size_t dir_pos = 0;
         bool dir_loaded = false;
+        // The wildcard the listing was taken with; a caller that changes it, as
+        // the native directory query may, needs a fresh snapshot.
+        std::string dir_filter;
         // C forbids reading straight after writing on the same stream without an
         // intervening flush or seek.  A guest calling the kernel's read() and
         // write() has no such rule, so the table tracks the direction and

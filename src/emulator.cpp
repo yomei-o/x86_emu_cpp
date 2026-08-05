@@ -48,7 +48,12 @@ void Emulator::choose_layout() {
         stack_size_ = 8ull << 20;
         stack_base_ = (os() == Os::Windows) ? 0x0000000000300000ull
                                             : 0x00007FFFFF700000ull;
-        heap_base_ = 0x0000000200000000ull;
+        // Close above a Windows image (which loads at 0x140000000), because a
+        // guest may compress pointers into 32 bits relative to something it
+        // already has - a compiler's arena does - and anything more than 4 GiB
+        // from the image cannot be reached that way.  A Linux guest's heap
+        // follows its image instead, chosen below.
+        heap_base_ = 0x0000000150000000ull;
         heap_limit_ = heap_base_ + (1ull << 30);
     }
     // A Linux guest grows its heap with brk() starting right after the image.
@@ -111,6 +116,13 @@ uint64_t Emulator::resolve_import(const std::string& dll, const std::string& sym
         throw CpuError(e.cpu().rip, "call to unimplemented import " + label +
                                        " (add a hook for it in hooks.cpp)");
     });
+}
+
+bool Emulator::alias_hook(const std::string& existing, const std::string& alias) {
+    auto it = hook_by_name_.find(existing);
+    if (it == hook_by_name_.end()) return false;
+    hook_by_name_[alias] = it->second;
+    return true;
 }
 
 uint64_t Emulator::data_import(const std::string& symbol) {
@@ -740,6 +752,17 @@ uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment) {
     mmap_next_ += need;
     mem.map(addr, need);
     mmap_live_[addr] = need;
+    return addr;
+}
+
+uint64_t Emulator::reserve_pages(uint64_t size, uint64_t alignment) {
+    uint64_t need = (size + 0xFFF) & ~0xFFFull;
+    if (alignment < 0x1000) alignment = 0x1000;
+    mmap_next_ = (mmap_next_ + alignment - 1) & ~(alignment - 1);
+    if (mmap_next_ + need > mmap_limit_) return 0;
+    uint64_t addr = mmap_next_;
+    mmap_next_ += need;
+    // Deliberately no mem.map(): the pages appear when the guest commits them.
     return addr;
 }
 

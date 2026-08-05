@@ -40,6 +40,13 @@ bool processor_feature(uint32_t feature) {
     }
 }
 
+// Module names are compared lowercased, as the module table stores them.
+std::string lowercase_name(const std::string& s) {
+    std::string out;
+    for (char c : s) out += static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    return out;
+}
+
 void zero_fill(Emulator& e, uint64_t addr, size_t len) {
     if (!addr || !len) return;
     std::vector<uint8_t> zeros(len, 0);
@@ -150,11 +157,35 @@ void Emulator::install_win32_hooks() {
     win32("GetModuleHandleW", 1, [](Emulator& e) {
         e.set_result(e.arg_slot(0) == 0 ? e.image().image_base : 0);
     });
-    win32("GetModuleHandleExW", 3, [](Emulator& e) {
-        uint64_t out = e.arg_slot(2);
-        if (out) e.mem.write_sized(out, e.pointer_size(), e.image().image_base);
-        e.set_result(1);
-    });
+    // (flags, name-or-address, out module).  The interesting flag is
+    // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, which asks "which module is this
+    // address in?" - a caller uses it to find *itself* from a function pointer,
+    // so answering with the main image every time hands a DLL the wrong module.
+    auto get_module_handle_ex = [](Emulator& e, bool wide) {
+        constexpr uint64_t kFromAddress = 0x4;
+        uint64_t flags = e.arg_slot(0), name_or_addr = e.arg_slot(1), out = e.arg_slot(2);
+        uint64_t base = 0;
+        if (flags & kFromAddress) {
+            Emulator::Module* m = e.module_for(name_or_addr);
+            base = m ? m->image.base : 0;
+        } else if (!name_or_addr) {
+            base = e.image().image_base;
+        } else {
+            std::string name = wide ? utf16_to_utf8(e, name_or_addr, -1)
+                                    : e.mem.read_cstring(name_or_addr);
+            if (Emulator::Module* m = e.module_by_name(lowercase_name(name)))
+                base = m->image.base;
+            else
+                base = e.hooked_module_handle(name);
+        }
+        if (out) e.mem.write_sized(out, e.pointer_size(), base);
+        if (!base) e.set_last_error(126);  // ERROR_MOD_NOT_FOUND
+        e.set_result(base ? 1 : 0);
+    };
+    win32("GetModuleHandleExW", 3,
+          [get_module_handle_ex](Emulator& e) { get_module_handle_ex(e, true); });
+    win32("GetModuleHandleExA", 3,
+          [get_module_handle_ex](Emulator& e) { get_module_handle_ex(e, false); });
     win32("GetModuleFileNameA", 3, [](Emulator& e) {
         std::string name = program_path(e);
         uint64_t buf = e.arg_slot(1), size = e.arg_slot(2);
@@ -408,11 +439,38 @@ void Emulator::install_win32_hooks() {
     // the *allocation granularity*, 64 KiB, not to a page: a guest that keeps
     // metadata by masking an allocation's low bits - a compiler's arena
     // allocator does - computes a wild pointer otherwise.
-    win32("VirtualAlloc", 4, [](Emulator& e) {
-        e.set_result(e.alloc_pages(e.arg_slot(1), 0x10000));
+    // (address, size, type, protect).  The two halves of this call have to work
+    // *together*: a guest reserves a large region with a NULL address and then
+    // commits pieces of it by passing addresses inside it.  Ignoring the address
+    // and handing back a fresh region each time leaves the guest computing
+    // pointers into the region it thinks it has - which is how a compiler's arena
+    // ends up dereferencing 0x6BB00000000.
+    //
+    // Reserving does not create pages, so a 100 MB reservation costs nothing
+    // until the guest commits parts of it; touching reserved-but-uncommitted
+    // memory faults, exactly as it would on Windows.
+    auto virtual_alloc = [](Emulator& e, uint64_t want, uint64_t size, uint32_t type) {
+        constexpr uint32_t kCommit = 0x1000, kReserve = 0x2000;
+        uint64_t addr;
+        if (want) {
+            addr = want & ~0xFFFull;
+            uint64_t end = (want + size + 0xFFF) & ~0xFFFull;
+            if (type & kCommit) e.mem.map(addr, end - addr);
+        } else if ((type & kReserve) && !(type & kCommit)) {
+            addr = e.reserve_pages(size, 0x10000);
+        } else {
+            addr = e.alloc_pages(size, 0x10000);
+        }
+        e.log_call("VirtualAlloc(want 0x%llX, %llu bytes, type 0x%X) = 0x%llX",
+                   (unsigned long long)want, (unsigned long long)size, type,
+                   (unsigned long long)addr);
+        e.set_result(addr);
+    };
+    win32("VirtualAlloc", 4, [virtual_alloc](Emulator& e) {
+        virtual_alloc(e, e.arg_slot(0), e.arg_slot(1), static_cast<uint32_t>(e.arg_slot(2)));
     });
-    win32("VirtualAllocEx", 5, [](Emulator& e) {
-        e.set_result(e.alloc_pages(e.arg_slot(2), 0x10000));
+    win32("VirtualAllocEx", 5, [virtual_alloc](Emulator& e) {
+        virtual_alloc(e, e.arg_slot(1), e.arg_slot(2), static_cast<uint32_t>(e.arg_slot(3)));
     });
     ret1("VirtualFree", 3);
     ret1("VirtualProtect", 4);

@@ -2,6 +2,7 @@
 // (c1.dll, c1xx.dll, c2.dll) and link.exe need beyond the API the earlier
 // guests already exercised.  Almost all of it is the UCRT's wide-character
 // dialect plus a few kernel32 corners (thread pools, file mappings).
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,12 @@
 #include "emulator.h"
 #include "guest_printf.h"
 #include "processes.h"
+
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace x86emu {
 namespace {
@@ -109,6 +116,83 @@ void Emulator::install_cl_hooks() {
         }
         e.set_result(1);
     });
+    // The hashing side of the crypto API, which a toolchain uses to derive a
+    // name - for a temporary file, or a build key - from some bytes.  A real
+    // digest is needed rather than a stub: the caller uses the *value*, and two
+    // different inputs must not collide.  FNV-1a spread over the requested
+    // length is not MD5, but it is a function of the input, which is what a name
+    // needs; nothing here depends on the digest being cryptographic.
+    {
+        struct Hash {
+            std::vector<uint8_t> data;
+        };
+        auto hashes = std::make_shared<std::unordered_map<uint64_t, Hash>>();
+        auto next = std::make_shared<uint64_t>(0xC0DE1000);
+        // (provider, algorithm, key, flags, out handle)
+        win32("CryptCreateHash", 5, [hashes, next](Emulator& e) {
+            uint64_t h = (*next += 16);
+            (*hashes)[h] = Hash{};
+            if (e.arg_slot(4)) e.mem.write_sized(e.arg_slot(4), e.pointer_size(), h);
+            e.set_result(1);
+        });
+        // (hash, data, length, flags)
+        win32("CryptHashData", 4, [hashes](Emulator& e) {
+            auto it = hashes->find(e.arg_slot(0));
+            if (it == hashes->end()) {
+                e.set_result(0);
+                return;
+            }
+            uint64_t len = e.arg_slot(2);
+            size_t at = it->second.data.size();
+            it->second.data.resize(at + static_cast<size_t>(len));
+            if (len) e.mem.read(e.arg_slot(1), it->second.data.data() + at, len);
+            e.set_result(1);
+        });
+        // (hash, param, buffer, *length, flags).  HP_HASHVAL is 2, HP_HASHSIZE 4.
+        win32("CryptGetHashParam", 5, [hashes](Emulator& e) {
+            auto it = hashes->find(e.arg_slot(0));
+            if (it == hashes->end()) {
+                e.set_result(0);
+                return;
+            }
+            uint32_t param = static_cast<uint32_t>(e.arg_slot(1));
+            uint64_t buf = e.arg_slot(2), len_ptr = e.arg_slot(3);
+            constexpr uint32_t kHashVal = 2, kHashSize = 4;
+            if (param == kHashSize) {
+                if (buf) e.mem.write32(buf, 16);
+                if (len_ptr) e.mem.write32(len_ptr, 4);
+                e.set_result(1);
+                return;
+            }
+            if (param != kHashVal) {
+                e.set_result(0);
+                return;
+            }
+            uint32_t want = len_ptr ? e.mem.read32(len_ptr) : 16;
+            if (!buf) {
+                if (len_ptr) e.mem.write32(len_ptr, 16);
+                e.set_result(1);
+                return;
+            }
+            if (want > 64) want = 64;
+            // One FNV-1a per output byte, seeded by its index, so the whole
+            // digest depends on the whole input.
+            for (uint32_t i = 0; i < want; ++i) {
+                uint64_t acc = 1469598103934665603ull + i;
+                for (uint8_t b : it->second.data) {
+                    acc ^= b;
+                    acc *= 1099511628211ull;
+                }
+                e.mem.write8(buf + i, static_cast<uint8_t>(acc >> 24));
+            }
+            if (len_ptr) e.mem.write32(len_ptr, want);
+            e.set_result(1);
+        });
+        win32("CryptDestroyHash", 1, [hashes](Emulator& e) {
+            hashes->erase(e.arg_slot(0));
+            e.set_result(1);
+        });
+    }
     ret0("EventRegister", 4);
     ret0("EventUnregister", 1);
     ret0("EventWriteTransfer", 7);
@@ -282,6 +366,381 @@ void Emulator::install_cl_hooks() {
     ret0("FlushProcessWriteBuffers", 0);
     ret0("FreeLibraryWhenCallbackReturns", 2);
 
+    // ntdll's UNICODE_STRING helpers: {Length, MaximumLength, Buffer}, with the
+    // two lengths counted in *bytes* rather than characters.  A guest reaching
+    // for these has usually already built the string; it wants the descriptor.
+    win32("RtlInitUnicodeString", 2, [](Emulator& e) {
+        uint64_t out = e.arg_slot(0), src = e.arg_slot(1);
+        if (!out) {
+            e.set_result(0);
+            return;
+        }
+        uint64_t units = src ? utf8_to_utf16(wide_arg(e, src)).size() : 0;
+        e.mem.write16(out, static_cast<uint16_t>(units * 2));
+        e.mem.write16(out + 2, static_cast<uint16_t>((units + 1) * 2));
+        e.mem.write_sized(out + 8, e.pointer_size(), src);
+        e.set_result(0);
+    });
+    win32("RtlCreateUnicodeString", 2, [](Emulator& e) {
+        // Unlike Init, this one *copies* the text into memory of its own.
+        uint64_t out = e.arg_slot(0), src = e.arg_slot(1);
+        if (!out || !src) {
+            e.set_result(0);
+            return;
+        }
+        std::u16string w = utf8_to_utf16(wide_arg(e, src));
+        std::vector<uint8_t> raw((w.size() + 1) * 2, 0);
+        std::memcpy(raw.data(), w.data(), w.size() * 2);
+        uint64_t buf = e.alloc_guest_data(raw.data(), raw.size());
+        e.mem.write16(out, static_cast<uint16_t>(w.size() * 2));
+        e.mem.write16(out + 2, static_cast<uint16_t>((w.size() + 1) * 2));
+        e.mem.write_sized(out + 8, e.pointer_size(), buf);
+        e.set_result(1);
+    });
+    ret0("RtlFreeUnicodeString", 1);
+
+    // The native file interface.  A toolchain that opens files through ntdll
+    // rather than kernel32 is asking for the same thing in a lower-level
+    // spelling: the path arrives as a UNICODE_STRING inside OBJECT_ATTRIBUTES,
+    // in NT namespace form ("\??\C:\dir\file"), and the answer is an NTSTATUS
+    // plus a handle written through a pointer.
+    auto nt_path = [](Emulator& e, uint64_t object_attributes) -> std::string {
+        if (!object_attributes) return {};
+        int ps = e.pointer_size();
+        uint64_t name = e.mem.read_sized(object_attributes + 0x10, ps);
+        if (!name) return {};
+        uint32_t bytes = e.mem.read16(name);
+        uint64_t buf = e.mem.read_sized(name + 8, ps);
+        if (!buf) return {};
+        std::string path = utf16_to_utf8(e, buf, static_cast<int>(bytes / 2));
+        // "\??\" and "\DosDevices\" both introduce a drive-letter path.
+        if (path.compare(0, 4, "\\??\\") == 0) path.erase(0, 4);
+        else if (path.compare(0, 12, "\\DosDevices\\") == 0) path.erase(0, 12);
+
+        // RootDirectory turns the name into a *relative* one - which is how a
+        // guest opens a directory once and then the files inside it, and how
+        // this call ends up looking like it was given only a directory name.
+        uint64_t root = e.mem.read_sized(object_attributes + 8, ps);
+        if (root) {
+            int dir_fd = Emulator::fd_from_handle(root);
+            FileTable::Entry* dir = dir_fd >= 0 ? e.files.get(dir_fd) : nullptr;
+            if (dir && !dir->path.empty()) {
+                std::string base = dir->path;
+                char last = base.back();
+                if (last != '\\' && last != '/') base += '\\';
+                path = base + path;
+            }
+        }
+        return path;
+    };
+    auto nt_open = [nt_path](Emulator& e, bool creating) {
+        constexpr uint32_t kStatusSuccess = 0;
+        constexpr uint32_t kStatusNotFound = 0xC0000034;   // OBJECT_NAME_NOT_FOUND
+        constexpr uint32_t kStatusCollision = 0xC0000035;  // OBJECT_NAME_COLLISION
+        uint64_t handle_out = e.arg_slot(0);
+        // These are 32-bit parameters; the rest of the slot they arrive in holds
+        // whatever was there before, so it has to be masked off.
+        uint32_t access = static_cast<uint32_t>(e.arg_slot(1));
+        std::string path = nt_path(e, e.arg_slot(2));
+        uint64_t status_block = e.arg_slot(3);
+        // NtCreateFile has AllocationSize/FileAttributes/ShareAccess before the
+        // disposition; NtOpenFile has neither and no disposition at all.
+        uint32_t disposition = creating ? static_cast<uint32_t>(e.arg_slot(7)) : 1 /* FILE_OPEN */;
+        uint32_t options = static_cast<uint32_t>(e.arg_slot(creating ? 8 : 5));
+
+        FileTable::OpenFlags f;
+        constexpr uint64_t kReadData = 0x1, kWriteData = 0x2, kAppendData = 0x4;
+        constexpr uint64_t kGenericRead = 0x80000000, kGenericWrite = 0x40000000;
+        f.read = (access & (kReadData | kGenericRead)) != 0;
+        f.write = (access & (kWriteData | kAppendData | kGenericWrite)) != 0;
+        if (!f.read && !f.write) f.read = true;  // an attributes-only open
+        switch (disposition) {
+            case 2: f.create = f.exclusive = f.write = true; break;   // FILE_CREATE
+            case 3: f.create = true; break;                           // FILE_OPEN_IF
+            case 0: case 4: case 5:                                   // SUPERSEDE/OVERWRITE*
+                f.create = f.truncate = f.write = true;
+                break;
+            default: break;                                           // FILE_OPEN
+        }
+        // A directory is opened by name too - FILE_DIRECTORY_FILE says so, and a
+        // guest that asks for one then uses it as OBJECT_ATTRIBUTES.RootDirectory.
+        constexpr uint32_t kDirectoryFile = 0x1;
+        FileTable::Stat st;
+        bool is_directory = (options & kDirectoryFile) != 0 ||
+                            (FileTable::stat_path(path, st) == 0 && st.is_dir);
+        int fd = is_directory ? e.files.open_directory(path) : e.files.open(path, f);
+        e.log_call("NtCreateFile(%s%s, access 0x%X, disposition %u) = %d", path.c_str(),
+                   is_directory ? " [directory]" : "", access, disposition, fd);
+        uint32_t status = kStatusSuccess;
+        if (fd < 0) status = fd == -17 ? kStatusCollision : kStatusNotFound;
+        if (handle_out)
+            e.mem.write_sized(handle_out, e.pointer_size(),
+                              fd < 0 ? 0 : Emulator::handle_from_fd(fd));
+        if (status_block) {
+            e.mem.write32(status_block, status);
+            // Information: which of the disposition's outcomes happened.  1 is
+            // FILE_OPENED, 2 FILE_CREATED; nothing here inspects it closely.
+            e.mem.write_sized(status_block + 8, e.pointer_size(), disposition == 2 ? 2 : 1);
+        }
+        e.set_result(status);
+    };
+    win32("NtCreateFile", 11, [nt_open](Emulator& e) { nt_open(e, true); });
+    win32("ZwCreateFile", 11, [nt_open](Emulator& e) { nt_open(e, true); });
+    win32("NtOpenFile", 6, [nt_open](Emulator& e) { nt_open(e, false); });
+    win32("NtClose", 1, [](Emulator& e) {
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        if (fd >= 3) e.files.close(fd);
+        e.set_result(0);
+    });
+    // (handle, io status, buffer, length, class).  The classes a toolchain asks
+    // about are the ones that decide whether a path is on a local disk and how
+    // big its blocks are; both answers are the same for every file here.
+    win32("NtQueryVolumeInformationFile", 5, [](Emulator& e) {
+        uint64_t status_block = e.arg_slot(1), buf = e.arg_slot(2);
+        uint32_t length = static_cast<uint32_t>(e.arg_slot(3));
+        uint32_t info_class = static_cast<uint32_t>(e.arg_slot(4));
+        constexpr uint32_t kFsDeviceInformation = 4;
+        constexpr uint32_t kFsSizeInformation = 3;
+        constexpr uint32_t kFsAttributeInformation = 5;
+        std::vector<uint8_t> zeros(length, 0);
+        if (buf && length) e.mem.write(buf, zeros.data(), zeros.size());
+        uint64_t written = 0;
+        if (buf && info_class == kFsDeviceInformation && length >= 8) {
+            e.mem.write32(buf, 0x7);       // FILE_DEVICE_DISK
+            e.mem.write32(buf + 4, 0x10);  // FILE_DEVICE_IS_MOUNTED
+            written = 8;
+        } else if (buf && info_class == kFsSizeInformation && length >= 24) {
+            e.mem.write64(buf, 1ull << 24);       // TotalAllocationUnits
+            e.mem.write64(buf + 8, 1ull << 23);   // AvailableAllocationUnits
+            e.mem.write32(buf + 16, 8);           // SectorsPerAllocationUnit
+            e.mem.write32(buf + 20, 512);         // BytesPerSector
+            written = 24;
+        } else if (buf && info_class == kFsAttributeInformation && length >= 16) {
+            e.mem.write32(buf, 0x0000000F);       // case-sensitive search etc.
+            e.mem.write32(buf + 4, 255);          // MaximumComponentNameLength
+            e.mem.write32(buf + 8, 8);            // FileSystemNameLength ("NTFS")
+            const char16_t ntfs[] = u"NTFS";
+            for (int i = 0; i < 4; ++i) e.mem.write16(buf + 12 + i * 2, ntfs[i]);
+            written = 20;
+        }
+        if (status_block) {
+            e.mem.write32(status_block, 0);
+            e.mem.write_sized(status_block + 8, e.pointer_size(), written);
+        }
+        e.set_result(0);
+    });
+    // (handle, io status, buffer, length, class): the per-file queries.  Only the
+    // ones a toolchain uses to size a read are worth answering properly.
+    win32("NtQueryInformationFile", 5, [](Emulator& e) {
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        uint64_t status_block = e.arg_slot(1), buf = e.arg_slot(2);
+        uint32_t length = static_cast<uint32_t>(e.arg_slot(3));
+        uint32_t info_class = static_cast<uint32_t>(e.arg_slot(4));
+        constexpr uint32_t kFileStandardInformation = 5;
+        constexpr uint32_t kFilePositionInformation = 14;
+        FileTable::Stat st;
+        bool have = fd >= 0 && e.files.stat_fd(fd, st) == 0;
+        std::vector<uint8_t> zeros(length, 0);
+        if (buf && length) e.mem.write(buf, zeros.data(), zeros.size());
+        uint64_t written = 0;
+        if (buf && info_class == kFileStandardInformation && length >= 24 && have) {
+            e.mem.write64(buf, st.size);           // AllocationSize
+            e.mem.write64(buf + 8, st.size);       // EndOfFile
+            e.mem.write32(buf + 16, 1);            // NumberOfLinks
+            e.mem.write8(buf + 20, 0);             // DeletePending
+            e.mem.write8(buf + 21, st.is_dir ? 1 : 0);
+            written = 24;
+        } else if (buf && info_class == kFilePositionInformation && length >= 8) {
+            int64_t at = fd >= 0 ? e.files.tell(fd) : 0;
+            e.mem.write64(buf, static_cast<uint64_t>(at < 0 ? 0 : at));
+            written = 8;
+        }
+        if (status_block) {
+            e.mem.write32(status_block, have || written ? 0 : 0xC0000008 /* INVALID_HANDLE */);
+            e.mem.write_sized(status_block + 8, e.pointer_size(), written);
+        }
+        e.set_result(have || written ? 0 : 0xC0000008);
+    });
+    // (handle, event, apc, apc ctx, io status, buffer, length, offset, key)
+    win32("NtReadFile", 9, [](Emulator& e) {
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        uint64_t status_block = e.arg_slot(4), buf = e.arg_slot(5);
+        uint64_t length = static_cast<uint32_t>(e.arg_slot(6));
+        uint64_t offset_ptr = e.arg_slot(7);
+        if (fd < 0) {
+            e.set_result(0xC0000008);
+            return;
+        }
+        int64_t saved = -1;
+        if (offset_ptr) {
+            int64_t want = static_cast<int64_t>(e.mem.read64(offset_ptr));
+            // A negative offset means "use the current position".
+            if (want >= 0) {
+                saved = e.files.tell(fd);
+                e.files.seek(fd, want, 0);
+            }
+        }
+        std::vector<uint8_t> tmp(static_cast<size_t>(length));
+        int64_t got = length ? e.files.read(fd, tmp.data(), length) : 0;
+        if (got > 0) e.mem.write(buf, tmp.data(), static_cast<uint64_t>(got));
+        if (saved >= 0) e.files.seek(fd, saved, 0);
+        constexpr uint32_t kStatusEndOfFile = 0xC0000011;
+        uint32_t status = got > 0 ? 0 : (got == 0 ? kStatusEndOfFile : 0xC0000022);
+        if (status_block) {
+            e.mem.write32(status_block, status);
+            e.mem.write_sized(status_block + 8, e.pointer_size(),
+                              got > 0 ? static_cast<uint64_t>(got) : 0);
+        }
+        e.set_result(status);
+    });
+    win32("NtWriteFile", 9, [](Emulator& e) {
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        uint64_t status_block = e.arg_slot(4), buf = e.arg_slot(5);
+        uint64_t length = static_cast<uint32_t>(e.arg_slot(6));
+        if (fd < 0) {
+            e.set_result(0xC0000008);
+            return;
+        }
+        std::vector<uint8_t> tmp(static_cast<size_t>(length));
+        if (length) e.mem.read(buf, tmp.data(), length);
+        int64_t put = length ? e.files.write(fd, tmp.data(), length) : 0;
+        if (status_block) {
+            e.mem.write32(status_block, put < 0 ? 0xC0000022 : 0);
+            e.mem.write_sized(status_block + 8, e.pointer_size(),
+                              put > 0 ? static_cast<uint64_t>(put) : 0);
+        }
+        e.set_result(put < 0 ? 0xC0000022 : 0);
+    });
+    // (handle, event, apc, apc ctx, io status, buffer, length, class,
+    //  single entry, name filter, restart).  The directory walk in its native
+    //  form: a toolchain looks for a source file this way, so the filter - which
+    //  may be an exact name rather than a wildcard - has to be honoured.
+    win32("NtQueryDirectoryFile", 11, [](Emulator& e) {
+        constexpr uint32_t kStatusNoMoreFiles = 0x80000006;
+        constexpr uint32_t kStatusInvalidHandle = 0xC0000008;
+        constexpr uint32_t kStatusBufferOverflow = 0x80000005;
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        FileTable::Entry* dir = fd >= 0 ? e.files.get(fd) : nullptr;
+        if (!dir || !dir->is_directory) {
+            e.set_result(kStatusInvalidHandle);
+            return;
+        }
+        uint64_t status_block = e.arg_slot(4), buf = e.arg_slot(5);
+        uint32_t length = static_cast<uint32_t>(e.arg_slot(6));
+        uint32_t info_class = static_cast<uint32_t>(e.arg_slot(7));
+        bool single = (e.arg_slot(8) & 0xFF) != 0;
+        uint64_t filter_ptr = e.arg_slot(9);
+        bool restart = (e.arg_slot(10) & 0xFF) != 0;
+
+        std::string filter;
+        if (filter_ptr) {
+            uint32_t bytes = e.mem.read16(filter_ptr);
+            uint64_t text = e.mem.read_sized(filter_ptr + 8, e.pointer_size());
+            if (text) filter = utf16_to_utf8(e, text, static_cast<int>(bytes / 2));
+        }
+        if (filter.empty()) filter = "*";
+
+        // The listing is snapshotted on the first call and walked by a cursor,
+        // the same state getdents64 uses.  A new filter or RestartScan starts over.
+        if (restart || !dir->dir_loaded || dir->dir_filter != filter) {
+            dir->dir_loaded = true;
+            dir->dir_filter = filter;
+            dir->dir_pos = 0;
+            dir->dir_names.clear();
+            dir->dir_types.clear();
+            for (const auto& de : e.list_directory(dir->path + "/" + filter)) {
+                dir->dir_names.push_back(de.name);
+                dir->dir_types.push_back(de.is_dir ? 4 : 8);
+            }
+        }
+
+        // Where the name sits, and the fixed part's size, depend on the class.
+        uint32_t header = 0;
+        switch (info_class) {
+            case 1: header = 0x40; break;   // FileDirectoryInformation
+            case 2: header = 0x44; break;   // FileFullDirectoryInformation
+            case 3: header = 0x5E; break;   // FileBothDirectoryInformation
+            case 12: header = 0x0C; break;  // FileNamesInformation
+            case 37: header = 0x58; break;  // FileIdBothDirectoryInformation
+            default: header = 0x40; break;
+        }
+
+        uint32_t written = 0;
+        uint64_t last_entry = 0;
+        while (dir->dir_pos < dir->dir_names.size()) {
+            const std::string& name = dir->dir_names[dir->dir_pos];
+            std::u16string wide = utf8_to_utf16(name);
+            uint32_t need = header + static_cast<uint32_t>(wide.size() * 2);
+            need = (need + 7) & ~7u;
+            if (written + need > length) {
+                if (!written) {
+                    if (status_block) e.mem.write32(status_block, kStatusBufferOverflow);
+                    e.set_result(kStatusBufferOverflow);
+                    return;
+                }
+                break;
+            }
+            uint64_t entry = buf + written;
+            std::vector<uint8_t> zeros(need, 0);
+            e.mem.write(entry, zeros.data(), zeros.size());
+            FileTable::Stat st;
+            std::string full = dir->path + "/" + name;
+            bool have = FileTable::stat_path(full, st) == 0;
+            uint64_t ticks = have ? (static_cast<uint64_t>(st.mtime) + 11644473600ull) * 10000000ull
+                                  : 0;
+            e.mem.write32(entry + 4, static_cast<uint32_t>(dir->dir_pos));  // FileIndex
+            if (info_class == 12) {
+                e.mem.write32(entry + 8, static_cast<uint32_t>(wide.size() * 2));
+            } else {
+                e.mem.write64(entry + 0x08, ticks);
+                e.mem.write64(entry + 0x10, ticks);
+                e.mem.write64(entry + 0x18, ticks);
+                e.mem.write64(entry + 0x20, ticks);
+                e.mem.write64(entry + 0x28, have ? st.size : 0);
+                e.mem.write64(entry + 0x30, have ? st.size : 0);
+                e.mem.write32(entry + 0x38, dir->dir_types[dir->dir_pos] == 4 ? 0x10u : 0x80u);
+                e.mem.write32(entry + 0x3C, static_cast<uint32_t>(wide.size() * 2));
+            }
+            for (size_t i = 0; i < wide.size(); ++i)
+                e.mem.write16(entry + header + i * 2, wide[i]);
+            if (last_entry) e.mem.write32(last_entry, static_cast<uint32_t>(entry - last_entry));
+            last_entry = entry;
+            written += need;
+            ++dir->dir_pos;
+            if (single) break;
+        }
+        if (last_entry) e.mem.write32(last_entry, 0);  // the list ends here
+
+        uint32_t status = written ? 0 : kStatusNoMoreFiles;
+        if (status_block) {
+            e.mem.write32(status_block, status);
+            e.mem.write_sized(status_block + 8, e.pointer_size(), written);
+        }
+        e.set_result(status);
+    });
+
+    // (attributes, out): the cheap "does this exist" query.
+    win32("NtQueryAttributesFile", 2, [nt_path](Emulator& e) {
+        std::string path = nt_path(e, e.arg_slot(0));
+        FileTable::Stat st;
+        if (FileTable::stat_path(path, st) != 0) {
+            e.set_result(0xC0000034);  // OBJECT_NAME_NOT_FOUND
+            return;
+        }
+        uint64_t out = e.arg_slot(1);
+        if (out) {
+            std::vector<uint8_t> zeros(56, 0);
+            e.mem.write(out, zeros.data(), zeros.size());
+            uint64_t ticks = (static_cast<uint64_t>(st.mtime) + 11644473600ull) * 10000000ull;
+            e.mem.write64(out + 8, ticks);   // CreationTime
+            e.mem.write64(out + 16, ticks);  // LastAccessTime
+            e.mem.write64(out + 24, ticks);  // LastWriteTime
+            e.mem.write64(out + 32, ticks);  // ChangeTime
+            e.mem.write32(out + 40, st.is_dir ? 0x10u : 0x80u);
+        }
+        e.set_result(0);
+    });
+
     // version.dll, which a toolchain *delay-loads* to read a file's version
     // resource.  Reporting "no version information" is a normal answer that
     // callers handle; not being there at all is not - the delay-load helper
@@ -301,6 +760,62 @@ void Emulator::install_cl_hooks() {
     ret0("GetFileVersionInfoA", 4);
     ret0("VerQueryValueW", 4);
     ret0("VerQueryValueA", 4);
+    // The OS-version comparison pair.  VerSetConditionMask packs a condition per
+    // type into a 64-bit mask (3 bits each), and VerifyVersionInfo evaluates the
+    // request against what the emulator claims to be - Windows 10 build 19045.
+    // Answering "yes" to everything would tell a guest it is on a newer Windows
+    // than it is, so the comparison is done properly.
+    win32("VerSetConditionMask", 3, [](Emulator& e) {
+        uint64_t mask = e.arg_slot(0);
+        uint32_t type_bit_mask = static_cast<uint32_t>(e.arg_slot(1));
+        uint32_t condition = static_cast<uint32_t>(e.arg_slot(2)) & 0x7;
+        // The type flags are single bits; each one owns three bits of the mask at
+        // (index of that bit) * 3.
+        for (int i = 0; i < 8; ++i) {
+            if (!(type_bit_mask & (1u << i))) continue;
+            mask &= ~(uint64_t{0x7} << (i * 3));
+            mask |= static_cast<uint64_t>(condition) << (i * 3);
+        }
+        e.set_result(mask);
+    });
+    win32("VerifyVersionInfoW", 4, [](Emulator& e) {
+        // (OSVERSIONINFOEX*, type mask, condition mask).  What the emulator is:
+        constexpr uint32_t kMajor = 10, kMinor = 0, kBuild = 19045;
+        uint64_t info = e.arg_slot(0);
+        uint32_t types = static_cast<uint32_t>(e.arg_slot(1));
+        uint64_t conditions = e.arg_slot(2);
+        if (!info) {
+            e.set_last_error(87);  // ERROR_INVALID_PARAMETER
+            e.set_result(0);
+            return;
+        }
+        // VER_MAJORVERSION 0x2 -> field at +4, MINORVERSION 0x1 -> +8,
+        // BUILDNUMBER 0x4 -> +12, in the order the mask's bits are numbered.
+        struct Check {
+            uint32_t flag;
+            uint64_t offset;
+            uint32_t actual;
+        } checks[] = {{0x1, 8, kMinor}, {0x2, 4, kMajor}, {0x4, 12, kBuild}};
+        bool ok = true;
+        for (const Check& c : checks) {
+            if (!(types & c.flag)) continue;
+            uint32_t wanted = e.mem.read32(info + c.offset);
+            int bit = 0;
+            for (int i = 0; i < 8; ++i)
+                if (c.flag & (1u << i)) bit = i;
+            uint32_t condition = static_cast<uint32_t>((conditions >> (bit * 3)) & 0x7);
+            switch (condition) {
+                case 1: ok = ok && c.actual == wanted; break;   // VER_EQUAL
+                case 2: ok = ok && c.actual > wanted; break;    // VER_GREATER
+                case 3: ok = ok && c.actual >= wanted; break;   // VER_GREATER_EQUAL
+                case 4: ok = ok && c.actual < wanted; break;    // VER_LESS
+                case 5: ok = ok && c.actual <= wanted; break;   // VER_LESS_EQUAL
+                default: break;
+            }
+        }
+        if (!ok) e.set_last_error(1150);  // ERROR_OLD_WIN_VERSION
+        e.set_result(ok ? 1 : 0);
+    });
     // Two more a modern toolchain probes for and can live without; naming them
     // here means GetProcAddress answers NULL rather than a delay-load failing.
     ret0("GetCurrentPackageId", 2);
@@ -580,6 +1095,57 @@ void Emulator::install_cl_hooks() {
         put_wide(e, e.arg_slot(1), text, e.arg_slot(2));
         e.set_result(0);
     });
+    // The bounded integer-to-string family.  (value, buffer, size, radix) for the
+    // narrow ones; _i64toa_s and _ui64toa_s put the 64-bit value first, so the
+    // buffer is one slot further along.
+    auto int_to_string = [](Emulator& e, bool wide, bool wide_value, bool sign) {
+        int slot = 0;
+        int64_t value;
+        if (wide_value)
+            value = static_cast<int64_t>(e.arg_slot(slot++));
+        else
+            value = sign ? static_cast<int32_t>(e.arg_slot(slot++))
+                         : static_cast<int64_t>(static_cast<uint32_t>(e.arg_slot(slot++)));
+        uint64_t buf = e.arg_slot(slot++);
+        uint64_t size = e.arg_slot(slot++);
+        int radix = static_cast<int>(e.arg_slot(slot));
+        if (radix < 2 || radix > 36) radix = 10;
+
+        // Only base 10 is signed; every other base treats the value as unsigned,
+        // which is what the CRT does and what a caller printing a bitmask wants.
+        std::string text;
+        bool negative = sign && radix == 10 && value < 0;
+        uint64_t magnitude = negative ? ~static_cast<uint64_t>(value) + 1
+                                      : static_cast<uint64_t>(value);
+        if (!wide_value && !sign) magnitude &= 0xFFFFFFFFull;
+        do {
+            int digit = static_cast<int>(magnitude % static_cast<uint64_t>(radix));
+            text += static_cast<char>(digit < 10 ? '0' + digit : 'a' + digit - 10);
+            magnitude /= static_cast<uint64_t>(radix);
+        } while (magnitude);
+        if (negative) text += '-';
+        std::reverse(text.begin(), text.end());
+
+        if (!buf || text.size() + 1 > size) {
+            e.set_result(34);  // ERANGE
+            return;
+        }
+        if (wide)
+            put_wide(e, buf, text, size);
+        else
+            e.mem.write_cstring(buf, text);
+        e.set_result(0);
+    };
+    ucrt("_itoa_s", [int_to_string](Emulator& e) { int_to_string(e, false, false, true); });
+    ucrt("_ltoa_s", [int_to_string](Emulator& e) { int_to_string(e, false, false, true); });
+    ucrt("_ultoa_s", [int_to_string](Emulator& e) { int_to_string(e, false, false, false); });
+    ucrt("_i64toa_s", [int_to_string](Emulator& e) { int_to_string(e, false, true, true); });
+    ucrt("_ui64toa_s", [int_to_string](Emulator& e) { int_to_string(e, false, true, false); });
+    ucrt("_ltow_s", [int_to_string](Emulator& e) { int_to_string(e, true, false, true); });
+    ucrt("_ultow_s", [int_to_string](Emulator& e) { int_to_string(e, true, false, false); });
+    ucrt("_i64tow_s", [int_to_string](Emulator& e) { int_to_string(e, true, true, true); });
+    ucrt("_ui64tow_s", [int_to_string](Emulator& e) { int_to_string(e, true, true, false); });
+
     ucrt("_wtoi", [](Emulator& e) {
         e.set_result(static_cast<uint64_t>(static_cast<int64_t>(
             std::strtol(wide_arg(e, e.arg_slot(0)).c_str(), nullptr, 10))));
@@ -691,6 +1257,69 @@ void Emulator::install_cl_hooks() {
         e.set_result(0);
     });
     ucrt("_callnewh", [](Emulator& e) { e.set_result(1); });
+    // (buffer, size, errno): the message for an errno value, bounded.
+    auto strerror_s = [](Emulator& e, bool wide) {
+        uint64_t buf = e.arg_slot(0), size = e.arg_slot(1);
+        const char* text = std::strerror(static_cast<int>(e.arg_slot(2)));
+        std::string message = text ? text : "unknown error";
+        if (!buf || size == 0) {
+            e.set_result(22);  // EINVAL
+            return;
+        }
+        if (wide) {
+            if (put_wide(e, buf, message, size) < 0) {
+                e.set_result(34);  // ERANGE
+                return;
+            }
+        } else {
+            if (message.size() + 1 > size) {
+                e.set_result(34);
+                return;
+            }
+            e.mem.write_cstring(buf, message);
+        }
+        e.set_result(0);
+    };
+    ucrt("strerror_s", [strerror_s](Emulator& e) { strerror_s(e, false); });
+    ucrt("_strerror_s", [strerror_s](Emulator& e) { strerror_s(e, false); });
+    ucrt("_wcserror_s", [strerror_s](Emulator& e) { strerror_s(e, true); });
+    ucrt("__wcserror_s", [strerror_s](Emulator& e) { strerror_s(e, true); });
+    ucrt("_wcserror", [](Emulator& e) {
+        const char* text = std::strerror(static_cast<int>(e.arg_slot(0)));
+        std::u16string w = utf8_to_utf16(text ? text : "unknown error");
+        std::vector<uint8_t> raw((w.size() + 1) * 2, 0);
+        std::memcpy(raw.data(), w.data(), w.size() * 2);
+        e.set_result(e.alloc_guest_data(raw.data(), raw.size()));
+    });
+    // (buffer, relative, size in characters); a NULL buffer means "allocate one".
+    ucrt("_wfullpath", [](Emulator& e) {
+        std::string in = wide_arg(e, e.arg_slot(1));
+        bool absolute = (in.size() > 1 && in[1] == ':') ||
+                        (!in.empty() && (in[0] == '\\' || in[0] == '/'));
+        std::string full = in;
+        if (!absolute) {
+            char cwd[4096];
+#if defined(_WIN32)
+            if (_getcwd(cwd, sizeof cwd)) full = std::string(cwd) + "\\" + in;
+#else
+            if (getcwd(cwd, sizeof cwd)) full = std::string(cwd) + "/" + in;
+#endif
+        }
+        for (char& c : full)
+            if (c == '/') c = '\\';
+        uint64_t buf = e.arg_slot(0);
+        uint64_t size = e.arg_slot(2);
+        if (!buf) {
+            buf = e.heap_alloc((full.size() + 1) * 2);
+            size = full.size() + 1;
+        }
+        if (put_wide(e, buf, full, size) < 0) {
+            e.set_guest_errno(34);  // ERANGE
+            e.set_result(0);
+            return;
+        }
+        e.set_result(buf);
+    });
 
     // ---- UCRT: locale tables -----------------------------------------------------------
     ucrt("_lock_locales", [](Emulator& e) { e.set_result(0); });
@@ -877,6 +1506,37 @@ void Emulator::install_cl_hooks() {
         }
         e.set_result(e.guest_file(fd));
     };
+    // (fd out, path, oflag, shflag, pmode): the descriptor-level open, whose
+    // flags are the POSIX ones rather than a mode string.
+    auto sopen_s = [](Emulator& e, bool wide) {
+        uint64_t fd_out = e.arg_slot(0);
+        std::string path = wide ? wide_arg(e, e.arg_slot(1)) : e.mem.read_cstring(e.arg_slot(1));
+        uint32_t oflag = static_cast<uint32_t>(e.arg_slot(2));
+        constexpr uint32_t kRdOnly = 0x0000, kWrOnly = 0x0001, kRdWr = 0x0002;
+        constexpr uint32_t kAppend = 0x0008, kCreat = 0x0100, kTrunc = 0x0200;
+        constexpr uint32_t kExcl = 0x0400, kText = 0x4000;
+        FileTable::OpenFlags f;
+        uint32_t mode = oflag & 0x3;
+        f.read = mode == kRdOnly || mode == kRdWr;
+        f.write = mode == kWrOnly || mode == kRdWr;
+        f.append = (oflag & kAppend) != 0;
+        f.create = (oflag & kCreat) != 0;
+        f.truncate = (oflag & kTrunc) != 0;
+        f.exclusive = (oflag & kExcl) != 0;
+        f.binary = (oflag & kText) == 0;
+        int fd = e.files.open(path, f);
+        e.log_call("_sopen_s(%s, oflag 0x%X) = %d", path.c_str(), oflag, fd);
+        if (fd < 0) {
+            e.report_file_error(fd);
+            if (fd_out) e.mem.write32(fd_out, 0xFFFFFFFFu);
+            e.set_result(static_cast<uint64_t>(-fd));  // the errno itself
+            return;
+        }
+        if (fd_out) e.mem.write32(fd_out, static_cast<uint32_t>(fd));
+        e.set_result(0);
+    };
+    ucrt("_sopen_s", [sopen_s](Emulator& e) { sopen_s(e, false); });
+    ucrt("_wsopen_s", [sopen_s](Emulator& e) { sopen_s(e, true); });
     ucrt("_fsopen", [fsopen](Emulator& e) { fsopen(e, false); });
     ucrt("_wfsopen", [fsopen](Emulator& e) { fsopen(e, true); });
     ucrt("_wfopen_s", [fsopen](Emulator& e) {
@@ -978,26 +1638,40 @@ void Emulator::install_cl_hooks() {
     };
     ucrt("_wcslwr_s", [wcs_case](Emulator& e) { wcs_case(e, false); });
     ucrt("_wcsupr_s", [wcs_case](Emulator& e) { wcs_case(e, true); });
-    auto isw_class = [](Emulator& e, int kind) {
+    // The wide classification family.  Only ASCII is classified: a real answer
+    // for the rest needs Unicode tables, and claiming one without them would be
+    // a guess a guest cannot tell from the truth.  Characters above 127 are
+    // reported as letters, which is what a compiler tokenising an identifier
+    // needs and what MSVC's own "any non-ASCII is an identifier character"
+    // behaviour amounts to.
+    auto isw_class = [](Emulator& e, int (*fn)(int), bool letters_above_ascii) {
         uint32_t c = static_cast<uint32_t>(e.arg_slot(0));
-        bool r = false;
-        switch (kind) {
-            case 0: r = (c < 128) && std::isalnum(static_cast<int>(c)); break;
-            case 1: r = (c < 128) && std::isdigit(static_cast<int>(c)); break;
-            case 2: r = (c < 128) && std::isspace(static_cast<int>(c)); break;
-            case 3: r = (c < 128) && std::isxdigit(static_cast<int>(c)); break;
-            case 4: r = (c < 128) && std::isalpha(static_cast<int>(c)); break;
-            case 5: r = (c < 128) && std::isprint(static_cast<int>(c)); break;
-            default: break;
-        }
+        bool r;
+        if (c < 128)
+            r = fn(static_cast<int>(c)) != 0;
+        else
+            r = letters_above_ascii;
         e.set_result(r ? 1 : 0);
     };
-    ucrt("iswalnum", [isw_class](Emulator& e) { isw_class(e, 0); });
-    ucrt("iswdigit", [isw_class](Emulator& e) { isw_class(e, 1); });
-    ucrt("iswspace", [isw_class](Emulator& e) { isw_class(e, 2); });
-    ucrt("iswxdigit", [isw_class](Emulator& e) { isw_class(e, 3); });
-    ucrt("iswalpha", [isw_class](Emulator& e) { isw_class(e, 4); });
-    ucrt("iswprint", [isw_class](Emulator& e) { isw_class(e, 5); });
+    auto isw = [&](const char* name, int (*fn)(int), bool letters_above_ascii = false) {
+        ucrt(name, [isw_class, fn, letters_above_ascii](Emulator& e) {
+            isw_class(e, fn, letters_above_ascii);
+        });
+    };
+    isw("iswalnum", [](int c) { return std::isalnum(c); }, true);
+    isw("iswalpha", [](int c) { return std::isalpha(c); }, true);
+    isw("iswdigit", [](int c) { return std::isdigit(c); });
+    isw("iswspace", [](int c) { return std::isspace(c); });
+    isw("iswxdigit", [](int c) { return std::isxdigit(c); });
+    isw("iswprint", [](int c) { return std::isprint(c); }, true);
+    isw("iswupper", [](int c) { return std::isupper(c); });
+    isw("iswlower", [](int c) { return std::islower(c); });
+    isw("iswpunct", [](int c) { return std::ispunct(c); });
+    isw("iswcntrl", [](int c) { return std::iscntrl(c); });
+    isw("iswgraph", [](int c) { return std::isgraph(c); }, true);
+    isw("iswblank", [](int c) { return c == ' ' || c == '\t' ? 1 : 0; });
+    isw("__iswcsymf", [](int c) { return std::isalpha(c) || c == '_' ? 1 : 0; }, true);
+    isw("__iswcsym", [](int c) { return std::isalnum(c) || c == '_' ? 1 : 0; }, true);
     ucrt("towlower", [](Emulator& e) {
         uint64_t c = e.arg_slot(0);
         e.set_result(c >= 'A' && c <= 'Z' ? c + 32 : c);
@@ -1029,6 +1703,63 @@ void Emulator::install_cl_hooks() {
     ucrt("wcscat_s", [wcs_copy](Emulator& e) { wcs_copy(e, true, false); });
     ucrt("wcsncpy_s", [wcs_copy](Emulator& e) { wcs_copy(e, false, true); });
     ucrt("wcsncat_s", [wcs_copy](Emulator& e) { wcs_copy(e, true, true); });
+
+    // The narrow bounded forms, same shape: (dst, dst size, src[, count]).  They
+    // return 0 on success and ERANGE when the destination is too small, and a
+    // caller that checks - this toolchain does - notices the difference.
+    auto str_copy = [](Emulator& e, bool cat, bool bounded) {
+        uint64_t dst = e.arg_slot(0);
+        uint64_t capacity = e.arg_slot(1);
+        std::string src = e.mem.read_cstring(e.arg_slot(2));
+        if (bounded) {
+            uint64_t count = e.arg_slot(3);
+            if (src.size() > count) src.resize(static_cast<size_t>(count));
+        }
+        std::string result = cat ? e.mem.read_cstring(dst) + src : src;
+        if (!dst || result.size() + 1 > capacity) {
+            e.set_result(34);  // ERANGE
+            return;
+        }
+        e.mem.write_cstring(dst, result);
+        e.set_result(0);
+    };
+    ucrt("strcpy_s", [str_copy](Emulator& e) { str_copy(e, false, false); });
+    ucrt("strcat_s", [str_copy](Emulator& e) { str_copy(e, true, false); });
+    ucrt("strncpy_s", [str_copy](Emulator& e) { str_copy(e, false, true); });
+    ucrt("strncat_s", [str_copy](Emulator& e) { str_copy(e, true, true); });
+    // (dst, dst size, src, count)
+    ucrt("memcpy_s", [](Emulator& e) {
+        uint64_t dst = e.arg_slot(0), capacity = e.arg_slot(1);
+        uint64_t src = e.arg_slot(2), count = e.arg_slot(3);
+        if (!count) {
+            e.set_result(0);
+            return;
+        }
+        if (!dst || count > capacity) {
+            e.set_result(34);  // ERANGE
+            return;
+        }
+        std::vector<uint8_t> tmp(static_cast<size_t>(count));
+        e.mem.read(src, tmp.data(), count);
+        e.mem.write(dst, tmp.data(), count);
+        e.set_result(0);
+    });
+    ucrt("memmove_s", [](Emulator& e) {
+        uint64_t dst = e.arg_slot(0), capacity = e.arg_slot(1);
+        uint64_t src = e.arg_slot(2), count = e.arg_slot(3);
+        if (!count) {
+            e.set_result(0);
+            return;
+        }
+        if (!dst || count > capacity) {
+            e.set_result(34);
+            return;
+        }
+        std::vector<uint8_t> tmp(static_cast<size_t>(count));
+        e.mem.read(src, tmp.data(), count);
+        e.mem.write(dst, tmp.data(), count);
+        e.set_result(0);
+    });
     ucrt("wcspbrk", [](Emulator& e) {
         std::string set = wide_arg(e, e.arg_slot(1));
         uint64_t p = e.arg_slot(0);
@@ -1075,6 +1806,35 @@ void Emulator::install_cl_hooks() {
             e.mem.write16(p + 10, 0);  // timezone
             e.mem.write16(p + 12, 0);  // dstflag
         }
+        e.set_result(0);
+    });
+    // (buffer, size, const __time64_t*): the bounded ctime, 26 characters
+    // including the newline and the terminator.
+    ucrt("_ctime64_s", [](Emulator& e) {
+        uint64_t buf = e.arg_slot(0), size = e.arg_slot(1);
+        if (!buf || size < 26) {
+            e.set_result(22);  // EINVAL
+            return;
+        }
+        auto t = static_cast<time_t>(e.mem.read64(e.arg_slot(2)));
+        const char* s = std::ctime(&t);
+        e.mem.write_cstring(buf, s ? s : "Thu Jan  1 00:00:00 1970\n");
+        e.set_result(0);
+    });
+    ucrt("_localtime64_s", [](Emulator& e) {
+        // (struct tm* out, const __time64_t* in)
+        uint64_t out = e.arg_slot(0);
+        auto t = static_cast<time_t>(e.mem.read64(e.arg_slot(1)));
+        std::tm* tm = std::localtime(&t);
+        if (!out || !tm) {
+            e.set_result(22);
+            return;
+        }
+        const int fields[9] = {tm->tm_sec,  tm->tm_min,  tm->tm_hour,
+                               tm->tm_mday, tm->tm_mon,  tm->tm_year,
+                               tm->tm_wday, tm->tm_yday, tm->tm_isdst};
+        for (int i = 0; i < 9; ++i)
+            e.mem.write32(out + static_cast<uint64_t>(i) * 4, static_cast<uint32_t>(fields[i]));
         e.set_result(0);
     });
     ucrt("rand_s", [](Emulator& e) {

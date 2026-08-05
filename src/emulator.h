@@ -272,6 +272,12 @@ public:
     // Guest memory standing in for an imported CRT *variable* (__argc,
     // _environ, _iob...), or 0 if the symbol is not one of those.
     uint64_t data_import(const std::string& symbol);
+    // Makes `alias` resolve to the same implementation as `existing`.  The CRT
+    // ships several functions twice - `fwrite` and `_fwrite_nolock` differ only
+    // in taking the stream's lock, which is nothing to take while one guest
+    // thread runs at a time - and this says that plainly instead of copying a
+    // body.  Returns false if `existing` is not registered.
+    bool alias_hook(const std::string& existing, const std::string& alias);
     // A stand-in HMODULE for a library the emulator implements rather than loads.
     uint64_t hooked_module_handle(const std::string& name);
 
@@ -344,6 +350,10 @@ public:
     // reusing an address exhausts the mmap window mid-compilation.
     // `alignment` must be a power of two; VirtualAlloc needs 64 KiB.
     uint64_t alloc_pages(uint64_t size, uint64_t alignment = 0x1000);
+    // Claims an address range without creating its pages, for a guest that
+    // reserves address space and commits parts of it later.  Nothing else will
+    // be handed out inside it.
+    uint64_t reserve_pages(uint64_t size, uint64_t alignment);
     // Returns an mmap()ed range, dropping its pages.
     void free_pages(uint64_t addr, uint64_t size);
     // The Linux program break; set_brk returns the value after the request.

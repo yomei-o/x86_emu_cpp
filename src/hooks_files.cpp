@@ -107,7 +107,9 @@ void Emulator::install_file_hooks() {
         int fd = e.host_fd(e.arg_slot(0));
         e.set_result(fd < 0 ? 0xFFFFFFFFull : static_cast<uint64_t>(e.files.close(fd) == 0 ? 0 : -1));
     });
-    libc("fread", [](Emulator& e) {
+    // fread, and the "_nolock" form a caller uses when it already holds the
+    // stream's lock: the same function while one guest thread runs at a time.
+    auto do_fread = [](Emulator& e) {
         uint64_t buf = e.arg_slot(0), size = e.arg_slot(1), count = e.arg_slot(2);
         int fd = e.host_fd(e.arg_slot(3));
         uint64_t total = size * count;
@@ -119,6 +121,25 @@ void Emulator::install_file_hooks() {
         int64_t got = e.files.read(fd, tmp.data(), total);
         if (got > 0) e.mem.write(buf, tmp.data(), static_cast<uint64_t>(got));
         // fread reports whole items, not bytes.
+        e.set_result(got <= 0 || size == 0 ? 0 : static_cast<uint64_t>(got) / size);
+    };
+    libc("fread", do_fread);
+    libc("_fread_nolock", do_fread);
+    // fread_s takes the destination's size as its second argument and shifts the
+    // rest along; the bound is what it adds, and reading less is always safe.
+    libc("fread_s", [do_fread](Emulator& e) {
+        uint64_t buf = e.arg_slot(0), capacity = e.arg_slot(1);
+        uint64_t size = e.arg_slot(2), count = e.arg_slot(3);
+        int fd = e.host_fd(e.arg_slot(4));
+        uint64_t total = size * count;
+        if (total > capacity) total = capacity;
+        if (fd < 0 || total == 0) {
+            e.set_result(0);
+            return;
+        }
+        std::vector<uint8_t> tmp(static_cast<size_t>(total));
+        int64_t got = e.files.read(fd, tmp.data(), total);
+        if (got > 0) e.mem.write(buf, tmp.data(), static_cast<uint64_t>(got));
         e.set_result(got <= 0 || size == 0 ? 0 : static_cast<uint64_t>(got) / size);
     });
     libc("fgetc", [](Emulator& e) {
@@ -455,6 +476,19 @@ void Emulator::install_file_hooks() {
     };
     win32("GetFileAttributesA", 1, [file_attributes](Emulator& e) { file_attributes(e, false); });
     win32("GetFileAttributesW", 1, [file_attributes](Emulator& e) { file_attributes(e, true); });
+
+    // Every stdio function the CRT also ships in a "_nolock" form, which a
+    // caller uses when it already holds the stream's lock.  With one guest
+    // thread running at a time the lock is the only difference, so the two are
+    // the same implementation under two names - said once here rather than
+    // duplicated at each definition.
+    for (const char* name : {"fread", "fwrite", "fflush", "fclose", "fgetc", "fputc",
+                             "fgets", "fputs", "fseek", "ftell", "ungetc", "getc",
+                             "putc", "fgetwc", "fputwc", "rewind", "_fseeki64",
+                             "_ftelli64", "fsetpos", "fgetpos"}) {
+        alias_hook(name, "_" + std::string(name) + "_nolock");
+        if (name[0] == '_') alias_hook(name, std::string(name) + "_nolock");
+    }
 }
 
 }  // namespace x86emu
