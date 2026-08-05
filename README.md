@@ -43,6 +43,8 @@ Verified by diffing emulated output against real native execution, byte for byte
 | Linux threads (`clone`, `futex`) — a glibc `pthread` program | — | ✅ |
 | **mingw-w64 `gcc` compiling and linking a program** | — | ✅ |
 | **Alpine `as` and `ld` (musl, dynamically linked) building a binary** | — | ✅ |
+| **C++ exceptions**: throw, unwind through destructors, rethrow, catch-all | ✅ | ✅ |
+| C's `__try`/`__except`/`__finally` (`__C_specific_handler`) | — | ✅ |
 
 Two of those deserve spelling out, because they are the whole point of having
 processes:
@@ -341,6 +343,7 @@ emulator built for the current host and prints which host that was.
 | `src/hooks_win32b.cpp` | synchronisation, directories, handles, paths, setjmp |
 | `src/hooks_win32c.cpp` | what the Visual C++ toolchain needs: the UCRT's wide-character dialect, file mappings, thread pools |
 | `src/hooks_process.cpp` | `CreateProcess`, pipes, process handles |
+| `src/exceptions.cpp` | the unwinder: `.pdata`/`.xdata` on x64, the `fs:[0]` chain on x86 |
 | `src/processes.{h,cpp}` | the process table and the scheduler over it |
 | `src/threads.cpp` | guest threads, the scheduler, and waitable objects |
 | `src/guest_printf.cpp` | the printf engine and UTF-16 conversion |
@@ -367,11 +370,18 @@ misbehaving quietly.
   true 80-bit extended values, so a computation carried out entirely in extended
   precision on real hardware can differ in its last bits. Loads and stores of an
   80-bit memory operand do convert exactly.
-- **No SEH or C++ exception unwinding.** Installing a handler is fine; actually
-  throwing is not (`tests/msvc/exc_msvc.cpp` is the test waiting for it). This is
-  the single thing standing between the emulator and `cl.exe`: Microsoft's
-  compiler throws during its own initialisation, so it never reaches `main`.
-  Everything else it imports is implemented (`src/hooks_win32c.cpp`).
+- **C++ with the runtime in a DLL (`/MD`) does not work.** Its language half -
+  `_CxxThrowException`, `__CxxFrameHandler4`, and `std::cout` itself - lives in
+  `vcruntime140.dll` and `msvcp140.dll`. Those DLLs now load and run for real
+  (`-L` the redistributable directory), which is progress, but the iostream
+  objects are still never constructed. `/MT`, where the same code is linked into
+  the image, works fully - exceptions included.
+- **`cl.exe` starts but will not compile.** Microsoft's compiler now runs far
+  enough to load its localised resource DLL and print its version banner, usage
+  and error messages; given any argument it reports `D8000 unknown command line
+  error` from a path that reads a few undocumented environment variables and
+  gives up, before it ever opens the source file. So some hook is answering
+  something it does not accept. `link.exe` is untried until then.
 - **`gcc` works; `cc1` from a Linux distribution does not, yet.** The mingw
   toolchain compiles and links end to end, and Alpine's `as` and `ld` do too, but
   Alpine's `cc1` gets through parsing and RTL expansion and then faults on a null

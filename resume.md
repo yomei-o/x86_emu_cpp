@@ -7,13 +7,15 @@ emulator *is*; this describes what is unfinished and what is known about it.
 
 Everything below is verified by diffing emulated output against native execution,
 byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
-37 tests):
+40 tests):
 
 - x86-32 and x86-64 integer, SSE/SSE2, x87
 - PE32/PE32+ and ELF32/ELF64 loading; real DLLs with relocation, exports,
   forwarders, `DllMain`, static TLS; ELF dynamic linking through the real `ld.so`
 - libc, math, files, Win32, UCRT hooks across three ABIs
 - threads on both OSes (Windows `CreateThread`, Linux `clone` + a real `futex`)
+- **C++ and SEH exception handling on x86 and x64**, against Microsoft's runtime
+  and mingw's
 - **processes on both OSes**: `CreateProcess` + pipes, `fork`/`execve`/`wait4`
 - **a stock CPython 3.13 for Windows runs its own standard library**
 - **mingw-w64 `gcc` compiles and links inside the emulator**, producing a binary
@@ -58,31 +60,94 @@ emulator.
   resource, which reconfigured GCC's garbage collector; `fflush` not flushing the
   guest's own buffer.
 
-The remaining work is breadth, not architecture, with two exceptions named below:
-x64 exception unwinding (for `cl.exe`) and whatever is wrong in the RTL path (for
-a distro `cc1`).
+## Done 2026-08-05 (later): exceptions, and cl.exe starts
 
-## Next: the two things actually blocked
+**Throwing works** (`src/exceptions.cpp`), on both bitnesses and against two
+independent language runtimes. The design is the same split real Windows uses:
+the emulator supplies the kernel's half and the guest's own runtime the
+language's half.
 
-### 1. `cl.exe` needs x64 exception unwinding
+- x64: the PE loader exposes the exception directory; `RtlVirtualUnwind`
+  interprets `UNWIND_INFO` (every unwind code, chained entries, frame registers,
+  and codes whose prologue offset has not been reached yet, so a throw from
+  inside a prologue unwinds correctly). `RaiseException` walks frames calling
+  each language handler; `RtlUnwindEx` runs the second pass.
+  `__C_specific_handler` (C's `__try`/`__except`/`__finally`) is here too.
+- x86: the `fs:[0]` registration chain, walked directly.
+- **The two things that were not obvious**, both of which cost real time:
+  - `STATUS_UNWIND_CONSOLIDATE` (**0x80000029**, a warning-level status, not
+    0xC000...) is what actually runs a C++ catch block on x64. MSVC's handler
+    does not call the catch; it raises this code from the unwinder with a
+    callback in parameter 0, and the unwinder must call that callback once the
+    frames are gone and continue at the address it returns. Without it
+    everything unwound correctly and then resumed *after* the catch: the program
+    printed nothing and exited 0. A disassembly of `_UnwindNestedFrames` is what
+    identified it - look for `lea rax,[callback]` stored into a local record
+    whose `ExceptionInformation` also holds the EH magic `0x19930520`.
+  - A handler that accepts **never returns**. Control goes back into its own
+    function, so the emulator's nested interpreter loop keeps running the guest
+    until the program ends. Leaving that nest is a host C++ throw
+    (`UnwindTransfer`) caught in `run_slice`; on the 32-bit path, where the guest
+    performs the jump itself, the tell is simply that the guest has halted by the
+    time `call_guest` returns.
+- Verified against native execution: `tests/msvc/bin/exc_msvc_MT32` and `MT64`
+  (no longer excluded), and `tests/hosted/except.cpp` built with mingw - an
+  independent language half - covering destructors through three frames,
+  rethrow and catch-all.
 
-Everything Microsoft's compiler imports is implemented (`src/hooks_win32c.cpp`:
-the UCRT's wide-character half, file mappings, synchronous thread pools,
-`_wspawnv` which runs its `_P_WAIT` child through `System::run_until_exit`). It
-still never reaches `main`, because it *throws* during initialisation and lands
-on `RtlPcToFileHeader`, which reports honestly that unwinding is not emulated.
+**`cl.exe` starts.** It loads its localised resource DLL and prints its version
+banner, usage and diagnostics. Getting there needed the resource directory
+(`FindResource`/`LoadResource` over the real three-level tree), loading a DLL
+named by full path, mapping a resource-only DLL (no relocation directory, so
+either its preferred base or - since nothing in it uses an absolute address -
+anywhere), and `SetThreadPreferredUILanguages`/`Get...` remembering what the
+guest set, defaulting to the host's UI language so a Japanese install finds 1041
+and an English one 1033. Also: `GetSystemInfo` was leaving
+`dwAllocationGranularity` zero and cl divides by it.
 
-So this is the SEH work, and it is worth doing for its own sake:
+That last fix has a bonus: **a DLL's dependencies are now searched for beside
+it**, so CPython's `_hashlib.pyd` finds the OpenSSL it links against and the
+smoke test's SHA-256 comes from real `libcrypto-3.dll` code running inside the
+emulator - still byte-identical to native.
 
-- x64: walk `.pdata`/`.xdata` (`RUNTIME_FUNCTION` → `UNWIND_INFO`), run the
-  prologue's unwind codes backwards to recover the caller's context, and call the
-  language handler (`__CxxFrameHandler3`/`4` for C++, `__C_specific_handler` for
-  SEH) at each frame until one accepts.
-- x86: the `fs:[0]` handler chain, which is much simpler and is what the 32-bit
-  MSVC tests need.
-- `tests/msvc/exc_msvc.cpp` is built and excluded, waiting for exactly this.
+## Next: the three things actually blocked
 
-### 2. A distribution `cc1` faults in the first RTL pass
+### 1. `cl.exe` rejects any command line
+
+Given any argument at all it prints `D8000 : unknown command line error` (the
+generic one) and exits 2; with no arguments it prints the usage banner and exits
+0. So the option parser is reached and something it depends on answers wrongly.
+
+What is known:
+
+- The failing path is short and localised. After `__p___wargv` and `__p___argc`
+  (both verified correct - the trace prints the arguments), it calls
+  `EventRegister`, `InitializeCriticalSection`, `SetConsoleCtrlHandler`,
+  `setlocale`, `SetErrorMode`, `_wdupenv_s`, `_get_wpgmptr`, `_wsplitpath_s`,
+  `wcscat_s`, `_wcsdup`, and reads `MPCL_SERVER_<digits>`,
+  `PRINT_HRESULT_ON_FAIL` and `_CL_DEBUGBREAK` - then goes straight into the
+  error-reporting path. It never opens the source file, and no unimplemented
+  import is called, and nothing throws.
+- `MPCL_SERVER_<n>` is the multi-processor compiler server handshake, read three
+  times. Worth investigating whether cl expects to *be* or to *find* a server,
+  and what it does with the answer.
+- `PRINT_HRESULT_ON_FAIL=1` is read but produced no extra output.
+- `--trace-calls` now logs every environment variable a guest reads and what it
+  got, which is how the above was found. Diffing the *hook sequence* of a
+  working run (no arguments) against a failing one is what localised it; that
+  technique is cheap and worth reaching for first.
+
+### 2. C++ with the runtime in a DLL (`/MD`)
+
+`msvcp140.dll` and `vcruntime140.dll` now load and *run* for real when `-L`
+points at the redistributable directory
+(`VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT`), which is new. `cpp_msvc_MD64` gets
+into msvcp140's own code and reads a null pointer at `0x1800097D6`; the iostream
+objects are still not constructed. The trail starts with what msvcp140's
+initialisation calls that we answer with zero - `_get_current_locale` and
+`_create_locale` both return NULL today, which is a lie a real CRT never tells.
+
+### 3. A distribution `cc1` faults in the first RTL pass
 
 Given a sysroot of unpacked Alpine packages, that distribution's `as` and `ld`
 run perfectly; its `cc1` does not. It gets *far*: `-version`, preprocessing (`-E`), an
@@ -391,8 +456,9 @@ target is really wanted.
 
 ## Also unfinished
 
-- **C++ and SEH exception unwinding.** See "the two things actually blocked"
-  above: this is what `cl.exe` needs, and `tests/msvc/exc_msvc.cpp` waits for it.
+- **32-bit `__try`/`__except` in C code** (`_except_handler4_common`, the
+  security-cookie variant MSVC generates). The 32-bit C++ path works; this one
+  is still a stub.
 - **`_popen`/`_wsystem` and a shell.** Both fail cleanly (a guest that wants a
   pipe to a *command* needs a shell to interpret it, and there is none). A guest
   using them for a compiler driver would need `cmd.exe`-style parsing, or an
@@ -405,10 +471,9 @@ target is really wanted.
 - **A `SIGCHLD`-driven guest.** Signals are never delivered; `wait4` works by
   blocking. A guest that installs a `SIGCHLD` handler and expects to be
   interrupted would wait forever.
-- **`msvcp140.dll` and `/MD` C++.** The DLL loads and its `DllMain` runs, but
-  `std::cout` is never constructed, so `tests/msvc/cpp_msvc_MD*` are excluded
-  from the suite. `/MT` works fully. Not investigated; the trail starts with the
-  `_initterm` calls made from that DLL's initialisation.
+- **`msvcp140.dll` and `/MD` C++** — see "the three things actually blocked"
+  above; the DLL runs for real now, which is further than these notes used to
+  describe.
 - **AVX.** `CPUID` deliberately does not advertise it, so nothing uses it. A guest
   built with `-march=native` on a modern machine would need it.
 - **Performance.** A plain decode-and-execute switch, roughly 3.6 s for
@@ -421,7 +486,7 @@ target is really wanted.
 
 ```sh
 sh build.sh                    # or cmake -B build && cmake --build build
-sh tests/run_tests.sh          # 37 tests; PYTHON=... to point at an interpreter
+sh tests/run_tests.sh          # 40 tests; PYTHON=... to point at an interpreter
 EMU=/path/to/other/x86emu sh tests/run_tests.sh   # test a different build
 sh tests/run_cross.sh          # every guest under one build, reporting the host
 ```
