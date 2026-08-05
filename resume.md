@@ -112,54 +112,63 @@ emulator - still byte-identical to native.
 
 ## Next: the three things actually blocked
 
-### 1. `cl.exe` rejects any command line
+### 1. `cl.exe` runs `c1.dll` and faults in its allocator
 
-Given any argument at all it prints `D8000 : unknown command line error` (the
-generic one) and exits 2; with no arguments it prints the usage banner and exits
-0. So the option parser is reached and something it depends on answers wrongly.
+It now processes its command line, prints the source file name exactly as the
+real one does, loads **c1.dll** — the actual compiler front end — and runs it.
+Where it stops:
 
-What is known:
+```
+c1.dll+0x5ED70:  mov [rax+8], rdi     ; rax = 0x000006BB00000000, unmapped
+```
 
-- The failing path is short and localised. After `__p___wargv` and `__p___argc`
-  (both verified correct - the trace prints the arguments), it calls
-  `EventRegister`, `InitializeCriticalSection`, `SetConsoleCtrlHandler`,
-  `setlocale`, `SetErrorMode`, `_wdupenv_s`, `_get_wpgmptr`, `_wsplitpath_s`,
-  `wcscat_s`, `_wcsdup`, and reads `MPCL_SERVER_<digits>`,
-  `PRINT_HRESULT_ON_FAIL` and `_CL_DEBUGBREAK` - then goes straight into the
-  error-reporting path. It never opens the source file, and no unimplemented
-  import is called, and nothing throws.
-- `MPCL_SERVER_<n>` is the multi-processor compiler server handshake, read three
-  times. Worth investigating whether cl expects to *be* or to *find* a server,
-  and what it does with the answer.
-- `PRINT_HRESULT_ON_FAIL=1` is read but produced no extra output.
-- `--trace-calls` now logs every environment variable a guest reads and what it
-  got, which is how the above was found. Diffing the *hook sequence* of a
-  working run (no arguments) against a failing one is what localised it; that
-  technique is cheap and worth reaching for first.
+`rax` is the return value of `c1.dll+0x43830`, c1's own allocator, whose fast
+path returns its argument and whose slow path calls `c1.dll+0x1FEB0`. The value
+has the shape of something built from a wrong half — the low 32 bits are zero and
+0x6BB sits in the high half — so the next step is to find which allocation
+primitive that arena is built on (`HeapAlloc`, `VirtualAlloc`, or a callback into
+cl.exe: the stack at the fault shows `__main__+0xCADE0` between the two c1
+frames) and what our hook hands it.
 
-**Ruled out** - do not spend time on these again:
+**How it got this far**, which is the part worth remembering: three hooks were
+answering plausibly and lying.
 
-- *Option parsing.* It works. Logging `wcsncmp`'s arguments shows cl comparing
-  `help` against its option table by prefix, fifty entries of it, with correct
-  answers; `wcsncmp` is the only comparison function it uses.
-- *The option table itself.* The 300,000 instructions before the error are cl
-  building a hash map of options (bucket masking, load-factor `divss`, list
-  splicing at `0x140013300`) - normal work, not a spin.
-- *`argv`.* `__p___wargv` hands over exactly the right strings; the trace prints
-  them. Passing the program with backslashes instead of forward slashes changes
-  nothing.
-- *The message lookup.* `FindResource(type 6, name 501)` succeeds - bundle 501 is
-  string ids 8000-8015, so cl really did choose D8000 rather than failing to find
-  D8003's text. `X86EMU_TRACE_RESOURCE=501` dumps the instruction history at that
-  lookup, but 300k entries of history still do not reach back to the decision;
-  the next attempt should instead find the *caller* of the error-reporting
-  function by reading the stack at that moment.
+- `CryptAcquireContextW` returned success without writing `*phProv`. cl checked
+  the handle, found zero and reported `D8000 unknown command line error` — for
+  *any* argument, which is exactly what made this look like an option-parsing bug
+  for a whole session. **An out parameter left unwritten is the quietest way for
+  a hook to lie**, and worth auditing across the others.
+- `VirtualAlloc` returned page-aligned memory; Windows aligns to the 64 KiB
+  allocation granularity, and an arena allocator that masks low bits to find its
+  base builds a wild pointer from anything less.
+- `version.dll`'s `GetFileVersionInfo*` did not exist. A toolchain *delay-loads*
+  them, and a missing procedure makes the delay-load helper raise `0xC06D007F`,
+  which cl reports as "internal compiler error" naming nothing. `GetProcAddress`
+  now logs the names it cannot find, which is how that was traced back.
 
-Native cl for comparison: `-nologo`, `-c` and `-nonsenseoption` all end in
-`D8003 : source file not found` (plus a `D9002` warning for the bad option), and
-`-help` prints the option list. So the divergence is cl choosing 8000 where the
-real one chooses 8003 - an internal error code with no D-number, produced before
-it looks at the file list.
+What was ruled out along the way (do not spend time on these again):
+
+- *Option parsing, `argv`, the option table.* All correct. cl matches by prefix
+  with `wcsncmp` (fifty entries, right answers), `__p___wargv` hands over exactly
+  the right strings, and the 300,000 instructions before the old error were cl
+  building a hash map of its options - normal work, not a spin.
+- *The message lookup.* `FindResource(type 6, name 501)` succeeded all along;
+  bundle 501 is string ids 8000-8015, so cl really had chosen D8000 rather than
+  failing to find another message's text.
+
+Two techniques did all the work here, in this order:
+
+1. **Diff the hook sequence** of a run that works against one that fails.
+2. **Read the stack at the moment the guest reports an error**, which names the
+   function that decided. `X86EMU_TRACE_RESOURCE=<string id>` prints
+   `stack_trace()` and the instruction history when a given string resource is
+   looked up; from there, disassembling the caller showed
+   `xor ecx,ecx; call report_error` - literally "report error code 0" - and the
+   branch into it was `cmpq $0,[global]; jne`, the global being the handle
+   `CryptAcquireContextW` had never written.
+
+For comparison, native cl answers `D8003 : source file not found` for `-nologo`,
+`-c` and `-nonsenseoption`, and prints the option list for `-help`.
 
 ### 2. C++ with the runtime in a DLL (`/MD`)
 

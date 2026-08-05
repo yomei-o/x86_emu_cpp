@@ -376,12 +376,10 @@ misbehaving quietly.
   (`-L` the redistributable directory), which is progress, but the iostream
   objects are still never constructed. `/MT`, where the same code is linked into
   the image, works fully - exceptions included.
-- **`cl.exe` starts but will not compile.** Microsoft's compiler now runs far
-  enough to load its localised resource DLL and print its version banner, usage
-  and error messages; given any argument it reports `D8000 unknown command line
-  error` from a path that reads a few undocumented environment variables and
-  gives up, before it ever opens the source file. So some hook is answering
-  something it does not accept. `link.exe` is untried until then.
+- **`cl.exe` gets as far as running `c1.dll`.** Microsoft's compiler processes its
+  command line, prints the source file name as the real one does, loads its
+  localised resources and its compiler front end `c1.dll`, and then faults inside
+  c1's own arena allocator. `link.exe` is untried until that clears.
 - **`gcc` works; `cc1` from a Linux distribution does not, yet.** The mingw
   toolchain compiles and links end to end, and Alpine's `as` and `ld` do too, but
   Alpine's `cc1` gets through parsing and RTL expansion and then faults on a null
