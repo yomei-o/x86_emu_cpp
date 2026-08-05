@@ -110,6 +110,43 @@ it**, so CPython's `_hashlib.pyd` finds the OpenSSL it links against and the
 smoke test's SHA-256 comes from real `libcrypto-3.dll` code running inside the
 emulator - still byte-identical to native.
 
+## The layering question, and the experiment that would settle it
+
+Worth writing down because it comes up every time: *why hook the C runtime at all,
+rather than only the layer below it?*
+
+For a **statically linked** CRT that is exactly what happens already. A `/MT`
+MSVC program, a static musl or glibc program, CPython's own bundled runtime - all
+of them run their real library code as guest instructions, and the emulator only
+answers at the bottom: kernel32 and a handful of ntdll calls on Windows, raw
+syscalls on Linux. `iswupper` in those guests is the guest's own code.
+
+Hooking is forced only when the guest **imports the CRT from a DLL** (`/MD`),
+because then its import table names `api-ms-win-crt-string-l1-1-0.dll!iswupper`
+and something has to answer. Two ways out, and the trade is the point:
+
+1. *Hook it*, as now. Cheap, fast (the host's `snprintf` does the formatting,
+   which is also why float output matches byte for byte), and it keeps the guest
+   away from the NT layer entirely. The cost is a wide, shallow surface - this
+   session added dozens of `_s` variants - and every hook is a chance to lie.
+2. *Load the real `ucrtbase.dll`*. **An x64 one exists on this machine**:
+   `C:\Program Files (x86)\Windows Kits\10\Redist\10.0.22621.0\ucrt\DLLs\x64\ucrtbase.dll`
+   (System32's is ARM64 and useless here). Dropping `ucrtbase` and
+   `api-ms-win-` from `is_system_library()` and pointing `-L` at that directory
+   is a five-minute experiment.
+
+The reason (2) has not been done is that `ucrtbase` talks to **ntdll's internals**,
+not to kernel32: `RtlAllocateHeap`, `NtQueryInformationProcess`, the loader lock,
+PEB fields, `LdrLoadDll`. That is the NT-kernel boundary this project has
+deliberately not emulated, and it is a much deeper surface than the CRT's. The
+same reasoning is why the boundary is *not* fixed: `vcruntime140.dll` moved from
+hooked to loaded-for-real this session, because its exception ABI cannot be
+hooked at all. Each library goes below the line when hooking it stops working.
+
+If (2) is tried, the honest test is the existing `/MD` suite -
+`tests/msvc/bin/*_MD*` - diffed against native, and the first thing to watch is
+how far `DllMain` gets before it wants something from ntdll.
+
 ## Next: the three things actually blocked
 
 ### 1. `cl.exe` reaches `tbbmalloc` and faults there
