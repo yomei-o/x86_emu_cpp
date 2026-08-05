@@ -7,7 +7,7 @@ emulator *is*; this describes what is unfinished and what is known about it.
 
 Everything below is verified by diffing emulated output against native execution,
 byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
-40 tests):
+41 checks):
 
 - x86-32 and x86-64 integer, SSE/SSE2, x87
 - PE32/PE32+ and ELF32/ELF64 loading; real DLLs with relocation, exports,
@@ -21,6 +21,9 @@ byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
 - **mingw-w64 `gcc` compiles and links inside the emulator**, producing a binary
   byte-identical to the one it produces natively
 - **Alpine's `as` and `ld` (dynamically linked, musl) build a working binary**
+- **MSVC `cl.exe` compiles and `link.exe` links, inside the emulator**, and the
+  object file is byte-identical to a native build apart from its timestamp
+  (`sh tests/toolchain/run_msvc.sh`)
 
 ## Done 2026-08-05 (processes, threads, compilers)
 
@@ -173,86 +176,86 @@ changes behaviour only on machines where that file happens to be findable, so a
 guest that ships its own `ucrtbase.dll` - some Python distributions do - would
 have silently stopped printing.
 
-## Next: the three things actually blocked
+## Done 2026-08-05 (last): the MSVC toolchain end to end
 
-### 1. `cl.exe` reaches `tbbmalloc` and faults there
+`cl.exe -c hello.c` produces an object byte-identical to a native build, and
+`cl.exe hello.c` spawns `link.exe` as a child process and produces a working
+executable. Seven bugs stood between "cl starts" and that, and every one of them
+was a hook that returned something plausible instead of something true. They are
+worth reading as a set, because the shape repeats:
 
-It processes its command line, prints the source file name exactly as the real
-one does, loads **c1.dll**, and c1 opens `hello.c`, enumerates the directory to
-find it, hashes bytes for a temporary name, reserves and commits its arenas, and
-loads `mspdbcore.dll`, `msvcp140_atomic_wait.dll` and **`tbbmalloc.dll`** —
-Intel's scalable allocator — before faulting inside that last one:
+1. **`wcstol` never wrote its end pointer.** c2.dll calls
+   `wcstol(arg, &end, 0)` on numeric options and then dereferences `end` to check
+   the whole argument was consumed; it read a stale stack slot as a pointer. The
+   whole wide `strto*` family now shares one implementation that counts *code
+   units* consumed, since the end pointer has to land in the guest's UTF-16
+   string and a UTF-8 round trip loses the correspondence.
+2. **`SRWLOCK` is one pointer, and we used two.** The old code kept a recursion
+   count in the word *after* the lock. `SRWLOCK_INIT` is a static zero and a guest
+   may never call `InitializeSRWLock`, so that second word held whatever the guest
+   had put there — the release path decremented a large number, never reached
+   zero, never cleared the owner, and every other thread spun forever. Everything
+   now fits in the one word: 0 free, `(tid << 1) | 1` exclusive, `count << 1`
+   shared.
+3. **`OpenSemaphoreW` and friends answered "yes, it exists" to everything.** A
+   guest uses that failure to decide it is the first process here and to do the
+   initialisation. There is now a per-process name table, so `CreateXxx` with a
+   name returns the existing object with `ERROR_ALREADY_EXISTS` and `OpenXxx`
+   fails when nothing created it.
+4. **No CNG hashing at all.** `GetProcAddress(BCryptOpenAlgorithmProvider)` found
+   nothing, so cl silently omitted the `.chks64` section — the object came out one
+   section and two symbols short with no diagnostic anywhere. `src/digest.h` now
+   has real MD5, SHA-1 and SHA-256 (checked against the published vectors) behind
+   both the CryptoAPI and BCrypt entry points. The old CryptoAPI hashing returned
+   FNV noise, which was fine for deriving a temporary file name and wrong the
+   moment the digest became part of the output.
+5. **`CreateFile` opened files in text mode.** `f.binary` was never set, so with
+   newline translation on for Windows guests every binary file a Windows guest
+   read through the Win32 API lost a byte per CRLF — silently, and only in the
+   middle of large ones. `link.exe` reported `LIBCMT.lib` as a corrupt library,
+   which is exactly what a static library with bytes missing from the middle is.
+   The NT layer had the same omission.
+6. **`strncpy_s` treated `_TRUNCATE` as a length.** `_TRUNCATE` is `(size_t)-1`
+   and means the opposite of a length: "copy whatever fits and tell me you
+   truncated". Reading it as a length made every such call overflow the capacity
+   check and return `ERANGE`, and a failing `strncpy_s` leaves the destination
+   untouched — so the caller read whatever was in its buffer before. link copies
+   archive member names this way, and a garbage member name is reported as
+   `LNK1127: the library is corrupt`.
+7. **Views of a mapped file were never written back.** link does not write its
+   output with `WriteFile` at all: it maps a view over the new executable, builds
+   the whole image in memory, and unmaps. With `UnmapViewOfFile` as a stub that
+   returned success, every link produced a zero-byte `.exe` and reported no error,
+   because from the linker's point of view nothing had failed. `SetEndOfFile` was
+   a no-op too, so the file kept the view's slack.
 
-```
-<tbbmalloc or the module above it>+0x5834AD:  writes to 0x340AA1E30, unmapped
-```
+Two more were about encodings rather than lies:
 
-Two theories were tested and are *not* it: the address does not come from `rdi`
-(which held our heap base), and moving the heap next to the image so that
-32-bit-relative pointer compression can reach it changed nothing (the fault
-address stayed byte-identical). So the wild pointer is computed from something
-else inside the allocator.
+- **Four stdio hooks resolved a stream and then wrote to `fd == 2 ? 2 : 1`
+  anyway.** cl writes the linker's response file with `fputws`, so the file came
+  out empty and its contents appeared in *our* output. There is now one
+  `Emulator::write_stream`, and no hook that takes a stream resolves it by hand.
+- **Wide stdio ignored the stream's encoding.** cl writes the response file with
+  `fputws` on a *binary* stream, where MSVC emits the wide characters unchanged,
+  and link reads it back with `ccs=unicode`. The two only agree if both halves are
+  UTF-16. `FileTable::WideIo` now records what a stream puts on disk, parsed from
+  the `ccs=` in the mode string, and `fputws`/`fgetws`/`fwprintf` honour it.
 
-Where to look next: tbbmalloc asks the system about memory in ways nothing else
-here does — `VirtualAlloc` with `MEM_TOP_DOWN`, large pages, `GetSystemInfo`'s
-granularity, `GetLogicalProcessorInformation` — and our answers to those are
-either absent or a guess. Logging every allocation call it makes and comparing
-the arithmetic it does on the results is the way in. Also worth trying:
-`cl -Bt+` or setting `TBB_MALLOC_DISABLE_REPLACEMENT=1`, since a compiler that
-falls back to the plain heap would sidestep the whole thing and prove the rest of
-the pipeline.
+Plus one missing instruction pair: `PEXTRW`/`PINSRW` (`66 0F C5` / `66 0F C4`),
+the only SSE2 instructions that move a *word* between the general and xmm
+register files, which is why a compiler reaches for them when packing a PE header
+field.
 
-**How it got this far**, which is the part worth remembering: hook after hook was
-answering plausibly and lying, and each one was found by running it and reading
-the failure rather than by guessing.
+**What this says about testing.** None of the first seven produced a crash or a
+message. A compiler with a subtly wrong hook exits 0 and writes a slightly
+different file, so the only test that finds these is one that compares the
+*output artifact* against a native build — `tests/toolchain/run_msvc.sh`. Byte
+comparison against a real toolchain is worth more here than any number of
+programs that print things.
 
-- `CryptAcquireContextW` returned success without writing `*phProv`. cl checked
-  the handle, found zero and reported `D8000 unknown command line error` — for
-  *any* argument, which is exactly what made this look like an option-parsing bug
-  for a whole session. **An out parameter left unwritten is the quietest way for
-  a hook to lie**, and worth auditing across the others.
-- `VirtualAlloc` returned page-aligned memory; Windows aligns to the 64 KiB
-  allocation granularity, and an arena allocator that masks low bits to find its
-  base builds a wild pointer from anything less.
-- `version.dll`'s `GetFileVersionInfo*` did not exist. A toolchain *delay-loads*
-  them, and a missing procedure makes the delay-load helper raise `0xC06D007F`,
-  which cl reports as "internal compiler error" naming nothing. `GetProcAddress`
-  now logs the names it cannot find, which is how that was traced back.
-- The **native file API** was missing entirely (`NtCreateFile` and the rest); a
-  toolchain opens files that way. Two details there cost time: the ULONG
-  parameters have to be masked out of the 64-bit slots they arrive in, and a
-  directory path arrives with a trailing separator that Windows' `stat()`
-  refuses.
-- `vcruntime140.dll` is no longer treated as a system library. It owns the
-  *language* half of exception handling, which no hook can stand in for, so it
-  has to be the real DLL - and that works now that the unwinder is real. Supply
-  it with `-L .../VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT`.
+## Next: the two things actually blocked
 
-What was ruled out along the way (do not spend time on these again):
-
-- *Option parsing, `argv`, the option table.* All correct. cl matches by prefix
-  with `wcsncmp` (fifty entries, right answers), `__p___wargv` hands over exactly
-  the right strings, and the 300,000 instructions before the old error were cl
-  building a hash map of its options - normal work, not a spin.
-- *The message lookup.* `FindResource(type 6, name 501)` succeeded all along;
-  bundle 501 is string ids 8000-8015, so cl really had chosen D8000 rather than
-  failing to find another message's text.
-
-Two techniques did all the work here, in this order:
-
-1. **Diff the hook sequence** of a run that works against one that fails.
-2. **Read the stack at the moment the guest reports an error**, which names the
-   function that decided. `X86EMU_TRACE_RESOURCE=<string id>` prints
-   `stack_trace()` and the instruction history when a given string resource is
-   looked up; from there, disassembling the caller showed
-   `xor ecx,ecx; call report_error` - literally "report error code 0" - and the
-   branch into it was `cmpq $0,[global]; jne`, the global being the handle
-   `CryptAcquireContextW` had never written.
-
-For comparison, native cl answers `D8003 : source file not found` for `-nologo`,
-`-c` and `-nonsenseoption`, and prints the option list for `-help`.
-
-### 2. C++ with the runtime in a DLL (`/MD`)
+### 1. C++ with the runtime in a DLL (`/MD`)
 
 `msvcp140.dll` and `vcruntime140.dll` now load and *run* for real when `-L`
 points at the redistributable directory
@@ -283,7 +286,7 @@ Worth knowing before going further: msvcp140 was built against the real
 Some of this may be unreachable without loading a real UCRT too, which is a
 bigger decision than it looks (see "Windows is effectively already done" below).
 
-### 3. A distribution `cc1` faults in the first RTL pass
+### 2. A distribution `cc1` faults in the first RTL pass
 
 Given a sysroot of unpacked Alpine packages, that distribution's `as` and `ld`
 run perfectly; its `cc1` does not. It gets *far*: `-version`, preprocessing (`-E`), an
@@ -672,10 +675,24 @@ so **rebuild and recommit it whenever `src/` changes**.
    `X86EMU_TRACE_RESOURCE=<id>` dumps the same history when it looks up a given
    string resource, which is how to find the code that chose an error message.
 7. `--trace` — every instruction. Only for the last few hundred.
+8. `X86EMU_TRACE_OPEN=1` — every path the guest opens, which answers "did it even
+   look for that file?" in one line.
+9. `X86EMU_KEEP_TEMP=1` — hex-dumps a temporary file as the guest deletes it. A
+   toolchain that talks to itself through response files destroys the evidence on
+   the way out, and this is the only way to read what one process actually handed
+   the next. It is how the empty response file turned up.
 
 For a guest that prints its own diagnostics, use them: `PYTHONVERBOSE=2` was what
 finally located CPython's import failure, and CPython's own traceback identified
 the `getpath` line number.
+
+### The one artifact worth comparing
+
+For any guest that *produces a file* rather than printing, build the same input
+with the real tool and diff the two outputs. A compiler, assembler or linker with
+a wrong hook does not crash: it exits 0 and writes something slightly different.
+Every bug in the MSVC bring-up was invisible to "did it succeed?" and obvious to
+"is the object identical?".
 
 ### The lesson worth keeping
 

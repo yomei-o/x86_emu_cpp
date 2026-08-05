@@ -42,12 +42,35 @@ Verified by diffing emulated output against real native execution, byte for byte
 | Linux processes (`fork`, `execve`, `pipe`, `wait4`) | — | ✅ |
 | Linux threads (`clone`, `futex`) — a glibc `pthread` program | — | ✅ |
 | **mingw-w64 `gcc` compiling and linking a program** | — | ✅ |
+| **MSVC `cl.exe` + `link.exe` building a program, byte-identical output** | — | ✅ |
 | **Alpine `as` and `ld` (musl, dynamically linked) building a binary** | — | ✅ |
 | **C++ exceptions**: throw, unwind through destructors, rethrow, catch-all | ✅ | ✅ |
 | C's `__try`/`__except`/`__finally` (`__C_specific_handler`) | — | ✅ |
 
-Two of those deserve spelling out, because they are the whole point of having
-processes:
+Three of those deserve spelling out, because they are the whole point of having
+processes.
+
+**The Visual Studio toolchain**, which is the hardest guest here: `cl.exe` loads
+`c1.dll` and `c2.dll`, reads the source, hashes it, writes an object file, then
+writes a response file and spawns `link.exe` as a child process to produce the
+executable.
+
+```console
+$ ./x86emu "$MSVC/bin/Hostx64/x64/cl.exe" -nologo hello.c
+hello.c
+$ ./x86emu hello.exe
+hello from cl
+```
+
+The object file it emits is **byte-for-byte identical** to what the same `cl.exe`
+produces natively, apart from the timestamp in the COFF header - which differs
+between any two builds, including two native ones. `tests/toolchain/run_msvc.sh`
+checks exactly that, and it is the most useful test in the tree: a compiler with
+a subtly wrong hook does not crash, it quietly emits a slightly different object.
+The missing `.chks64` section that revealed we had no CNG hashing at all would
+have gone unnoticed by any test that only asked whether the compile succeeded.
+
+**mingw-w64 gcc**:
 
 ```console
 $ ./x86emu /c/prog/w64devkit/bin/gcc.exe hello.c -o hello.exe
@@ -63,8 +86,8 @@ address space, talking through inherited handles and temporary files. The
 executable that comes out is identical to the one the same toolchain builds
 natively.
 
-The Linux side does the same through `fork`/`execve`, with `--sysroot` pointing
-at a directory of unpacked Alpine packages:
+**The Linux side** does the same through `fork`/`execve`, with `--sysroot`
+pointing at a directory of unpacked Alpine packages:
 
 ```console
 $ ./x86emu --sysroot alpine/root alpine/root/usr/bin/as -o main.o main.s
@@ -264,6 +287,7 @@ sh tests/dll/build.sh           # a program plus a DLL, for the loader
 tests\msvc\build.bat            # Visual Studio 2022 (Windows only)
 sh tests/linux/build.sh         # gcc targeting x86 Linux, run on a Linux host
 sh tests/run_tests.sh
+sh tests/toolchain/run_msvc.sh  # builds with the emulated cl.exe; needs VS
 ```
 
 ```
@@ -279,6 +303,13 @@ ELF guests (emulated output vs. recorded expectation)
 
 17 passed, 0 failed
 ```
+
+`tests/toolchain/run_msvc.sh` runs separately from the rest (it needs a Visual
+Studio installation, and skips itself without one) and asks a different question:
+it builds a program with the emulated `cl.exe` and with the native one, and
+compares the two object files. Output diffing catches a guest that prints the
+wrong thing; this catches a guest that *produces* the wrong thing, which a
+compiler does silently.
 
 Where a guest can also run natively, the check is a byte-for-byte diff against
 real execution — the strongest signal available, and the reason the test programs
@@ -376,10 +407,10 @@ misbehaving quietly.
   (`-L` the redistributable directory), which is progress, but the iostream
   objects are still never constructed. `/MT`, where the same code is linked into
   the image, works fully - exceptions included.
-- **`cl.exe` gets as far as running `c1.dll`.** Microsoft's compiler processes its
-  command line, prints the source file name as the real one does, loads its
-  localised resources and its compiler front end `c1.dll`, and then faults inside
-  c1's own arena allocator. `link.exe` is untried until that clears.
+- **The MSVC toolchain works for C; C++ through it is untried.** `cl.exe` and
+  `link.exe` build a C program end to end and the object matches a native build
+  byte for byte, but only the C front end has been exercised. Anything that pulls
+  in `msvcp140.dll` runs into the `/MD` limitation above.
 - **`gcc` works; `cc1` from a Linux distribution does not, yet.** The mingw
   toolchain compiles and links end to end, and Alpine's `as` and `ld` do too, but
   Alpine's `cc1` gets through parsing and RTL expansion and then faults on a null
