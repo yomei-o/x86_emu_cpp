@@ -112,26 +112,36 @@ emulator - still byte-identical to native.
 
 ## Next: the three things actually blocked
 
-### 1. `cl.exe` runs `c1.dll` and faults in its allocator
+### 1. `cl.exe` reaches `tbbmalloc` and faults there
 
-It now processes its command line, prints the source file name exactly as the
-real one does, loads **c1.dll** — the actual compiler front end — and runs it.
-Where it stops:
+It processes its command line, prints the source file name exactly as the real
+one does, loads **c1.dll**, and c1 opens `hello.c`, enumerates the directory to
+find it, hashes bytes for a temporary name, reserves and commits its arenas, and
+loads `mspdbcore.dll`, `msvcp140_atomic_wait.dll` and **`tbbmalloc.dll`** —
+Intel's scalable allocator — before faulting inside that last one:
 
 ```
-c1.dll+0x5ED70:  mov [rax+8], rdi     ; rax = 0x000006BB00000000, unmapped
+<tbbmalloc or the module above it>+0x5834AD:  writes to 0x340AA1E30, unmapped
 ```
 
-`rax` is the return value of `c1.dll+0x43830`, c1's own allocator, whose fast
-path returns its argument and whose slow path calls `c1.dll+0x1FEB0`. The value
-has the shape of something built from a wrong half — the low 32 bits are zero and
-0x6BB sits in the high half — so the next step is to find which allocation
-primitive that arena is built on (`HeapAlloc`, `VirtualAlloc`, or a callback into
-cl.exe: the stack at the fault shows `__main__+0xCADE0` between the two c1
-frames) and what our hook hands it.
+Two theories were tested and are *not* it: the address does not come from `rdi`
+(which held our heap base), and moving the heap next to the image so that
+32-bit-relative pointer compression can reach it changed nothing (the fault
+address stayed byte-identical). So the wild pointer is computed from something
+else inside the allocator.
 
-**How it got this far**, which is the part worth remembering: three hooks were
-answering plausibly and lying.
+Where to look next: tbbmalloc asks the system about memory in ways nothing else
+here does — `VirtualAlloc` with `MEM_TOP_DOWN`, large pages, `GetSystemInfo`'s
+granularity, `GetLogicalProcessorInformation` — and our answers to those are
+either absent or a guess. Logging every allocation call it makes and comparing
+the arithmetic it does on the results is the way in. Also worth trying:
+`cl -Bt+` or setting `TBB_MALLOC_DISABLE_REPLACEMENT=1`, since a compiler that
+falls back to the plain heap would sidestep the whole thing and prove the rest of
+the pipeline.
+
+**How it got this far**, which is the part worth remembering: hook after hook was
+answering plausibly and lying, and each one was found by running it and reading
+the failure rather than by guessing.
 
 - `CryptAcquireContextW` returned success without writing `*phProv`. cl checked
   the handle, found zero and reported `D8000 unknown command line error` — for
@@ -145,6 +155,15 @@ answering plausibly and lying.
   them, and a missing procedure makes the delay-load helper raise `0xC06D007F`,
   which cl reports as "internal compiler error" naming nothing. `GetProcAddress`
   now logs the names it cannot find, which is how that was traced back.
+- The **native file API** was missing entirely (`NtCreateFile` and the rest); a
+  toolchain opens files that way. Two details there cost time: the ULONG
+  parameters have to be masked out of the 64-bit slots they arrive in, and a
+  directory path arrives with a trailing separator that Windows' `stat()`
+  refuses.
+- `vcruntime140.dll` is no longer treated as a system library. It owns the
+  *language* half of exception handling, which no hook can stand in for, so it
+  has to be the real DLL - and that works now that the unwinder is real. Supply
+  it with `-L .../VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT`.
 
 What was ruled out along the way (do not spend time on these again):
 
