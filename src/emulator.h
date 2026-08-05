@@ -203,6 +203,10 @@ public:
     GuestThread* current_thread();
     // Creates a thread that will call `start` with `argument`; returns its handle.
     uint64_t create_thread(uint64_t start, uint64_t argument, uint64_t stack_size);
+    // Linux clone(CLONE_VM|CLONE_THREAD): the child is a copy of the current
+    // context that resumes right after the syscall with RAX = 0, on `stack`,
+    // with fs = `tls` if given.  Returns the new thread's id.
+    uint32_t clone_thread(uint64_t stack, uint64_t tls, uint64_t clear_child_tid);
     void exit_thread(uint32_t exit_code);
     // Gives up the rest of this thread's slice.  Hooks that block call this after
     // recording what they are waiting for.

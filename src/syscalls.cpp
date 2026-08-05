@@ -8,11 +8,14 @@
 #include <ctime>
 #include <string>
 #include <vector>
-#if !defined(_WIN32)
-#include <unistd.h>  // getcwd, for the Linux/emscripten host
+#if defined(_WIN32)
+#include <direct.h>  // _chdir, _getcwd
+#else
+#include <unistd.h>  // getcwd/chdir, for the Linux/emscripten host
 #endif
 
 #include "emulator.h"
+#include "processes.h"
 
 namespace x86emu {
 namespace {
@@ -30,6 +33,8 @@ enum class Sys {
     ArchPrctl, SetTidAddress, RtSigaction, RtSigprocmask, SetThreadArea,
     Mprotect, Madvise, Futex, GetRandom, Readlink, Openat, SetRobustList,
     Prlimit64, GetIds, SchedGetaffinity, Ignored, NotImplemented,
+    Fork, Vfork, Execve, Wait4, Kill, Pipe, Pipe2, Clone, Getppid, SchedYield,
+    Chdir, Fchdir,
 };
 
 Sys map_x86_64(uint64_t nr) {
@@ -76,6 +81,18 @@ Sys map_x86_64(uint64_t nr) {
         case 228: return Sys::ClockGettime;
         case 231: return Sys::ExitGroup;
         case 72: return Sys::Fcntl;
+        case 22: return Sys::Pipe;
+        case 293: return Sys::Pipe2;
+        case 24: return Sys::SchedYield;
+        case 56: return Sys::Clone;
+        case 57: return Sys::Fork;
+        case 58: return Sys::Vfork;
+        case 59: return Sys::Execve;
+        case 61: return Sys::Wait4;
+        case 62: return Sys::Kill;
+        case 80: return Sys::Chdir;
+        case 81: return Sys::Fchdir;
+        case 110: return Sys::Getppid;
         case 217: return Sys::Getdents64;
         case 257: return Sys::Openat;
         case 262: return Sys::Newfstatat;
@@ -118,6 +135,19 @@ Sys map_i386(uint64_t nr) {
         case 38: return Sys::Rename;
         case 41: return Sys::Dup;
         case 63: return Sys::Dup2;
+        case 2: return Sys::Fork;
+        case 190: return Sys::Vfork;
+        case 11: return Sys::Execve;
+        case 7: return Sys::Wait4;    // waitpid: same shape, no rusage
+        case 114: return Sys::Wait4;
+        case 37: return Sys::Kill;
+        case 42: return Sys::Pipe;
+        case 331: return Sys::Pipe2;
+        case 120: return Sys::Clone;
+        case 64: return Sys::Getppid;
+        case 12: return Sys::Chdir;
+        case 133: return Sys::Fchdir;
+        case 158: return Sys::SchedYield;
         case 93: return Sys::Ftruncate;
         case 106: return Sys::Stat;
         case 107: return Sys::Lstat;
@@ -149,9 +179,18 @@ Sys map_i386(uint64_t nr) {
 constexpr int64_t kENOSYS = -38;
 constexpr int64_t kENOTTY = -25;
 constexpr int64_t kEBADF = -9;
+constexpr int64_t kEAGAIN = -11;
 
 void host_write(Emulator& e, int fd, const std::string& data) {
     e.write_raw(fd, data.data(), data.size());
+}
+
+int64_t host_chdir(const std::string& path) {
+#if defined(_WIN32)
+    return _chdir(path.c_str()) == 0 ? 0 : -2;  // ENOENT
+#else
+    return ::chdir(path.c_str()) == 0 ? 0 : -2;
+#endif
 }
 
 #include "syscalls_files.inc"
@@ -188,6 +227,15 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         case Sys::Read: {
             std::vector<uint8_t> tmp(static_cast<size_t>(a[2]));
             int64_t got = a[2] ? e.files.read(static_cast<int>(a[0]), tmp.data(), a[2]) : 0;
+            if (got == kEAGAINPipe) {
+                // An empty pipe with a live writer: block this thread and run
+                // the syscall again when bytes or end-of-file arrive.
+                auto end = e.files.get(static_cast<int>(a[0]))->pipe_end;
+                e.block_syscall_retry([end] {
+                    return !end->pipe->buffer.empty() || end->pipe->writers <= 0;
+                });
+                return kEAGAINPipe;  // never written back; the retry answers
+            }
             if (got > 0) e.mem.write(a[1], tmp.data(), static_cast<uint64_t>(got));
             return got;
         }
@@ -238,12 +286,179 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             return 0;
         case Sys::Brk:
             return static_cast<int64_t>(e.set_brk(a[0]));
-        case Sys::Exit:
+        case Sys::Exit: {
+            // exit() ends the calling *thread*; exit_group ends the process.
+            // With one thread they are the same thing.
+            Emulator::GuestThread* t = e.current_thread();
+            if (t && e.threads().size() > 1) {
+                if (t->clear_child_tid) {
+                    // CLONE_CHILD_CLEARTID: pthread_join waits on this word.
+                    e.mem.write32(t->clear_child_tid, 0);
+                }
+                e.exit_thread(static_cast<uint32_t>(a[0]));
+                return 0;
+            }
+            e.exit_process(static_cast<int>(static_cast<int32_t>(a[0])));
+            return 0;
+        }
         case Sys::ExitGroup:
             e.exit_process(static_cast<int>(static_cast<int32_t>(a[0])));
             return 0;
         case Sys::Getpid:
-            return 4242;
+            return e.pid();
+        case Sys::Getppid: {
+            if (!e.system()) return 1;
+            System::Process* p = e.system()->find(e.pid());
+            return p ? p->ppid : 1;
+        }
+        case Sys::SchedYield:
+            e.yield_now();
+            return 0;
+        case Sys::Fork:
+        case Sys::Vfork: {
+            if (!e.system()) return kENOSYS;
+            std::unique_ptr<Emulator> child = e.fork_clone();
+            int pid = e.system()->adopt(std::move(child), e.pid());
+            if (sys == Sys::Vfork) {
+                // vfork suspends the parent until the child execs or exits.
+                System* s = e.system();
+                Emulator::GuestThread* t = e.current_thread();
+                if (t) {
+                    t->state = Emulator::GuestThread::State::Blocked;
+                    t->wait_predicate = [s, pid] { return s->exec_done_or_zombie(pid); };
+                    e.yield_now();
+                }
+            }
+            if (e.options().trace_calls)
+                std::fprintf(stderr, "[sys] %s -> pid %d\n",
+                             sys == Sys::Vfork ? "vfork" : "fork", pid);
+            return pid;
+        }
+        case Sys::Clone: {
+            // clone(flags, stack, parent_tid, child_tid, tls) on x86-64; the
+            // last two arguments trade places on i386.
+            uint64_t flags = a[0], stack = a[1], parent_tid = a[2];
+            uint64_t child_tid = e.is64() ? a[3] : a[4];
+            uint64_t tls = e.is64() ? a[4] : a[3];
+            constexpr uint64_t kVm = 0x100, kVfork = 0x4000, kThread = 0x10000;
+            constexpr uint64_t kSettls = 0x80000, kParentSettid = 0x100000;
+            constexpr uint64_t kChildCleartid = 0x200000, kChildSettid = 0x1000000;
+
+            if ((flags & kVm) && (flags & kThread)) {
+                // A thread: same address space, new stack, new TLS.  Raw clone
+                // semantics - the child resumes right here with RAX = 0.
+                uint32_t tid = e.clone_thread(stack, (flags & kSettls) ? tls : 0,
+                                              (flags & kChildCleartid) ? child_tid : 0);
+                if (flags & kParentSettid) e.mem.write32(parent_tid, tid);
+                if (flags & kChildSettid) e.mem.write32(child_tid, tid);
+                if (e.options().trace_calls)
+                    std::fprintf(stderr, "[sys] clone(thread) -> tid %u\n", tid);
+                return tid;
+            }
+            // A process.  CLONE_VM without CLONE_VFORK cannot be honoured with
+            // a copied address space, but CLONE_VFORK's suspend-until-exec means
+            // the parent never looks at the (unshared) memory in between - which
+            // is exactly posix_spawn's pattern.
+            if (!e.system()) return kENOSYS;
+            std::unique_ptr<Emulator> child = e.fork_clone();
+            if (stack) child->cpu().regs[RSP] = stack;
+            int pid = e.system()->adopt(std::move(child), e.pid());
+            if (flags & kVfork) {
+                System* s = e.system();
+                Emulator::GuestThread* t = e.current_thread();
+                if (t) {
+                    t->state = Emulator::GuestThread::State::Blocked;
+                    t->wait_predicate = [s, pid] { return s->exec_done_or_zombie(pid); };
+                    e.yield_now();
+                }
+            }
+            if (e.options().trace_calls)
+                std::fprintf(stderr, "[sys] clone(process, flags 0x%llx) -> pid %d\n",
+                             (unsigned long long)flags, pid);
+            return pid;
+        }
+        case Sys::Execve: {
+            std::string path = e.mem.read_cstring(a[0]);
+            int ps = e.pointer_size();
+            std::vector<std::string> argv;
+            for (uint64_t p = a[1]; p; p += ps) {
+                uint64_t s = e.mem.read_sized(p, ps);
+                if (!s) break;
+                argv.push_back(e.mem.read_cstring(s));
+            }
+            std::vector<std::pair<std::string, std::string>> env;
+            for (uint64_t p = a[2]; p; p += ps) {
+                uint64_t s = e.mem.read_sized(p, ps);
+                if (!s) break;
+                std::string entry = e.mem.read_cstring(s);
+                size_t eq = entry.find('=');
+                if (eq != std::string::npos && eq > 0)
+                    env.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+            }
+            if (argv.empty()) argv.push_back(path);
+            if (e.options().trace_calls)
+                std::fprintf(stderr, "[sys] execve(%s)\n", path.c_str());
+            Emulator::ExecRequest req;
+            req.path = FileTable::host_path(path);
+            req.argv = std::move(argv);
+            req.env = std::move(env);
+            e.request_exec(std::move(req));
+            return 0;  // on success this thread never sees the return value
+        }
+        case Sys::Wait4: {
+            // (pid, status*, options, rusage)
+            if (!e.system()) return kENOSYS;
+            System* s = e.system();
+            int want = static_cast<int>(static_cast<int32_t>(a[0]));
+            int self = e.pid();
+            System::Process* z = s->zombie_child(self, want <= 0 ? -1 : want);
+            if (!z) {
+                if (!s->has_children(self)) return -10;  // ECHILD
+                if (a[2] & 1) return 0;                  // WNOHANG
+                e.block_syscall_retry([s, self, want] {
+                    return s->zombie_child(self, want <= 0 ? -1 : want) != nullptr ||
+                           !s->has_children(self);
+                });
+                return 0;  // retried; never written back
+            }
+            z->reaped = true;
+            if (a[1]) e.mem.write32(a[1], static_cast<uint32_t>(z->exit_code & 0xFF) << 8);
+            return z->pid;
+        }
+        case Sys::Kill: {
+            int target = static_cast<int>(static_cast<int32_t>(a[0]));
+            int sig = static_cast<int>(a[1]);
+            if (target == e.pid()) {
+                if (sig) e.exit_process(128 + sig);
+                return 0;
+            }
+            if (!e.system() || !e.system()->find(target)) return -3;  // ESRCH
+            if (sig) e.system()->terminate(target, 128 + sig);
+            return 0;
+        }
+        case Sys::Pipe:
+        case Sys::Pipe2: {
+            int fds[2];
+            int r = e.files.make_pipe(fds);
+            if (r != 0) return r;
+            constexpr uint32_t kCloexec = 02000000;
+            if (sys == Sys::Pipe2 && (a[1] & kCloexec)) {
+                e.files.get(fds[0])->cloexec = true;
+                e.files.get(fds[1])->cloexec = true;
+            }
+            e.mem.write32(a[0], static_cast<uint32_t>(fds[0]));
+            e.mem.write32(a[0] + 4, static_cast<uint32_t>(fds[1]));
+            return 0;
+        }
+        case Sys::Chdir: {
+            std::string path = FileTable::host_path(e.mem.read_cstring(a[0]));
+            return host_chdir(path);
+        }
+        case Sys::Fchdir: {
+            FileTable::Entry* entry = e.files.get(static_cast<int>(a[0]));
+            if (!entry || !entry->is_directory) return -20;  // ENOTDIR
+            return host_chdir(FileTable::host_path(entry->path));
+        }
         case Sys::Time: {
             auto now = static_cast<int64_t>(std::time(nullptr));
             if (a[0]) e.mem.write_sized(a[0], e.pointer_size(), static_cast<uint64_t>(now));
@@ -317,33 +532,89 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             if (mask) e.mem.write64(mask, 1);  // one CPU
             return 8;
         }
-        case Sys::Gettid:
-            return 4242;
+        case Sys::Gettid: {
+            // The main thread's tid is the pid, as Linux has it.
+            Emulator::GuestThread* t = e.current_thread();
+            if (!t || e.threads().empty() || t == e.threads()[0].get())
+                return e.pid();
+            return t->id;
+        }
         case Sys::GetIds:
             return 0;  // running as root, which nothing here checks
         case Sys::Readlink: {
             // A Unix runtime finds its own executable through /proc/self/exe -
             // CPython's getpath depends on it. There is no real procfs, so answer
-            // it (and /proc/self/cwd) from what the emulator already knows.
+            // it (and /proc/self/cwd) from what the emulator already knows.  The
+            // answer must be absolute and start with '/' (glibc's ld.so asserts
+            // exactly that); a Windows host path is spelled "/C:/dir/prog".
             std::string path = e.mem.read_cstring(a[0]);
             std::string target;
             if (path == "/proc/self/exe")
                 target = e.args().empty() ? std::string() : e.args()[0];
             if (target.empty()) return -22;  // EINVAL: nothing we resolve
+            for (char& c : target)
+                if (c == '\\') c = '/';
+            if (target[0] != '/') {
+                if (target.size() > 1 && target[1] == ':') {
+                    target = "/" + target;  // absolute Windows path
+                } else {
+                    char buf[4096];
+#if defined(_WIN32)
+                    if (_getcwd(buf, sizeof buf)) {
+                        std::string cwd = buf;
+                        for (char& c : cwd)
+                            if (c == '\\') c = '/';
+                        target = "/" + cwd + "/" + target;
+                    }
+#else
+                    if (::getcwd(buf, sizeof buf)) target = std::string(buf) + "/" + target;
+#endif
+                }
+            }
             uint64_t buf = a[1];
             size_t n = std::min<size_t>(target.size(), static_cast<size_t>(a[2]));
             for (size_t i = 0; i < n; ++i) e.mem.write8(buf + i, static_cast<uint8_t>(target[i]));
             return static_cast<int64_t>(n);  // readlink does not NUL-terminate
         }
-        // Signal handling, futexes and memory advice: a static libc sets these up
-        // at startup, and since nothing is ever delivered and there is only one
-        // thread, reporting success is accurate.
-        case Sys::SetTidAddress:
+        case Sys::SetTidAddress: {
+            // Records where to write 0 (and wake) when this thread exits;
+            // pthread_join on the main thread depends on it.
+            Emulator::GuestThread* t = e.current_thread();
+            if (t) t->clear_child_tid = a[0];
+            return (!t || e.threads().empty() || t == e.threads()[0].get()) ? e.pid()
+                                                                            : t->id;
+        }
+        case Sys::Futex: {
+            // (addr, op, val, timeout/val2, addr2, val3)
+            uint64_t addr = a[0];
+            int op = static_cast<int>(a[1]) & 0x7F;  // strip FUTEX_PRIVATE_FLAG
+            uint32_t val = static_cast<uint32_t>(a[2]);
+            switch (op) {
+                case 0:    // FUTEX_WAIT
+                case 9: {  // FUTEX_WAIT_BITSET
+                    if (e.mem.read32(addr) != val) return kEAGAIN;
+                    // Waking "when the word changes" allows spurious wakeups,
+                    // which the futex contract explicitly permits; the waiter
+                    // re-checks and calls back in if it must.
+                    Memory* m = &e.mem;
+                    e.block_syscall_retry([m, addr, val] { return m->read32(addr) != val; });
+                    return 0;
+                }
+                case 1:    // FUTEX_WAKE
+                case 10:   // FUTEX_WAKE_BITSET
+                    // Waiters watch the word itself; there is no queue to pop.
+                    return static_cast<int64_t>(val);
+                default:
+                    return 0;  // requeue and friends: claim success
+            }
+        }
+        // Signal handling and memory advice: a static libc sets these up at
+        // startup, and since nothing is ever delivered, reporting success is
+        // accurate.
         case Sys::RtSigaction:
         case Sys::RtSigprocmask:
         case Sys::Mprotect:
         case Sys::Madvise:
-        case Sys::Futex:
         case Sys::SetRobustList:
         case Sys::Ignored:
             return 0;
@@ -381,7 +652,9 @@ void Emulator::install_syscall_handlers() {
         else if (opt_.trace_calls)
             std::fprintf(stderr, "[sys] %llu\n", (unsigned long long)nr);
         int64_t r = do_syscall(*this, sys, a);
-        if (!cpu_->halted) cpu_->regs[RAX] = static_cast<uint64_t>(r);
+        // A blocked syscall rewound RIP to run again; RAX still holds the
+        // syscall number and must survive until the retry.
+        if (!cpu_->halted && !take_syscall_block()) cpu_->regs[RAX] = static_cast<uint64_t>(r);
     };
 
     // i386: number in EAX, arguments in EBX, ECX, EDX, ESI, EDI, EBP.
@@ -397,7 +670,8 @@ void Emulator::install_syscall_handlers() {
             std::fprintf(stderr, "[sys] int80 %llu%s\n", (unsigned long long)nr,
                          sys == Sys::Unknown ? " (unimplemented)" : "");
         int64_t r = do_syscall(*this, sys, a);
-        if (!cpu_->halted) cpu_->regs[RAX] = static_cast<uint64_t>(r) & 0xFFFFFFFFull;
+        if (!cpu_->halted && !take_syscall_block())
+            cpu_->regs[RAX] = static_cast<uint64_t>(r) & 0xFFFFFFFFull;
     };
 }
 

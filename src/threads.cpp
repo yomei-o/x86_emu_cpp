@@ -278,6 +278,37 @@ uint64_t Emulator::create_thread(uint64_t start, uint64_t argument, uint64_t sta
     return threads_.back()->handle;
 }
 
+uint32_t Emulator::clone_thread(uint64_t stack, uint64_t tls, uint64_t clear_child_tid) {
+    auto t = std::make_unique<GuestThread>();
+    t->id = next_thread_id_++;
+    t->clear_child_tid = clear_child_tid;
+
+    // The child is the calling context verbatim - same RIP (already past the
+    // syscall instruction), the caller-provided stack, its own TLS base - with
+    // RAX zeroed, which is how the guest's clone() wrapper tells the two apart.
+    std::memcpy(t->regs, cpu_->regs, sizeof t->regs);
+    std::memcpy(t->xmm, cpu_->xmm, sizeof t->xmm);
+    std::memcpy(t->st, cpu_->st, sizeof t->st);
+    std::memcpy(t->st_used, cpu_->st_used, sizeof t->st_used);
+    t->st_top = cpu_->st_top;
+    t->fpu_control = cpu_->fpu_control;
+    t->fpu_status = cpu_->fpu_status;
+    t->mxcsr = cpu_->mxcsr;
+    t->rip = cpu_->rip;
+    t->rflags = cpu_->rflags;
+    t->fs_base = tls ? tls : cpu_->fs_base;
+    t->gs_base = cpu_->gs_base;
+    t->regs[RAX] = 0;
+    if (stack) t->regs[RSP] = stack;
+
+    t->handle = create_sync_object(SyncObject::Kind::Thread, true, false, 0);
+    sync_object(t->handle)->owner = t->id;
+    log_call("clone_thread %u, stack 0x%llX, tls 0x%llX", t->id, (unsigned long long)stack,
+             (unsigned long long)tls);
+    threads_.push_back(std::move(t));
+    return threads_.back()->id;
+}
+
 void Emulator::exit_thread(uint32_t exit_code) {
     GuestThread* t = current_thread();
     if (!t) {

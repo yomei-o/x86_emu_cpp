@@ -74,23 +74,34 @@ inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             int fd = (flags & 0200000)
                          ? e.files.open_directory(path)
                          : e.files.open(path, open_flags_from_linux(flags));
+            if (fd >= 0 && (flags & 02000000))  // O_CLOEXEC
+                e.files.get(fd)->cloexec = true;
             if (e.options().trace_calls)
                 std::fprintf(stderr, "[sys] open(%s, 0%o) = %d\n", path.c_str(), flags, fd);
             return fd;
         }
         case Sys::Fcntl: {
-            // fcntl(fd, cmd, arg). A runtime uses this at startup to set FD_CLOEXEC
-            // and to duplicate descriptors; the emulator does not track close-on-exec
-            // (there is no exec), so the flag commands succeed as no-ops.
+            // fcntl(fd, cmd, arg). Close-on-exec is real now that execve exists.
             int fd = static_cast<int>(a[0]);
             int cmd = static_cast<int>(a[1]);
             if (!e.files.valid(fd) && fd > 2) return -9;  // EBADF
             switch (cmd) {
                 case 0:      // F_DUPFD
-                case 1030:   // F_DUPFD_CLOEXEC
                     return e.files.dup(fd, -1);
-                case 1: return 0;   // F_GETFD (no FD_CLOEXEC tracked)
-                case 2: return 0;   // F_SETFD (accept)
+                case 1030: {  // F_DUPFD_CLOEXEC
+                    int copy = e.files.dup(fd, -1);
+                    if (copy >= 0) e.files.get(copy)->cloexec = true;
+                    return copy;
+                }
+                case 1: {  // F_GETFD
+                    FileTable::Entry* entry = e.files.get(fd);
+                    return entry && entry->cloexec ? 1 : 0;  // FD_CLOEXEC
+                }
+                case 2: {  // F_SETFD
+                    if (FileTable::Entry* entry = e.files.get(fd))
+                        entry->cloexec = (a[2] & 1) != 0;
+                    return 0;
+                }
                 case 3: return 2;   // F_GETFL -> O_RDWR, no O_NONBLOCK
                 case 4: return 0;   // F_SETFL (accept)
                 default: return 0;  // permissive: startup only sets flags
@@ -172,12 +183,19 @@ inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         }
         case Sys::Getcwd: {
             // A Unix runtime needs an absolute cwd (CPython's getpath calls abspath,
-            // which fails on a relative "."). Use the host's real directory where it
-            // is already Unix-shaped (emscripten MEMFS, Linux); a Windows host's
-            // drive-letter path is meaningless to a Linux guest, so answer "/".
+            // which fails on a relative "."). On a Unix-shaped host pass the real
+            // directory through; on a Windows host, spell the drive path as
+            // "/C:/dir", which host_path() knows how to turn back into C:/dir.
             std::string s = "/";
-#if !defined(_WIN32)
             char buf[4096];
+#if defined(_WIN32)
+            if (_getcwd(buf, sizeof buf)) {
+                s = buf;
+                for (char& c : s)
+                    if (c == '\\') c = '/';
+                s = "/" + s;
+            }
+#else
             if (::getcwd(buf, sizeof buf)) s = buf;
 #endif
             if (a[1] < s.size() + 1) return -34;  // ERANGE
@@ -187,8 +205,12 @@ inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         case Sys::Dup:
             return e.files.dup(static_cast<int>(a[0]));
         case Sys::Dup2:
-        case Sys::Dup3:
-            return e.files.dup(static_cast<int>(a[0]), static_cast<int>(a[1]));
+        case Sys::Dup3: {
+            int r = e.files.dup(static_cast<int>(a[0]), static_cast<int>(a[1]));
+            if (sys == Sys::Dup3 && r >= 0 && (a[2] & 02000000))  // O_CLOEXEC
+                e.files.get(r)->cloexec = true;
+            return r;
+        }
         case Sys::Pread: {
             int fd = static_cast<int>(a[0]);
             int64_t saved = e.files.tell(fd);
