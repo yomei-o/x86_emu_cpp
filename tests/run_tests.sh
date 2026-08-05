@@ -76,12 +76,15 @@ fi
 if ls tests/msvc/bin/*.exe >/dev/null 2>&1; then
     echo "MSVC guests (emulated output vs. native execution)"
     for exe in tests/msvc/bin/*.exe; do
-        # Built, but not yet runnable, and each for a reason worth naming:
-        #   exc_*        needs C++ exception unwinding
-        #   cpp_*_MD*    imports std::cout as *data* from msvcp140.dll, which
-        #                needs the real DLL loaded rather than hooked
+        # Built, but not yet runnable, and each for a reason worth naming.  The
+        # /MD builds link their C++ runtime dynamically, so the *language* half
+        # of exception handling and the iostream objects live in vcruntime140.dll
+        # and msvcp140.dll; the emulator implements the kernel's half of
+        # unwinding, not those DLLs' contents.  The /MT builds - the same
+        # programs with the runtime statically linked - do run, exceptions and
+        # all.
         case "$exe" in
-            *exc_*) continue;;
+            *exc_msvc_MD*) continue;;
             *cpp_msvc_MD*) continue;;
         esac
         check_native "$exe"

@@ -51,6 +51,13 @@ struct PeImage {
     uint64_t tls_raw_start = 0;      // the template's bounds, as addresses
     uint64_t tls_raw_end = 0;
     uint64_t tls_zero_fill = 0;      // extra zeroed bytes after the template
+
+    // The x64 exception directory: a sorted array of RUNTIME_FUNCTION, three
+    // RVAs each, describing how to unwind every function in the image.  This is
+    // what makes throwing possible - on x64 there is no frame-pointer chain to
+    // walk, only this table.
+    uint64_t exception_table = 0;    // as an address, not an RVA
+    uint32_t exception_table_size = 0;
 };
 
 // Reads just enough of the headers to know the CPU mode; throws LoadError if the

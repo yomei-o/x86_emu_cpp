@@ -27,6 +27,15 @@ namespace x86emu {
 
 class System;
 
+// Thrown by the unwinder to abandon everything between a throw and its handler.
+// The emulator's own call stack mirrors the guest's while handlers run - a
+// language handler is guest code called from the dispatcher - so transferring
+// control to a catch block means leaving those host frames too, and a C++ throw
+// is the honest way to do it.  `context` points at a guest CONTEXT to resume.
+struct UnwindTransfer {
+    uint64_t context;
+};
+
 // How arguments reach a called function.
 enum class Abi {
     Cdecl32,  // 32-bit: everything on the stack
@@ -453,7 +462,38 @@ public:
     void install_ucrt_hooks();
     void install_process_hooks();
     void install_cl_hooks();
+    void install_exception_hooks();
     void install_syscall_handlers();
+
+    // ---- exceptions ----------------------------------------------------------
+    // The x64 unwinder (exceptions.cpp).  These are the kernel's half of
+    // exception handling; the language's half is guest code the dispatcher
+    // calls.
+    bool lookup_function_entry(uint64_t pc, uint64_t& image_base, uint64_t& entry);
+    // Undoes one frame's prologue, in place, on a guest CONTEXT.  Returns the
+    // frame's language handler (0 if it has none) and reports where its locals
+    // live.
+    uint64_t virtual_unwind(uint32_t handler_type, uint64_t image_base, uint64_t pc,
+                            uint64_t entry, uint64_t ctx, uint64_t& handler_data,
+                            uint64_t& establisher_frame);
+    void unwind_leaf(uint64_t ctx);
+    // Walks frames calling each language handler until one accepts; ends the
+    // process if none does.  Never returns normally when a handler takes it.
+    void dispatch_exception(uint64_t record, uint64_t ctx);
+    // The second pass: run the handlers between here and `target_frame` so
+    // destructors and __finally blocks execute, then transfer to `target_ip`.
+    void unwind_to(uint64_t target_frame, uint64_t target_ip, uint64_t record,
+                   uint64_t return_value, uint64_t ctx);
+    void raise_guest_exception(uint32_t code, uint32_t flags,
+                               const std::vector<uint64_t>& params, uint64_t address);
+    // Guest memory for a record, a context or a dispatcher block.
+    uint64_t exception_scratch(uint64_t size);
+    void apply_unwind_transfer(const UnwindTransfer& t);
+    // 32-bit exception handling is a different mechanism: a linked list of
+    // handlers headed by fs:[0], walked directly.
+    void install_seh32_hooks();
+    void dispatch_exception32(uint64_t record, uint64_t ctx);
+    void unwind_chain32(uint64_t target_frame, uint64_t record);
 
 private:
     struct Hook {

@@ -1132,6 +1132,9 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         install_ucrt_hooks();
         install_process_hooks();
         install_cl_hooks();
+        // Last, so that its real implementations win over the stubs the files
+        // above register for a guest that cannot be supported yet.
+        install_exception_hooks();
     }
 
     if (os_kind == Os::Windows) {
@@ -1253,7 +1256,15 @@ Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
     uint64_t deadline = cpu_->instructions_executed + quantum;
     reschedule_ = false;
     while (!cpu_->halted && !reschedule_ && cpu_->instructions_executed < deadline) {
-        cpu_->step();
+        try {
+            cpu_->step();
+        } catch (const UnwindTransfer& transfer) {
+            // An exception found its handler.  The host frames between the throw
+            // and here - nested interpreter loops, one per language handler the
+            // dispatcher called - are gone with the C++ throw that got us here;
+            // the guest continues from the context the unwinder built.
+            apply_unwind_transfer(transfer);
+        }
         if (opt_.max_instructions && cpu_->instructions_executed >= opt_.max_instructions)
             throw CpuError(cpu_->rip, "instruction limit reached (possible infinite loop)");
     }

@@ -283,6 +283,11 @@ PeImage map_pe(const std::vector<uint8_t>& f, Memory& mem, uint64_t load_base) {
     }
 
     if (entry_rva) img.entry = img.base + entry_rva;
+    // Directory 3 is IMAGE_DIRECTORY_ENTRY_EXCEPTION; only x64 images have one.
+    if (uint32_t pdata_rva = directory_rva(f, h, 3)) {
+        img.exception_table = img.base + pdata_rva;
+        img.exception_table_size = directory_size(f, h, 3);
+    }
     read_imports(mem, f, h, img);
     read_exports(mem, f, h, img);
     read_tls(mem, f, h, img);

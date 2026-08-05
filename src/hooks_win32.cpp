@@ -305,15 +305,23 @@ void Emulator::install_win32_hooks() {
         std::fprintf(stderr, "[dbg] %s", utf16_to_utf8(e, e.arg_slot(0), -1).c_str());
         e.set_result(0);
     });
-    // Structured exception handling is not modelled; if a guest actually raises
-    // one, say so rather than wander off.
-    for (const char* name : {"RaiseException", "RtlUnwind", "RtlUnwindEx",
-                             "RtlCaptureContext", "RtlLookupFunctionEntry",
-                             "RtlVirtualUnwind", "RtlPcToFileHeader"}) {
-        std::string n = name;
-        add_hook(n, 0, [n](Emulator& e) {
-            throw CpuError(e.cpu().rip,
-                           n + ": structured exception handling is not emulated");
+    // The x64 unwinder implements these (exceptions.cpp, installed after this
+    // file's hooks).  In 32-bit code, where exception handling is the fs:[0]
+    // chain instead, they are still unimplemented and say so.
+    if (!is64()) {
+        // These three are x64-only; 32-bit code has no unwind tables.
+        for (const char* name : {"RtlCaptureContext", "RtlLookupFunctionEntry",
+                                 "RtlVirtualUnwind"}) {
+            std::string n = name;
+            add_hook(n, 0, [n](Emulator& e) {
+                throw CpuError(e.cpu().rip, n + " has no meaning in 32-bit code");
+            });
+        }
+        win32("RtlPcToFileHeader", 2, [](Emulator& e) {
+            Module* m = e.module_for(e.arg_slot(0));
+            uint64_t base = m ? m->image.base : 0;
+            if (e.arg_slot(1)) e.mem.write32(e.arg_slot(1), static_cast<uint32_t>(base));
+            e.set_result(base);
         });
     }
 
@@ -857,14 +865,18 @@ void Emulator::install_ucrt_hooks() {
     ucrt("__processing_throw", [](Emulator& e) { e.set_result(0); });
     ret0("_get_wide_winmain_command_line");
 
-    // Exception machinery: reaching any of these means the guest is actually
-    // throwing, which needs a real unwinder rather than a plausible answer.
-    for (const char* name : {"__C_specific_handler", "_except_handler4_common",
-                             "_CxxThrowException", "__CxxFrameHandler3",
-                             "__CxxFrameHandler4", "_purecall"}) {
+    // The language handlers themselves belong to the guest's runtime, and for a
+    // statically linked CRT they are in the image.  What remains here is the
+    // cases where the guest imports one, which only a /MD build does: the C one
+    // the x64 unwinder implements (exceptions.cpp), and the C++ ones that live
+    // in vcruntime140.dll and would need that DLL loaded for real.
+    for (const char* name : {"_except_handler4_common", "_CxxThrowException",
+                             "__CxxFrameHandler3", "__CxxFrameHandler4", "_purecall"}) {
         std::string n = name;
         add_hook(n, 0, [n](Emulator& e) {
-            throw CpuError(e.cpu().rip, n + ": C++/SEH exception unwinding is not emulated");
+            throw CpuError(e.cpu().rip,
+                           n + ": this build imports its exception runtime from a DLL; "
+                               "the emulator implements the kernel's half only");
         });
     }
 }
