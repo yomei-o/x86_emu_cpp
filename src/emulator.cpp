@@ -56,9 +56,12 @@ void Emulator::choose_layout() {
         heap_base_ = (image_.brk + 0xFFF) & ~0xFFFull;
         heap_limit_ = heap_base_ + (1ull << 28);
     }
-    // mmap lives above the brk heap so the two can never collide.
+    // mmap lives above the brk heap so the two can never collide.  A 64-bit
+    // guest gets a large window because addresses cost nothing there and a real
+    // toolchain maps a great deal (cc1 alone wants hundreds of megabytes);
+    // pages are only created when touched.
     mmap_next_ = heap_limit_;
-    mmap_limit_ = mmap_next_ + (1ull << 28);
+    mmap_limit_ = mmap_next_ + (is64() ? (16ull << 30) : (1ull << 28));
     stack_top_ = stack_base_ + stack_size_;
     heap_next_ = heap_base_;
     misc_next_ = misc_base_;
@@ -700,11 +703,53 @@ uint64_t Emulator::heap_alloc(uint64_t size) {
 
 uint64_t Emulator::alloc_pages(uint64_t size) {
     uint64_t need = (size + 0xFFF) & ~0xFFFull;
+
+    // Best fit among the ranges munmap() returned, so that a long run of
+    // equal-sized allocate/free cycles reuses one range forever.
+    size_t best = mmap_free_.size();
+    for (size_t i = 0; i < mmap_free_.size(); ++i) {
+        if (mmap_free_[i].second < need) continue;
+        if (best == mmap_free_.size() || mmap_free_[i].second < mmap_free_[best].second) best = i;
+    }
+    if (best < mmap_free_.size()) {
+        uint64_t addr = mmap_free_[best].first;
+        uint64_t have = mmap_free_[best].second;
+        if (have > need)
+            mmap_free_[best] = {addr + need, have - need};  // keep the remainder
+        else
+            mmap_free_.erase(mmap_free_.begin() + static_cast<long>(best));
+        mem.map(addr, need);
+        mmap_live_[addr] = need;
+        return addr;
+    }
+
     if (mmap_next_ + need > mmap_limit_) return 0;
     uint64_t addr = mmap_next_;
     mmap_next_ += need;
     mem.map(addr, need);
+    mmap_live_[addr] = need;
     return addr;
+}
+
+void Emulator::free_pages(uint64_t addr, uint64_t size) {
+    uint64_t page_addr = addr & ~0xFFFull;
+    uint64_t need = (size + (addr - page_addr) + 0xFFF) & ~0xFFFull;
+    if (!need) return;
+    // Only ranges inside the mmap window are ours to recycle; a guest may also
+    // munmap part of its own image or a range ld.so mapped at a fixed address,
+    // which just drops the pages.
+    mem.unmap(page_addr, need);
+    if (page_addr >= mmap_limit_) return;
+    auto it = mmap_live_.find(page_addr);
+    if (it != mmap_live_.end() && it->second <= need) {
+        mmap_free_.emplace_back(page_addr, it->second);
+        mmap_live_.erase(it);
+        return;
+    }
+    // A partial unmap: give back exactly what was asked for.  Coalescing is not
+    // attempted; best-fit reuse is enough for the allocation patterns seen here.
+    if (page_addr >= mmap_next_) return;   // never handed out
+    mmap_free_.emplace_back(page_addr, need);
 }
 
 uint64_t Emulator::set_brk(uint64_t addr) {

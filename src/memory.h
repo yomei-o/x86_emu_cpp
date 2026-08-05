@@ -46,6 +46,11 @@ public:
         return pages_.find(addr >> kPageBits) != pages_.end();
     }
 
+    // Drops the pages covering [addr, addr+size), releasing their memory.  A
+    // later map() of the same range gets fresh zero-filled pages, which is what
+    // munmap() followed by mmap() means.
+    void unmap(uint64_t addr, uint64_t size);
+
     void read(uint64_t addr, void* dst, uint64_t len) const;
     void write(uint64_t addr, const void* src, uint64_t len);
 

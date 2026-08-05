@@ -52,7 +52,16 @@ std::shared_ptr<std::FILE> borrow_stream(std::FILE* fp) {
     return std::shared_ptr<std::FILE>(fp, [](std::FILE*) {});
 }
 
+std::string g_sysroot;
+
 }  // namespace
+
+void FileTable::set_sysroot(std::string dir) {
+    for (char& c : dir)
+        if (c == '\\') c = '/';
+    while (!dir.empty() && dir.back() == '/') dir.pop_back();
+    g_sysroot = std::move(dir);
+}
 
 FileTable::FileTable() {
     // The three standard streams are always present and always the host's.  Their
@@ -91,6 +100,9 @@ std::string FileTable::host_path(const std::string& guest_path) {
     if (out.size() >= 3 && out[0] == '/' &&
         ((out[1] >= 'A' && out[1] <= 'Z') || (out[1] >= 'a' && out[1] <= 'z')) && out[2] == ':')
         out.erase(0, 1);
+    // Any other absolute Unix path lives inside the sysroot, when one is set.
+    else if (!g_sysroot.empty() && !out.empty() && out[0] == '/')
+        out = g_sysroot + out;
     return out;
 }
 
@@ -384,13 +396,34 @@ int FileTable::rename_file(const std::string& from, const std::string& to) {
 }
 
 int FileTable::stat_path(const std::string& path, Stat& out) {
+    std::string host = host_path(path);
     x86emu_stat_struct st;
-    if (x86emu_stat(host_path(path).c_str(), &st) != 0) return from_errno(errno);
+    if (x86emu_stat(host.c_str(), &st) != 0) return from_errno(errno);
     out.size = static_cast<uint64_t>(st.st_size);
     out.is_dir = (st.st_mode & S_IFMT) == S_IFDIR;
     out.is_char_device = (st.st_mode & S_IFMT) == S_IFCHR;
     out.mtime = static_cast<int64_t>(st.st_mtime);
+    out.ino = inode_for(host);
     return 0;
+}
+
+uint64_t FileTable::inode_for(const std::string& host_path_in) {
+    // Windows' _stat64 reports st_ino as 0, so the number is invented here -
+    // stably, from the path, since callers compare inodes between two stats of
+    // the same file.  Case is folded because Windows paths are case-insensitive
+    // and "the same file" must hash the same either way.
+#if !defined(_WIN32)
+    x86emu_stat_struct st;
+    if (x86emu_stat(host_path_in.c_str(), &st) == 0 && st.st_ino)
+        return static_cast<uint64_t>(st.st_ino);
+#endif
+    uint64_t h = 1469598103934665603ull;  // FNV-1a
+    for (char c : host_path_in) {
+        char lower = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+        h ^= static_cast<unsigned char>(lower);
+        h *= 1099511628211ull;
+    }
+    return h ? h : 1;  // 0 means "no inode" to some callers
 }
 
 int FileTable::stat_fd(int fd, Stat& out) {
@@ -399,11 +432,17 @@ int FileTable::stat_fd(int fd, Stat& out) {
     if (e->is_pipe()) {
         out.is_fifo = true;
         out.size = e->pipe_end->pipe->buffer.size();
+        // A pipe's identity is the pipe object, so that two descriptors on the
+        // same pipe stat alike and two different pipes do not.
+        out.ino = reinterpret_cast<uintptr_t>(e->pipe_end->pipe.get());
+        out.dev = 2;
         return 0;
     }
     if (e->standard_stream) {
         out.is_char_device = true;
         out.size = 0;
+        out.ino = static_cast<uint64_t>(fd) + 1;
+        out.dev = 3;
         return 0;
     }
     // A directory handle has no stream to measure; the path is the whole answer.

@@ -1,6 +1,7 @@
 #include "processes.h"
 
 #include <cstdio>
+#include <string>
 
 #include "loader.h"
 
@@ -226,7 +227,11 @@ int System::run() {
                                  p.emu->args().empty() ? "?" : p.emu->args()[0].c_str(),
                                  err.what());
                 }
+                // Becoming a zombie *is* progress: a parent blocked in wait4
+                // wakes on it, and without saying so the very next check
+                // declares deadlock before that parent ever runs again.
                 make_zombie(p, 127);
+                progress = true;
                 continue;
             }
             switch (st) {
@@ -263,9 +268,25 @@ int System::run() {
                     advanced = true;
                 }
             }
-            if (!advanced)
+            if (!advanced) {
+                // Naming who is stuck on what is the difference between a
+                // one-line diagnosis and an afternoon: the usual cause is a
+                // parent waiting for a child that died, or a pipe whose writer
+                // no longer exists.
+                std::string detail;
+                for (const auto& p : procs_) {
+                    if (p->reaped) continue;
+                    char line[256];
+                    std::snprintf(line, sizeof line, "    pid %d (%s): %s\n", p->pid,
+                                  p->emu && !p->emu->args().empty()
+                                      ? p->emu->args()[0].c_str()
+                                      : "?",
+                                  p->zombie ? "exited" : "blocked");
+                    detail += line;
+                }
                 throw CpuError(root->emu->cpu().rip,
-                               "all processes are blocked: deadlock");
+                               "all processes are blocked: deadlock\n" + detail);
+            }
         }
     }
 }

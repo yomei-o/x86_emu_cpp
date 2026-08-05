@@ -23,7 +23,8 @@ build_one() {                   # build_one <compiler> <suffix> <source> <name>
         echo "   skip $name$suffix ($cc not found)"
         return 1
     fi
-    if $cc -static -O1 -o "$out/$name$suffix" "$src" 2>"$out/$name$suffix.log"; then
+    # -pthread matters for thread_gcc.c and is harmless for the rest.
+    if $cc -static -pthread -O1 -o "$out/$name$suffix" "$src" 2>"$out/$name$suffix.log"; then
         echo "   $out/$name$suffix"
         rm -f "$out/$name$suffix.log"
         return 0

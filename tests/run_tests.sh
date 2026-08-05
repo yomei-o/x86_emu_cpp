@@ -61,6 +61,15 @@ if ls tests/dll/bin/*/usedll.exe >/dev/null 2>&1; then
     done
 fi
 
+# Built by tests/hosted/build.sh: ordinary mingw programs with the real CRT,
+# the Win32 API, child processes and pipes.  Also native-diffable.
+if ls tests/hosted/bin/*.exe >/dev/null 2>&1; then
+    echo "Hosted Windows guests (emulated output vs. native execution)"
+    for exe in tests/hosted/bin/*.exe; do
+        check_native "$exe"
+    done
+fi
+
 # Built by tests/msvc/build.bat: a real Visual Studio toolchain, so the CRT
 # startup runs before main and - with /MT - the C runtime itself executes inside
 # the guest.

@@ -30,8 +30,8 @@ inline void write_stat(Emulator& e, uint64_t buf, const FileTable::Stat& st, boo
     if (is64) {
         std::vector<uint8_t> zeros(144, 0);
         e.mem.write(buf, zeros.data(), zeros.size());
-        e.mem.write64(buf + 0, 1);                 // st_dev
-        e.mem.write64(buf + 8, 1);                 // st_ino
+        e.mem.write64(buf + 0, st.dev);            // st_dev
+        e.mem.write64(buf + 8, st.ino);            // st_ino
         e.mem.write64(buf + 16, 1);                // st_nlink
         e.mem.write32(buf + 24, mode);             // st_mode
         e.mem.write64(buf + 48, st.size);          // st_size
@@ -44,10 +44,11 @@ inline void write_stat(Emulator& e, uint64_t buf, const FileTable::Stat& st, boo
         // struct stat64, the layout the i386 fstat64/stat64 syscalls use.
         std::vector<uint8_t> zeros(96, 0);
         e.mem.write(buf, zeros.data(), zeros.size());
-        e.mem.write64(buf + 0, 1);                 // st_dev
-        e.mem.write32(buf + 12, 1);                // __st_ino
+        e.mem.write64(buf + 0, st.dev);            // st_dev
+        e.mem.write32(buf + 12, static_cast<uint32_t>(st.ino));  // __st_ino
         e.mem.write32(buf + 16, mode);             // st_mode
         e.mem.write32(buf + 20, 1);                // st_nlink
+        e.mem.write64(buf + 88, st.ino);           // st_ino (the 64-bit one)
         e.mem.write64(buf + 44, st.size);          // st_size
         e.mem.write32(buf + 52, 4096);             // st_blksize
         e.mem.write64(buf + 56, (st.size + 511) / 512);  // st_blocks

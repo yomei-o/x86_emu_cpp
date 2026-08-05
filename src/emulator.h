@@ -329,8 +329,13 @@ public:
 
     // ---- guest services ----------------------------------------------------
     uint64_t heap_alloc(uint64_t size);
-    // Page-aligned allocation, for mmap().
+    // Page-aligned allocation, for mmap().  Reuses ranges given back by
+    // free_pages(), which matters more than it sounds: a compiler's garbage
+    // collector cycles through mmap/munmap thousands of times, and never
+    // reusing an address exhausts the mmap window mid-compilation.
     uint64_t alloc_pages(uint64_t size);
+    // Returns an mmap()ed range, dropping its pages.
+    void free_pages(uint64_t addr, uint64_t size);
     // The Linux program break; set_brk returns the value after the request.
     uint64_t brk_value() const { return brk_; }
     uint64_t set_brk(uint64_t addr);
@@ -506,6 +511,10 @@ private:
     // mmap gets its own region: it must not hand out addresses that a later
     // brk() would also claim.
     uint64_t mmap_next_ = 0, mmap_limit_ = 0;
+    // Ranges munmap() gave back, and the size of every live mmap allocation so
+    // that munmap of a whole allocation can be recognised.
+    std::vector<std::pair<uint64_t, uint64_t>> mmap_free_;
+    std::unordered_map<uint64_t, uint64_t> mmap_live_;
     uint64_t misc_base_ = 0, misc_next_ = 0;
     uint64_t teb_base_ = 0;
 

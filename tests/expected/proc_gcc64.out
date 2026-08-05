@@ -1,0 +1,3 @@
+parent got: child pid=1 ppid ok=1
+child exit=42
+parent done

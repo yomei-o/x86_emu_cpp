@@ -3,6 +3,7 @@
 #include <cstdio>
 
 namespace x86emu {
+
 namespace {
 
 uint64_t mask_of(int size) {
@@ -761,13 +762,30 @@ void Cpu::execute_0f() {
         case 0xB3:
         case 0xBB: {  // BT / BTS / BTR / BTC, register bit index
             RM rm = decode_modrm();
-            uint64_t bit = reg_read(modrm_reg_, opsize_) & (opsize_ * 8 - 1);
-            uint64_t v = rm_read(rm, opsize_);
+            RM target = rm;
+            uint64_t bit;
+            if (rm.is_reg) {
+                bit = reg_read(modrm_reg_, opsize_) & (opsize_ * 8 - 1);
+            } else {
+                // With a memory destination the offset is *not* truncated to the
+                // operand width: it is signed and addresses a bit anywhere in
+                // memory, so the operand moves with it.  Truncating instead
+                // silently rewrites the wrong bit of the wrong word, which is
+                // how a guest's bitmap (GCC's, for one) quietly corrupts itself.
+                int bits = opsize_ * 8;
+                int shift = opsize_ == 8 ? 6 : opsize_ == 4 ? 5 : 4;
+                int64_t offset = sign_ext(reg_read(modrm_reg_, opsize_), opsize_);
+                // An arithmetic shift floors, which is the rounding negative
+                // offsets need.
+                target.addr = rm.addr + static_cast<uint64_t>((offset >> shift) * opsize_);
+                bit = static_cast<uint64_t>(offset) & static_cast<uint64_t>(bits - 1);
+            }
+            uint64_t v = rm_read(target, opsize_);
             set_flag(FLAG_CF, ((v >> bit) & 1) != 0);
             if (op == 0xAB) v |= (1ull << bit);
             if (op == 0xB3) v &= ~(1ull << bit);
             if (op == 0xBB) v ^= (1ull << bit);
-            if (op != 0xA3) rm_write(rm, opsize_, v);
+            if (op != 0xA3) rm_write(target, opsize_, v);
             return;
         }
         case 0xBA: {  // BT/BTS/BTR/BTC, immediate bit index
@@ -862,6 +880,11 @@ void Cpu::step() {
     }
 
     uint64_t start = rip;
+    if (!history_.empty()) {
+        history_[history_pos_] = start;
+        history_pos_ = (history_pos_ + 1) % history_.size();
+        if (history_filled_ < history_.size()) ++history_filled_;
+    }
     pfx_ = Prefixes{};
 
     // Prefix bytes.  Segment overrides other than fs:/gs: are accepted and
@@ -1342,6 +1365,17 @@ const char* Cpu::reg_name(int i, int size) {
     static const char* n32[16] = {"eax", "ecx", "edx",  "ebx",  "esp",  "ebp",  "esi",  "edi",
                                   "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"};
     return size == 8 ? n64[i & 15] : n32[i & 15];
+}
+
+std::vector<uint64_t> Cpu::history() const {
+    std::vector<uint64_t> out;
+    if (history_.empty() || history_filled_ == 0) return out;
+    out.reserve(history_filled_);
+    // The oldest entry is the one after the newest when the buffer has wrapped.
+    size_t start = history_filled_ < history_.size() ? 0 : history_pos_;
+    for (size_t i = 0; i < history_filled_; ++i)
+        out.push_back(history_[(start + i) % history_.size()]);
+    return out;
 }
 
 std::string Cpu::state_line() const {

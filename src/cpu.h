@@ -12,6 +12,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "memory.h"
 
@@ -94,6 +95,19 @@ public:
 
     uint64_t instructions_executed = 0;
     bool trace = false;
+
+    // A ring buffer of the addresses of the last instructions executed, kept
+    // when history_size() > 0.  A fault deep inside a large guest is otherwise
+    // almost impossible to place: --trace produces gigabytes, while the last
+    // few hundred addresses name the loop or the call that got there.
+    void enable_history(size_t entries) {
+        history_.assign(entries, 0);
+        history_pos_ = 0;
+        history_filled_ = 0;
+    }
+    size_t history_size() const { return history_.size(); }
+    // The addresses, oldest first.
+    std::vector<uint64_t> history() const;
 
     Mode mode() const { return mode_; }
     bool is64() const { return mode_ == Mode::X86_64; }
@@ -242,6 +256,10 @@ private:
     uint32_t xmm_read_d(const RM& rm);    // low 32 bits of an operand
 
     [[noreturn]] void unsupported(const char* what, uint8_t opcode, uint64_t start_rip);
+
+    std::vector<uint64_t> history_;
+    size_t history_pos_ = 0;
+    size_t history_filled_ = 0;
 
     Memory& mem_;
     Mode mode_;

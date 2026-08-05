@@ -136,6 +136,13 @@ void Emulator::install_library_hooks() {
         e.set_result(count);
     });
     libc("fflush", [](Emulator& e) {
+        // The guest's own buffered stdout has to go out too, not just the host's
+        // streams: a guest that flushes before writing to another descriptor is
+        // ordering its output deliberately, and holding the bytes back reorders
+        // it.  fflush(NULL) means every stream.
+        int fd = e.host_fd(e.arg_slot(0));
+        if (fd == 1 || e.arg_slot(0) == 0) e.flush_guest_output();
+        if (fd > 2) e.files.flush(fd);
         std::fflush(stdout);
         std::fflush(stderr);
         e.set_result(0);

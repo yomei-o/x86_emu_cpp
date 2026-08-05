@@ -26,8 +26,26 @@ void usage() {
                  "  -n, --max-insns N    stop after N instructions (0 = unlimited)\n"
                  "  -d, --dump ADDR[:N]  hex dump N bytes of guest memory after loading\n"
                  "  -L, --libpath DIR    also look here for DLLs the guest imports\n"
+                 "  -r, --sysroot DIR    treat DIR as a Linux guest's filesystem root\n"
+                 "      --history N      on a fault, print the last N instruction addresses\n"
                  "      --imports        list imports with no implementation, then exit\n"
                  "  -h, --help           this text\n");
+}
+
+// The tail of --history, printed after a fault.  Runs of consecutive addresses
+// are collapsed: what matters is the branches and calls, not the straight-line
+// code between them.
+void print_history(x86emu::Emulator& emu) {
+    std::vector<uint64_t> h = emu.cpu().history();
+    if (h.empty()) return;
+    std::fprintf(stderr, "  last %zu instructions (--history):\n", h.size());
+    for (size_t i = 0; i < h.size(); ++i) {
+        // Only print an address when control did not simply fall through from
+        // the previous one, plus the last few unconditionally.
+        bool interesting = i == 0 || i + 4 >= h.size() || h[i] < h[i - 1] || h[i] > h[i - 1] + 16;
+        if (!interesting) continue;
+        std::fprintf(stderr, "    %012llX\n", (unsigned long long)h[i]);
+    }
 }
 
 }  // namespace
@@ -37,6 +55,7 @@ int main(int argc, char** argv) {
     std::string program;
     std::vector<std::string> guest_args;
     std::vector<std::pair<uint64_t, uint64_t>> dumps;
+    size_t history = 0;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -61,6 +80,18 @@ int main(int argc, char** argv) {
                 return 2;
             }
             opt.library_paths.push_back(argv[++i]);
+        } else if (a == "--history") {
+            if (i + 1 >= argc) {
+                usage();
+                return 2;
+            }
+            history = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 0));
+        } else if (a == "-r" || a == "--sysroot") {
+            if (i + 1 >= argc) {
+                usage();
+                return 2;
+            }
+            x86emu::FileTable::set_sysroot(argv[++i]);
         } else if (a == "-d" || a == "--dump") {
             if (i + 1 >= argc) {
                 usage();
@@ -118,6 +149,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (history) emu.cpu().enable_history(history);
+
     // Dumps happen after loading and before the first instruction, which is
     // where you want them when checking that an image was mapped correctly.
     for (const auto& [addr, len] : dumps) {
@@ -153,6 +186,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "  %s\n", emu.cpu().state_line().c_str());
         std::fprintf(stderr, "  after %llu instructions\n",
                      (unsigned long long)emu.cpu().instructions_executed);
+        print_history(emu);
         return 1;
     } catch (const x86emu::MemoryFault& err) {
         std::fflush(stdout);
@@ -163,6 +197,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "  %s\n", emu.cpu().state_line().c_str());
         std::string trace = emu.stack_trace();
         if (!trace.empty()) std::fprintf(stderr, "  possible callers:\n%s", trace.c_str());
+        print_history(emu);
         return 1;
     }
 }

@@ -15,6 +15,13 @@ void Memory::map(uint64_t addr, uint64_t size, const std::string& name) {
     if (!name.empty()) regions_.push_back({addr, size, name});
 }
 
+void Memory::unmap(uint64_t addr, uint64_t size) {
+    if (size == 0) return;
+    uint64_t first = addr >> kPageBits;
+    uint64_t last = (addr + size - 1) >> kPageBits;
+    for (uint64_t p = first; p <= last; ++p) pages_.erase(p);
+}
+
 uint8_t* Memory::host_ptr(uint64_t addr, bool for_write) const {
     auto it = pages_.find(addr >> kPageBits);
     if (it == pages_.end()) {

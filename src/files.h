@@ -155,6 +155,13 @@ public:
         bool is_char_device = false;
         bool is_fifo = false;
         int64_t mtime = 0;
+        // A distinct inode per path.  This is not decoration: musl's dynamic
+        // linker decides whether a shared library is already loaded by
+        // comparing st_dev/st_ino, so one shared inode number makes the second
+        // library it opens look like the first, and every symbol in it goes
+        // missing.
+        uint64_t ino = 1;
+        uint64_t dev = 1;
     };
     static int stat_path(const std::string& path, Stat& out);
     int stat_fd(int fd, Stat& out);
@@ -163,8 +170,16 @@ public:
     // their own conventions, and the host may be either.
     static std::string host_path(const std::string& guest_path);
 
+    // A directory standing in for a Linux guest's "/": absolute paths like
+    // /usr/bin/cc1 resolve inside it.  This is what lets an unmodified distro
+    // toolchain, which has /usr baked into every search path, run from a
+    // directory of unpacked packages.  Empty (the default) means no remapping.
+    static void set_sysroot(std::string dir);
+
 private:
     int alloc_slot();
+    // A stable inode number for a host path (see Stat::ino).
+    static uint64_t inode_for(const std::string& host_path);
 
     std::unordered_map<int, Entry> files_;
     bool translate_newlines_ = false;

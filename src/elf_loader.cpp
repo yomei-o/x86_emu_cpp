@@ -124,6 +124,11 @@ LoadedImage load_elf(const std::vector<uint8_t>& f, Memory& mem, uint64_t load_b
     if (lowest == ~0ull) throw LoadError("no PT_LOAD segments");
     img.image_base = lowest;
     img.image_size = img.brk - lowest;
+    // Dynamic linking is signalled by PT_INTERP, not by ET_DYN: a distro
+    // toolchain ships ET_EXEC binaries that still need ld.so (non-PIE, fixed
+    // addresses, PLT relocations).  Entering one directly jumps through an
+    // unrelocated PLT into address zero.
+    if (!img.interp.empty()) img.is_dynamic = true;
     return img;
 }
 

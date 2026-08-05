@@ -32,7 +32,7 @@ enum class Sys {
     Getpid, Gettid, Uname, ClockGettime, Time,
     ArchPrctl, SetTidAddress, RtSigaction, RtSigprocmask, SetThreadArea,
     Mprotect, Madvise, Futex, GetRandom, Readlink, Openat, SetRobustList,
-    Prlimit64, GetIds, SchedGetaffinity, Ignored, NotImplemented,
+    Prlimit64, Getrlimit, GetIds, SchedGetaffinity, Ignored, NotImplemented,
     Fork, Vfork, Execve, Wait4, Kill, Pipe, Pipe2, Clone, Getppid, SchedYield,
     Chdir, Fchdir,
 };
@@ -71,7 +71,7 @@ Sys map_x86_64(uint64_t nr) {
         case 63: return Sys::Uname;
         case 96: return Sys::Time;
         case 89: return Sys::Readlink;
-        case 97: return Sys::Prlimit64;   // getrlimit, close enough
+        case 97: return Sys::Getrlimit;
         case 102: case 104: case 107: case 108: return Sys::GetIds;
         case 158: return Sys::ArchPrctl;
         case 186: return Sys::Gettid;
@@ -185,6 +185,49 @@ void host_write(Emulator& e, int fd, const std::string& data) {
     e.write_raw(fd, data.data(), data.size());
 }
 
+// Answers getrlimit/prlimit64 per resource.  One value for every resource is
+// not good enough: a program sizes itself from these, and GCC in particular
+// derives its garbage collector's heap parameters from RLIMIT_DATA/RSS/AS -
+// answering "8 MB" there configures a compiler that spends its life collecting.
+void write_rlimit(Emulator& e, uint64_t out, int resource) {
+    // The values a stock Linux reports, because a guest does not merely read
+    // these - it *acts* on them.  GCC raises RLIMIT_STACK whenever rlim_max
+    // exceeds rlim_cur, so reporting an infinite maximum for the stack sends it
+    // down a path a real system never would.
+    constexpr uint64_t kInfinity = ~0ull;
+    uint64_t cur = kInfinity, max = kInfinity;
+    switch (resource) {
+        case 3:   // RLIMIT_STACK: 8 MiB, and not raisable
+            cur = max = 8ull << 20;
+            break;
+        case 4:   // RLIMIT_CORE: no core dumps here
+            cur = 0;
+            break;
+        case 6:   // RLIMIT_NPROC
+        case 11:  // RLIMIT_SIGPENDING
+            cur = max = 7823;
+            break;
+        case 7:   // RLIMIT_NOFILE - the descriptor table's real bound
+            cur = 1024;
+            max = 65536;
+            break;
+        case 8:   // RLIMIT_MEMLOCK
+            cur = max = 65536;
+            break;
+        case 12:  // RLIMIT_MSGQUEUE
+            cur = max = 819200;
+            break;
+        case 13:  // RLIMIT_NICE
+        case 14:  // RLIMIT_RTPRIO
+            cur = max = 0;
+            break;
+        default:  // CPU, FSIZE, DATA, RSS, AS, LOCKS, RTTIME: unlimited
+            break;
+    }
+    e.mem.write64(out, cur);
+    e.mem.write64(out + 8, max);
+}
+
 int64_t host_chdir(const std::string& path) {
 #if defined(_WIN32)
     return _chdir(path.c_str()) == 0 ? 0 : -2;  // ENOENT
@@ -283,6 +326,11 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             return static_cast<int64_t>(target);
         }
         case Sys::Munmap:
+            // Really unmapping matters: a compiler's garbage collector cycles
+            // through mmap/munmap thousands of times, and a no-op munmap runs
+            // the address space out mid-compilation - which the guest sees as a
+            // failed allocation and usually dereferences.
+            e.free_pages(a[0], a[1]);
             return 0;
         case Sys::Brk:
             return static_cast<int64_t>(e.set_brk(a[0]));
@@ -518,15 +566,15 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             }
             return static_cast<int64_t>(len);
         }
-        case Sys::Prlimit64: {
-            // Report a generous, fixed stack and file-descriptor limit.
-            uint64_t out = a[3] ? a[3] : a[1];
-            if (out) {
-                e.mem.write64(out, 8ull << 20);       // rlim_cur
-                e.mem.write64(out + 8, ~0ull);        // rlim_max
-            }
+        case Sys::Prlimit64:
+            // prlimit64(pid, resource, new_limit, old_limit).  A "set" is
+            // accepted and ignored; nothing here enforces limits.
+            if (a[3]) write_rlimit(e, a[3], static_cast<int>(a[1]));
             return 0;
-        }
+        case Sys::Getrlimit:
+            // getrlimit(resource, rlim*)
+            if (a[1]) write_rlimit(e, a[1], static_cast<int>(a[0]));
+            return 0;
         case Sys::SchedGetaffinity: {
             uint64_t mask = a[2];
             if (mask) e.mem.write64(mask, 1);  // one CPU
@@ -649,9 +697,17 @@ void Emulator::install_syscall_handlers() {
         if (sys == Sys::Unknown && opt_.trace_calls)
             std::fprintf(stderr, "[sys] unimplemented syscall %llu\n",
                          (unsigned long long)nr);
-        else if (opt_.trace_calls)
-            std::fprintf(stderr, "[sys] %llu\n", (unsigned long long)nr);
         int64_t r = do_syscall(*this, sys, a);
+        // Arguments and result together, so a trace can be diffed against
+        // another implementation's (qemu's -strace, say) to find where two runs
+        // first disagree.
+        if (opt_.trace_calls)
+            std::fprintf(stderr,
+                         "[sys] %llu(%llx,%llx,%llx,%llx,%llx,%llx) = %lld\n",
+                         (unsigned long long)nr, (unsigned long long)a[0],
+                         (unsigned long long)a[1], (unsigned long long)a[2],
+                         (unsigned long long)a[3], (unsigned long long)a[4],
+                         (unsigned long long)a[5], (long long)r);
         // A blocked syscall rewound RIP to run again; RAX still holds the
         // syscall number and must survive until the retry.
         if (!cpu_->halted && !take_syscall_block()) cpu_->regs[RAX] = static_cast<uint64_t>(r);
