@@ -40,12 +40,28 @@ bool is_system_library(const std::string& lower_name) {
         "oleaut32", "ws2_32", "wsock32", "rpcrt4", "sechost", "shlwapi", "psapi",
         "version", "comdlg32", "comctl32", "winmm", "imm32", "setupapi", "crypt32",
         "bcrypt", "ncrypt", "userenv", "netapi32", "iphlpapi", "dbghelp",
-        // msvcp (the C++ standard library) and vcruntime (the C++ *language*
-        // runtime) are deliberately absent.  Both export things that cannot be
-        // hooked: msvcp exports std::cout as *data*, and vcruntime owns the
-        // language half of exception handling - __CxxFrameHandler4 is called by
-        // the unwinder with an ABI no hook can stand in for.  They have to be the
-        // real DLLs, and everything they in turn import is on this list.
+        // Deliberately absent, because they export things no hook can stand in
+        // for, so they have to be the real files when the guest can find them:
+        //
+        //   msvcp*      - exports std::cout as *data*
+        //   vcruntime*  - owns the language half of exception handling;
+        //                 __CxxFrameHandler4 is called by the unwinder itself
+        //
+        // Everything here stays hooked.  A guest that cannot find a non-listed
+        // DLL falls back to hooks anyway, which is why this list is a policy
+        // rather than a requirement - and also why adding to it is safer than
+        // removing from it: a name taken off the list changes behaviour only on
+        // the machines where that file happens to be findable.
+        //
+        // The UCRT (`ucrtbase` and the `api-ms-win-crt-*` forwarders) was tried
+        // *off* this list, since its own imports are all `api-ms-win-core-*`,
+        // which forward to kernel32 and land back on these hooks - so loading it
+        // does not drag the NT layer in.  It does load and run: a /MD guest gets
+        // through the real UCRT's initialisation, its lowio setup and its exit
+        // path.  But **nothing it prints comes out** - no WriteFile, no
+        // WriteConsole, no error - so the result is a silent program where the
+        // hooks give a working one.  Until that is understood it stays hooked;
+        // resume.md records how far it got and where to look.
         "msvcrt", "msvcr", "ucrtbase", "concrt",
         "api-ms-win-", "ext-ms-win-", "ntdll",
     };

@@ -129,23 +129,49 @@ and something has to answer. Two ways out, and the trade is the point:
    which is also why float output matches byte for byte), and it keeps the guest
    away from the NT layer entirely. The cost is a wide, shallow surface - this
    session added dozens of `_s` variants - and every hook is a chance to lie.
-2. *Load the real `ucrtbase.dll`*. **An x64 one exists on this machine**:
-   `C:\Program Files (x86)\Windows Kits\10\Redist\10.0.22621.0\ucrt\DLLs\x64\ucrtbase.dll`
-   (System32's is ARM64 and useless here). Dropping `ucrtbase` and
-   `api-ms-win-` from `is_system_library()` and pointing `-L` at that directory
-   is a five-minute experiment.
+2. *Load the real `ucrtbase.dll`*. **This was tried**, and the result is written
+   up below. It is not the wall it looked like, but it does not work yet either.
 
-The reason (2) has not been done is that `ucrtbase` talks to **ntdll's internals**,
-not to kernel32: `RtlAllocateHeap`, `NtQueryInformationProcess`, the loader lock,
-PEB fields, `LdrLoadDll`. That is the NT-kernel boundary this project has
-deliberately not emulated, and it is a much deeper surface than the CRT's. The
-same reasoning is why the boundary is *not* fixed: `vcruntime140.dll` moved from
-hooked to loaded-for-real this session, because its exception ABI cannot be
+The boundary is *not* fixed, which is the useful part: `vcruntime140.dll` moved
+from hooked to loaded-for-real this session because its exception ABI cannot be
 hooked at all. Each library goes below the line when hooking it stops working.
 
-If (2) is tried, the honest test is the existing `/MD` suite -
-`tests/msvc/bin/*_MD*` - diffed against native, and the first thing to watch is
-how far `DllMain` gets before it wants something from ntdll.
+### The UCRT experiment, and how far it got
+
+An x64 `ucrtbase.dll` and the whole `api-ms-win-crt-*` forwarder set exist here:
+`C:\Program Files (x86)\Windows Kits\10\Redist\10.0.22621.0\ucrt\DLLs\x64\`
+(System32's is ARM64 and useless). Taking `ucrtbase` and `api-ms-win-crt-` off
+`is_system_library()`'s list and pointing `-L` there:
+
+- **The premise was wrong, in a good way.** `ucrtbase` imports *nothing* from
+  ntdll: its whole import list is `api-ms-win-core-*`, which forward to kernel32
+  and land back on the existing hooks. Letting it load does not drag the NT layer
+  in. (`api-ms-win-core-*` must stay hooked; leaving the whole namespace loadable
+  is fine, because those forwarders resolve to `kernel32.<name>`, kernel32 *is*
+  on the list, and the import falls back to a hook by itself.)
+- **It loads and runs.** `api-ms-win-crt-runtime` → `ucrtbase` → the rest of the
+  forwarders all map, `ucrtbase`'s `DllMain` completes, and its lowio
+  initialisation calls `GetStdHandle`+`GetFileType` three times, exactly as the
+  real one does.
+- **But nothing it prints comes out.** `hello_msvc_MD64` exits 0 and produces no
+  output: no `WriteFile`, no `WriteConsoleW`, no error. 40/40 tests still pass
+  (they do not depend on the UCRT being loadable), so this is silent rather than
+  broken - which is worse, and why the change was reverted rather than kept.
+
+Where to look when picking this up: the real UCRT decided that stdout is not
+writable. Its lowio setup takes the three handles from `GetStdHandle` (we return
+0x1000+fd) and `GetFileType` (we return CHAR for a terminal, DISK otherwise), and
+before that it looks for *inherited* handle information in
+`RTL_USER_PROCESS_PARAMETERS.RuntimeData` - which the emulator does not populate,
+and which may be being read as garbage rather than as absent. Also worth checking
+what `GetConsoleMode` returning 0 (deliberate, so a guest picks the plain
+`WriteFile` path) does to the real UCRT's console detection, and whether
+`GetFileInformationByHandle` is wanted.
+
+Keep in mind the risk that made the revert right: removing a name from the list
+changes behaviour only on machines where that file happens to be findable, so a
+guest that ships its own `ucrtbase.dll` - some Python distributions do - would
+have silently stopped printing.
 
 ## Next: the three things actually blocked
 
