@@ -28,6 +28,7 @@ tests/hosted/bin/
 
 # qemu-diff working files (see tools/qemu-diff) and the Alpine gcc sysroot.
 /gccroot/
+/glibcroot/
 /qemu.seq
 /ours.seq.bin
 /census_filter.txt

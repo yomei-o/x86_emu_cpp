@@ -658,6 +658,167 @@ bool Cpu::execute_sse(uint8_t op) {
                                  ? 0xFFFFFFFFu : 0;
             return true;
         }
+        case 0xD5:
+        case 0xE4:
+        case 0xE5:
+        case 0xF4:
+        case 0xF5: {  // PMULLW / PMULHUW / PMULHW / PMULUDQ / PMADDWD
+            if (sel != Sel::P66) return false;
+            RM rm = decode_modrm();
+            Xmm s = xmm_read(rm);
+            Xmm& d = xmm[modrm_reg_];
+            switch (op) {
+                case 0xD5:
+                    for (int i = 0; i < 8; ++i)
+                        d.w[i] = static_cast<uint16_t>(d.w[i] * s.w[i]);
+                    break;
+                case 0xE4:
+                    for (int i = 0; i < 8; ++i)
+                        d.w[i] = static_cast<uint16_t>((static_cast<uint32_t>(d.w[i]) * s.w[i]) >> 16);
+                    break;
+                case 0xE5:
+                    for (int i = 0; i < 8; ++i)
+                        d.w[i] = static_cast<uint16_t>(
+                            (static_cast<int32_t>(static_cast<int16_t>(d.w[i])) *
+                             static_cast<int16_t>(s.w[i])) >> 16);
+                    break;
+                case 0xF4:
+                    d.q[0] = static_cast<uint64_t>(d.d[0]) * s.d[0];
+                    d.q[1] = static_cast<uint64_t>(d.d[2]) * s.d[2];
+                    break;
+                default: {  // PMADDWD: pairwise signed multiply-add into dwords
+                    for (int i = 0; i < 4; ++i) {
+                        int32_t lo = static_cast<int16_t>(d.w[i * 2]) *
+                                     static_cast<int16_t>(s.w[i * 2]);
+                        int32_t hi = static_cast<int16_t>(d.w[i * 2 + 1]) *
+                                     static_cast<int16_t>(s.w[i * 2 + 1]);
+                        d.d[i] = static_cast<uint32_t>(lo + hi);
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
+        case 0xF6: {  // PSADBW: sums of absolute byte differences per half
+            if (sel != Sel::P66) return false;
+            RM rm = decode_modrm();
+            Xmm s = xmm_read(rm);
+            Xmm& d = xmm[modrm_reg_];
+            for (int half = 0; half < 2; ++half) {
+                uint32_t sum = 0;
+                for (int i = 0; i < 8; ++i) {
+                    int diff = d.b[half * 8 + i] - s.b[half * 8 + i];
+                    sum += static_cast<uint32_t>(diff < 0 ? -diff : diff);
+                }
+                d.q[half] = sum;
+            }
+            return true;
+        }
+        case 0xE0:
+        case 0xE3: {  // PAVGB / PAVGW (rounded unsigned average)
+            if (sel != Sel::P66) return false;
+            RM rm = decode_modrm();
+            Xmm s = xmm_read(rm);
+            Xmm& d = xmm[modrm_reg_];
+            if (op == 0xE0)
+                for (int i = 0; i < 16; ++i)
+                    d.b[i] = static_cast<uint8_t>((d.b[i] + s.b[i] + 1) >> 1);
+            else
+                for (int i = 0; i < 8; ++i)
+                    d.w[i] = static_cast<uint16_t>((d.w[i] + s.w[i] + 1) >> 1);
+            return true;
+        }
+        case 0xD8:
+        case 0xD9:
+        case 0xDC:
+        case 0xDD:
+        case 0xE8:
+        case 0xE9:
+        case 0xEC:
+        case 0xED: {  // saturating PSUBUS/PADDUS/PSUBS/PADDS, bytes and words
+            if (sel != Sel::P66) return false;
+            RM rm = decode_modrm();
+            Xmm s = xmm_read(rm);
+            Xmm& d = xmm[modrm_reg_];
+            auto sat_u8 = [](int v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); };
+            auto sat_u16 = [](int v) { return static_cast<uint16_t>(v < 0 ? 0 : v > 65535 ? 65535 : v); };
+            auto sat_s8 = [](int v) { return static_cast<uint8_t>(v < -128 ? -128 : v > 127 ? 127 : v); };
+            auto sat_s16 = [](int v) { return static_cast<uint16_t>(v < -32768 ? -32768 : v > 32767 ? 32767 : v); };
+            switch (op) {
+                case 0xD8: for (int i = 0; i < 16; ++i) d.b[i] = sat_u8(d.b[i] - s.b[i]); break;
+                case 0xD9: for (int i = 0; i < 8; ++i) d.w[i] = sat_u16(d.w[i] - s.w[i]); break;
+                case 0xDC: for (int i = 0; i < 16; ++i) d.b[i] = sat_u8(d.b[i] + s.b[i]); break;
+                case 0xDD: for (int i = 0; i < 8; ++i) d.w[i] = sat_u16(d.w[i] + s.w[i]); break;
+                case 0xE8: for (int i = 0; i < 16; ++i) d.b[i] = sat_s8(static_cast<int8_t>(d.b[i]) - static_cast<int8_t>(s.b[i])); break;
+                case 0xE9: for (int i = 0; i < 8; ++i) d.w[i] = sat_s16(static_cast<int16_t>(d.w[i]) - static_cast<int16_t>(s.w[i])); break;
+                case 0xEC: for (int i = 0; i < 16; ++i) d.b[i] = sat_s8(static_cast<int8_t>(d.b[i]) + static_cast<int8_t>(s.b[i])); break;
+                default: for (int i = 0; i < 8; ++i) d.w[i] = sat_s16(static_cast<int16_t>(d.w[i]) + static_cast<int16_t>(s.w[i])); break;
+            }
+            return true;
+        }
+        case 0xEA:
+        case 0xEE: {  // PMINSW / PMAXSW
+            if (sel != Sel::P66) return false;
+            RM rm = decode_modrm();
+            Xmm s = xmm_read(rm);
+            Xmm& d = xmm[modrm_reg_];
+            for (int i = 0; i < 8; ++i) {
+                int16_t a = static_cast<int16_t>(d.w[i]), b = static_cast<int16_t>(s.w[i]);
+                d.w[i] = static_cast<uint16_t>(op == 0xEA ? (b < a ? b : a) : (b > a ? b : a));
+            }
+            return true;
+        }
+        case 0xD1:
+        case 0xD2:
+        case 0xD3:
+        case 0xE1:
+        case 0xE2:
+        case 0xF1:
+        case 0xF2:
+        case 0xF3: {  // PSRL/PSRA/PSLL with the count in an xmm or m128
+            if (sel != Sel::P66) return false;
+            RM rm = decode_modrm();
+            uint64_t count = xmm_read(rm).q[0];
+            Xmm& d = xmm[modrm_reg_];
+            bool arith = op == 0xE1 || op == 0xE2;
+            bool left = op >= 0xF1;
+            int elem = (op == 0xD1 || op == 0xE1 || op == 0xF1)   ? 2
+                       : (op == 0xD2 || op == 0xE2 || op == 0xF2) ? 4
+                                                                  : 8;
+            int bits = elem * 8;
+            for (int i = 0; i < 16 / elem; ++i) {
+                if (elem == 2) {
+                    uint16_t& v = d.w[i];
+                    if (count >= static_cast<uint64_t>(bits))
+                        v = arith ? static_cast<uint16_t>(static_cast<int16_t>(v) >> 15) : 0;
+                    else if (left)
+                        v = static_cast<uint16_t>(v << count);
+                    else if (arith)
+                        v = static_cast<uint16_t>(static_cast<int16_t>(v) >> count);
+                    else
+                        v = static_cast<uint16_t>(v >> count);
+                } else if (elem == 4) {
+                    uint32_t& v = d.d[i];
+                    if (count >= static_cast<uint64_t>(bits))
+                        v = arith ? static_cast<uint32_t>(static_cast<int32_t>(v) >> 31) : 0;
+                    else if (left)
+                        v = v << count;
+                    else if (arith)
+                        v = static_cast<uint32_t>(static_cast<int32_t>(v) >> count);
+                    else
+                        v = v >> count;
+                } else {
+                    uint64_t& v = d.q[i];
+                    if (count >= static_cast<uint64_t>(bits))
+                        v = 0;  // there is no PSRAQ in SSE2
+                    else if (left)
+                        v = v << count;
+                    else
+                        v = v >> count;
+                }
+            }
+            return true;
+        }
         case 0xDA:
         case 0xDE: {  // PMINUB / PMAXUB
             if (sel != Sel::P66) return false;
@@ -761,9 +922,56 @@ bool Cpu::execute_sse(uint8_t op) {
         }
 
         // ---- MXCSR ----------------------------------------------------------
-        case 0xAE: {  // LDMXCSR / STMXCSR / the fences
+        case 0xAE: {  // FXSAVE / FXRSTOR / LDMXCSR / STMXCSR / the fences
             RM rm = decode_modrm();
             int sub = modrm_reg_ & 7;
+            if (sub == 0 && !rm.is_reg) {  // FXSAVE
+                // The 512-byte area, as far as anything here consumes it: the
+                // control words, MXCSR, the x87 stack and the xmm registers.
+                // ST values are stored as the host doubles they are kept in
+                // (8 bytes into the 16-byte slot, the rest zero), which is not
+                // the 80-bit hardware format - only our own FXRSTOR reads them
+                // back, and a guest that does (glibc's lazy-PLT resolver, a
+                // setjmp) only ever round-trips the block unmodified.
+                uint8_t area[512] = {};
+                auto put16 = [&](int off, uint16_t v) { std::memcpy(area + off, &v, 2); };
+                auto put32 = [&](int off, uint32_t v) { std::memcpy(area + off, &v, 4); };
+                put16(0, fpu_control);
+                uint16_t sw = static_cast<uint16_t>((fpu_status & ~0x3800u) |
+                                                    ((st_top & 7) << 11));
+                put16(2, sw);
+                uint8_t ftw = 0;
+                for (int i = 0; i < 8; ++i)
+                    if (st_used[i]) ftw |= static_cast<uint8_t>(1u << i);
+                area[4] = ftw;
+                put32(24, mxcsr);
+                put32(28, 0x0000FFFF);  // MXCSR_MASK
+                for (int i = 0; i < 8; ++i)
+                    std::memcpy(area + 32 + i * 16, &st[i], 8);
+                int nxmm = is64() ? 16 : 8;
+                for (int i = 0; i < nxmm; ++i)
+                    std::memcpy(area + 160 + i * 16, xmm[i].b, 16);
+                mem_.write(rm.addr, area, sizeof area);
+                return true;
+            }
+            if (sub == 1 && !rm.is_reg) {  // FXRSTOR
+                uint8_t area[512];
+                mem_.read(rm.addr, area, sizeof area);
+                std::memcpy(&fpu_control, area + 0, 2);
+                uint16_t sw;
+                std::memcpy(&sw, area + 2, 2);
+                fpu_status = sw;
+                st_top = (sw >> 11) & 7;
+                uint8_t ftw = area[4];
+                for (int i = 0; i < 8; ++i) st_used[i] = (ftw >> i) & 1;
+                std::memcpy(&mxcsr, area + 24, 4);
+                for (int i = 0; i < 8; ++i)
+                    std::memcpy(&st[i], area + 32 + i * 16, 8);
+                int nxmm = is64() ? 16 : 8;
+                for (int i = 0; i < nxmm; ++i)
+                    std::memcpy(xmm[i].b, area + 160 + i * 16, 16);
+                return true;
+            }
             if (sub == 2)
                 mxcsr = static_cast<uint32_t>(rm_read(rm, 4));
             else if (sub == 3)

@@ -308,6 +308,14 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             uint64_t target;
             if (flags & kMapFixed) {           // ld.so reserves a span, then drops
                 target = addr;                 // each segment at a fixed sub-address
+                // MAP_FIXED *replaces* the range: whatever was there reads as
+                // zero afterwards.  map() alone keeps existing page contents,
+                // and glibc's ld.so maps its .bss with MAP_FIXED|MAP_ANONYMOUS
+                // over pages that still held file bytes - every zero-initialised
+                // libc global came up as junk, which a NULL-check then believed.
+                uint64_t page = target & ~0xFFFull;
+                uint64_t span = (target - page + len + 0xFFF) & ~0xFFFull;
+                e.mem.unmap(page, span);
                 e.mem.map(target, len, "mmap");
             } else {
                 target = e.alloc_pages(len);   // a fresh region (hint addr ignored)

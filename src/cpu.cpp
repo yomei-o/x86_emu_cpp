@@ -704,12 +704,18 @@ void Cpu::execute_0f() {
             // more: a libc picks its memcpy/strlen implementation from these
             // bits, so claiming AVX or SSE4.2 here would make it jump straight
             // into instructions that do not exist.  SSE2 and CMOV are safe (see
-            // sse.cpp); MMX, FXSR, POPCNT and everything newer are not.
+            // sse.cpp); POPCNT and everything newer are not.  MMX and FXSR are
+            // advertised because glibc's ld.so refuses to load anything marked
+            // x86-64-baseline without them (and SCE below, likewise): FXSAVE/
+            // FXRSTOR are real (sse.cpp), and nothing on x86-64 emits actual
+            // MMX code once SSE2 is there.
             enum : uint32_t {
                 EDX_FPU = 1u << 0,
                 EDX_TSC = 1u << 4,
                 EDX_CX8 = 1u << 8,
                 EDX_CMOV = 1u << 15,
+                EDX_MMX = 1u << 23,
+                EDX_FXSR = 1u << 24,
                 EDX_SSE = 1u << 25,
                 EDX_SSE2 = 1u << 26,
             };
@@ -726,7 +732,8 @@ void Cpu::execute_0f() {
                     regs[RAX] = 0x000306C3;  // a Haswell-era family/model/stepping
                     regs[RBX] = 0x00000800;  // one logical processor, CLFLUSH 64B
                     regs[RCX] = 0;           // no SSE3 or later
-                    regs[RDX] = EDX_FPU | EDX_TSC | EDX_CX8 | EDX_CMOV | EDX_SSE | EDX_SSE2;
+                    regs[RDX] = EDX_FPU | EDX_TSC | EDX_CX8 | EDX_CMOV | EDX_MMX |
+                                EDX_FXSR | EDX_SSE | EDX_SSE2;
                     break;
                 case 0x80000000:
                     regs[RAX] = 0x80000001;
@@ -734,7 +741,9 @@ void Cpu::execute_0f() {
                     break;
                 case 0x80000001:
                     regs[RAX] = regs[RBX] = regs[RCX] = 0;
-                    regs[RDX] = is64() ? (1u << 29) : 0;  // long mode
+                    // Long mode, and SYSCALL (bit 11) - the instruction is real
+                    // here, and glibc's baseline ISA check insists on the bit.
+                    regs[RDX] = is64() ? (1u << 29) | (1u << 11) : 0;
                     break;
                 default:
                     regs[RAX] = regs[RBX] = regs[RCX] = regs[RDX] = 0;

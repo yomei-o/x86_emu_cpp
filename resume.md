@@ -390,6 +390,57 @@ fine, so the configuration is legitimate — but a guest that genuinely needs a
 deep stack will hit it, and the honest next step is a real
 setrlimit(RLIMIT_STACK) that grows the stack mapping.
 
+## Done 2026-08-05 (night, later): glibc's gcc too — Ubuntu 22.04, real ld-linux
+
+The "glibc's ld.so is a step harder" item is done: **Ubuntu 22.04's gcc 11
+compiles, links and the result runs**, all inside the emulator, through the
+real `ld-linux-x86-64.so.2` and `libc.so.6`. `gcc -S -O2` output is
+byte-identical to the same gcc running natively (WSL). Four things stood in
+the way, each its own lesson:
+
+1. **The ISA gate.** glibc's ld.so refuses any x86-64-baseline-marked library
+   unless CPUID shows CMOV/CX8/FPU/FXSR/MMX/SCE/SSE/SSE2 — "CPU ISA level is
+   lower than required" with FXSR and MMX and SYSCALL bits missing. CPUID now
+   advertises them: FXSAVE/FXRSTOR are implemented for real (sse.cpp; glibc's
+   lazy-PLT resolver and setjmp only ever round-trip the area), SYSCALL was
+   always real, and nothing on x86-64 emits actual MMX once SSE2 exists.
+   Leaf-1 ECX stays 0, so IFUNC dispatch picks the sse2 string routines,
+   which is exactly what the interpreter implements.
+2. **MAP_FIXED must replace, not merge.** `Memory::map()` keeps existing page
+   contents; a real `mmap(MAP_FIXED)` reads back zero. glibc's ld.so maps a
+   library's whole file image first and then drops `MAP_FIXED|MAP_ANONYMOUS`
+   over the .bss range — which still held file bytes, so every
+   zero-initialised libc global came up as junk. The symptom was marvellous:
+   printf's `__printf_modifier_table` (normally NULL) read as ASCII text from
+   the license banner, passed its NULL check, and vfprintf dereferenced
+   prose. musl never tripped this because its .bss pages lie beyond the file
+   image and were genuinely fresh. The mmap syscall now unmaps the range
+   first.
+3. **Windows tar / cp -a and symlinks, again.** A WSL symlink copied to
+   /mnt/c is a reparse point Windows fopen answers EINVAL for — which ld.so
+   reports as "cannot open shared object file: Invalid argument" on a file
+   that is plainly there. (The aarch64 notes say the same about apk symlinks
+   writing as nothing.) Replace every symlink in a sysroot with a copy of its
+   target.
+4. **The multiply half of SSE2 was missing.** gcc 11's own code (Ubuntu
+   builds it -O2) hit PMULUDQ; the whole family went in together: PMULLW,
+   PMULHW/PMULHUW, PMULUDQ, PMADDWD, PSADBW, PAVGB/W, the saturating
+   add/subtract group (D8/D9/DC/DD/E8/E9/EC/ED), PMINSW/PMAXSW, and the
+   PSRL/PSRA/PSLL forms whose count is in an xmm (D1-D3/E1-E2/F1-F3).
+
+Sysroot recipe (from the WSL Ubuntu this machine has): copy `/usr/bin/{gcc,
+as,ld}`, `/usr/lib/gcc/x86_64-linux-gnu/11`, `/usr/libexec/gcc`,
+`/usr/include`, `/usr/lib/x86_64-linux-gnu`, `/lib64/ld-linux-x86-64.so.2`
+into `glibcroot/`, dereference every symlink, and put copies of
+`libc.so.6/libm.so.6/libmvec.so.1/libgcc_s.so.1/...` in
+`glibcroot/lib/x86_64-linux-gnu/` too, because `/usr/lib/.../libc.so` is a
+linker *script* naming `/lib/x86_64-linux-gnu/libc.so.6` by absolute path.
+
+What glibc still does not get: NPTL threads through this path are untested
+(the Alpine/musl thread tests pass; glibc's pthread creation wants more from
+`clone` and TLS than musl does), and `--strict`-style scrutiny has not been
+applied. The next guest worth trying is a dynamically linked glibc CPython.
+
 ### Reproducing the whole loop (this machine is x86-64, with WSL)
 
 ```sh
