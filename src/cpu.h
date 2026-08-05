@@ -80,6 +80,11 @@ public:
     // guests read the TEB through fs (32-bit) or gs (64-bit).
     uint64_t fs_base = 0;
     uint64_t gs_base = 0;
+    // 32-bit Linux TLS: set_thread_area fills a slot's base, and a later
+    // `mov %gs, sel` (see opcode 0x8E) points gs_base at it.
+    static constexpr unsigned kGdtSlots = 32;
+    uint64_t gdt_base[kGdtSlots] = {};
+    uint16_t fs_selector = 0, gs_selector = 0;
 
     bool halted = false;
     int exit_code = 0;

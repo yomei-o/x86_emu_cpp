@@ -150,6 +150,19 @@ inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         case Sys::Lseek:
             return e.files.seek(static_cast<int>(a[0]), static_cast<int64_t>(a[1]),
                                 static_cast<int>(a[2]));
+        case Sys::Llseek: {
+            // _llseek(fd, off_high, off_low, loff_t* result, whence): the 64-bit
+            // offset arrives split, the new position leaves through the pointer,
+            // and the return value is 0 - not the position.  Treating it like
+            // lseek made glibc read a stale errno and report EPERM for every
+            // seek, which `as` passed on as "can't write to section".
+            const int64_t off = static_cast<int64_t>((a[1] << 32) | (a[2] & 0xFFFFFFFFull));
+            const int64_t pos = e.files.seek(static_cast<int>(a[0]), off,
+                                             static_cast<int>(a[4]));
+            if (pos < 0) return pos;
+            if (a[3]) e.mem.write64(a[3], static_cast<uint64_t>(pos));
+            return 0;
+        }
         case Sys::Stat:
         case Sys::Lstat: {
             FileTable::Stat st;

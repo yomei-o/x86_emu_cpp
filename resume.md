@@ -390,6 +390,43 @@ fine, so the configuration is legitimate — but a guest that genuinely needs a
 deep stack will hit it, and the honest next step is a real
 setrlimit(RLIMIT_STACK) that grows the stack mapping.
 
+## Done 2026-08-06: 32-bit glibc gcc — Ubuntu jammy i386, real ld-linux.so.2
+
+The same exercise in 32-bit mode: **Ubuntu 22.04's i386 gcc-11 compiles, links
+and the result runs**, with `gcc -S -O2` output byte-identical to the same gcc
+running natively (an i386 chroot on the WSL host — its kernel still executes
+ia32, which beats qemu-i386 as a reference because the driver's children run
+too). The sysroot recipe is the arm64 one with `binary-i386` package indices
+into `glibcroot32/`; symlink dereferencing needs a second pass (directory
+symlinks invalidate paths mid-walk).
+
+Four emulator bugs, all of the same species — 64-bit assumptions the 32-bit
+path had never exercised, because until now no 32-bit dynamic guest existed
+(the old machine had no i686 cross-compiler):
+
+1. **The interpreter loaded at 0x7F0000000000 in a 32-bit guest too.**
+   Truncated to 32 bits, ld-linux.so.2's first indirect jump landed at
+   0x1D4B9 in unmapped memory. The base is now 0x60000000 when !is64().
+2. **The PIE default base had the same disease** (0x555555554000 → pages at
+   the full address, a guest computing mod 2^32): cc1 ran but `as`, PIE,
+   crashed at 0x55554034. 32-bit PIEs load at 0x56555000 now.
+3. **mmap2's offset argument counts pages, not bytes.** Taken as bytes, every
+   file mapping past the first page read the wrong part of the .so — ld.so
+   walked a link_map whose l_info was all NULL. `case 192` is Sys::Mmap2 now
+   and shifts by 12.
+4. **_llseek is not lseek.** Five arguments — split 64-bit offset, the new
+   position returned through a pointer, 0 on success. Treating a[1] as the
+   offset and returning the position made glibc's lseek64 wrapper hand back
+   -1 with a stale errno, which `as` reported as "can't write 16 bytes to
+   section .note.gnu.property: Operation not permitted" — a long way from a
+   seek.
+
+And one new instruction pair: **MOV Sreg, r/m (0x8E) and its store form
+(0x8C)** — glibc's 32-bit TLS does set_thread_area and then `mov %gs, ax`.
+set_thread_area now records each GDT slot's base and 0x8E resolves the
+selector against them (Cpu::gdt_base). Statx (383) stays unimplemented on
+purpose: glibc falls back to fstatat64 cleanly.
+
 ## Done 2026-08-05 (night, later): glibc's gcc too — Ubuntu 22.04, real ld-linux
 
 The "glibc's ld.so is a step harder" item is done: **Ubuntu 22.04's gcc 11

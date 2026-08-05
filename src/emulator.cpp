@@ -1380,12 +1380,19 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         bind_imports(self_raw->image);
         exe_tls_callbacks_ = self_raw->image.tls_callbacks;
     } else {
-        image_ = load_elf(file, mem);
+        // The PIE base has to fit the guest's pointer size: the 64-bit default
+        // truncates to 0x55554000 in a 32-bit guest, which is not where the
+        // pages went.  0x56555000 is where a 32-bit Linux kernel puts one.
+        image_ = load_elf(file, mem, is64() ? 0x555555554000ull : 0x56555000ull);
         // A dynamic (PIE) executable names an interpreter (ld.so) in PT_INTERP.
         // Map it at its own base and enter there first; it relocates the program
         // and the shared libraries and then jumps to the real entry (AT_ENTRY).
         if (image_.is_dynamic && !image_.interp.empty()) {
-            const uint64_t interp_base = 0x00007F0000000000ull;
+            // The base must fit the guest's pointer size: the 64-bit constant
+            // truncated to 32 bits landed ld-linux.so.2 in unmapped memory and
+            // the first indirect jump went with it.
+            const uint64_t interp_base =
+                is64() ? 0x00007F0000000000ull : 0x60000000ull;
             std::vector<uint8_t> ld = read_file(FileTable::host_path(image_.interp));
             LoadedImage li = load_elf(ld, mem, interp_base);
             image_.interp_base = li.load_bias;

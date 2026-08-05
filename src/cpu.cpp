@@ -1160,6 +1160,32 @@ void Cpu::step() {
             return;
         }
 
+        case 0x8C:    // MOV r/m16, Sreg
+        case 0x8E: {  // MOV Sreg, r/m16
+            // Segment registers exist here only as far as 32-bit TLS needs
+            // them: set_thread_area fills a GDT slot's base, glibc loads
+            // %gs (or %fs) with `entry*8 | 3`, and from then on gs:/fs:
+            // resolve through that base.  Everything else about selectors
+            // is not modelled.
+            RM rm = decode_modrm();
+            const unsigned sreg = modrm_reg_ & 7;
+            if (op == 0x8C) {
+                rm_write(rm, 2, sreg == 5 ? gs_selector : sreg == 4 ? fs_selector : 0);
+                return;
+            }
+            const uint16_t sel = static_cast<uint16_t>(rm_read(rm, 2));
+            const unsigned slot = sel >> 3;
+            if (sreg == 5) {  // GS
+                gs_selector = sel;
+                if (slot < kGdtSlots && gdt_base[slot]) gs_base = gdt_base[slot];
+            } else if (sreg == 4) {  // FS
+                fs_selector = sel;
+                if (slot < kGdtSlots && gdt_base[slot]) fs_base = gdt_base[slot];
+            }
+            // Loads of ds/es/ss with a flat selector change nothing.
+            return;
+        }
+
         case 0x8F: {  // POP rm
             RM rm = decode_modrm();
             rm_write(rm, ptr_size, pop());

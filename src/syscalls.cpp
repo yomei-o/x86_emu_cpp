@@ -27,7 +27,7 @@ enum class Sys {
     Read, Write, Writev, Readv, Close, Fstat, Ioctl,
     Open, Lseek, Stat, Lstat, Newfstatat, Unlink, Unlinkat, Rename,
     Access, Faccessat, Getcwd, Getdents64, Fcntl, Dup, Dup2, Dup3, Pread, Pwrite, Ftruncate,
-    Mmap, Munmap, Brk,
+    Mmap, Mmap2, Munmap, Brk, Llseek,
     Exit, ExitGroup,
     Getpid, Gettid, Uname, ClockGettime, Time,
     ArchPrctl, SetTidAddress, RtSigaction, RtSigprocmask, SetThreadArea,
@@ -121,7 +121,7 @@ Sys map_i386(uint64_t nr) {
         case 146: return Sys::Writev;
         case 174: return Sys::RtSigaction;
         case 175: return Sys::RtSigprocmask;
-        case 192: return Sys::Mmap;   // mmap2, offset in pages
+        case 192: return Sys::Mmap2;  // mmap2, offset in pages
         case 91: return Sys::Munmap;
         case 197: return Sys::Fstat;  // fstat64
         case 243: return Sys::SetThreadArea;
@@ -152,7 +152,7 @@ Sys map_i386(uint64_t nr) {
         case 106: return Sys::Stat;
         case 107: return Sys::Lstat;
         case 125: return Sys::Mprotect;
-        case 140: return Sys::Lseek;   // llseek
+        case 140: return Sys::Llseek;  // _llseek: split offset, result by pointer
         case 145: return Sys::Readv;
         case 183: return Sys::Getcwd;
         case 195: return Sys::Stat;    // stat64
@@ -293,7 +293,8 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         }
         case Sys::Ioctl:
             return kENOTTY;  // "not a terminal" is a valid answer libc handles
-        case Sys::Mmap: {
+        case Sys::Mmap:
+        case Sys::Mmap2: {
             // mmap(addr, len, prot, flags, fd, offset). The host's mmap is never
             // used: an anonymous mapping is just guest pages, and a file mapping is
             // the file's bytes read (fopen/fread) into those pages - which is all a
@@ -301,7 +302,12 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             uint64_t addr = a[0], len = a[1];
             uint32_t flags = static_cast<uint32_t>(a[3]);
             int fd = static_cast<int>(static_cast<int32_t>(a[4]));
-            uint64_t offset = a[5];
+            // mmap2's offset argument counts 4096-byte pages, not bytes.  Taken
+            // as bytes, every file mapping past the first page reads the wrong
+            // part of the .so - data that is plausible everywhere and true
+            // nowhere, which is how a 32-bit ld.so came to walk a link_map
+            // whose l_info was all NULL.
+            uint64_t offset = (sys == Sys::Mmap2) ? a[5] << 12 : a[5];
             constexpr uint32_t kMapFixed = 0x10, kMapAnon = 0x20;
             if (len == 0) return -22;  // EINVAL
 
@@ -556,11 +562,20 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
         }
         case Sys::SetThreadArea: {
             // The 32-bit equivalent: a struct user_desc whose base_addr becomes
-            // what gs: resolves to.  entry_number -1 means "pick one for me".
+            // what gs: (or fs:) resolves to once the guest loads the selector.
+            // entry_number -1 means "pick one for me".  The base is recorded per
+            // GDT slot so the `mov %gs, sel` that follows (opcode 0x8E) can
+            // associate the right one; gs_base is also set directly, which keeps
+            // a guest that never reloads gs working the way it always has.
             uint64_t desc = a[0];
             uint32_t entry = e.mem.read32(desc);
-            if (entry == 0xFFFFFFFFu) e.mem.write32(desc, 12);  // any free slot
-            e.cpu().gs_base = e.mem.read32(desc + 4);           // base_addr
+            if (entry == 0xFFFFFFFFu) {
+                entry = 12;
+                e.mem.write32(desc, entry);
+            }
+            uint32_t base = e.mem.read32(desc + 4);             // base_addr
+            if (entry < Cpu::kGdtSlots) e.cpu().gdt_base[entry] = base;
+            e.cpu().gs_base = base;
             return 0;
         }
         case Sys::GetRandom: {
