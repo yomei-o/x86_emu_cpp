@@ -390,8 +390,10 @@ void Emulator::install_win32_hooks() {
         uint64_t buf = e.arg_slot(1), len = e.arg_slot(2), written_ptr = e.arg_slot(3);
         std::string data(static_cast<size_t>(len), '\0');
         if (len) e.mem.read(buf, data.data(), len);
+        // A guest that has redirected its own output still calls WriteConsole,
+        // and the bytes belong wherever the handle points.
         int fd = Emulator::fd_from_handle(e.arg_slot(0));
-        e.write_raw(fd == 2 ? 2 : 1, data.data(), data.size());
+        e.write_raw(fd < 0 ? 1 : fd, data.data(), data.size());
         if (written_ptr) e.mem.write32(written_ptr, static_cast<uint32_t>(len));
         e.set_result(1);
     });
@@ -399,7 +401,7 @@ void Emulator::install_win32_hooks() {
         uint64_t buf = e.arg_slot(1), units = e.arg_slot(2), written_ptr = e.arg_slot(3);
         std::string utf8 = utf16_to_utf8(e, buf, static_cast<int>(units));
         int fd = Emulator::fd_from_handle(e.arg_slot(0));
-        e.write_raw(fd == 2 ? 2 : 1, utf8.data(), utf8.size());
+        e.write_raw(fd < 0 ? 1 : fd, utf8.data(), utf8.size());
         if (written_ptr) e.mem.write32(written_ptr, static_cast<uint32_t>(units));
         e.set_result(1);
     });
@@ -676,6 +678,61 @@ void Emulator::install_win32_hooks() {
     win32("lstrlenA", 1, [](Emulator& e) {
         e.set_result(e.mem.read_cstring(e.arg_slot(0)).size());
     });
+    win32("lstrlenW", 1, [](Emulator& e) {
+        uint64_t p = e.arg_slot(0), n = 0;
+        while (e.mem.read16(p + n * 2) != 0) ++n;
+        e.set_result(n);
+    });
+    // The lstr* comparisons return the sign of the difference, like strcmp.  The
+    // case-insensitive forms fold ASCII only, which is what a toolchain comparing
+    // file names and switches needs; a locale-aware fold would need the tables we
+    // do not have.
+    auto compare_strings = [](Emulator& e, bool wide, bool fold_case) {
+        std::string a = wide ? utf16_to_utf8(e, e.arg_slot(0), -1)
+                             : e.mem.read_cstring(e.arg_slot(0));
+        std::string b = wide ? utf16_to_utf8(e, e.arg_slot(1), -1)
+                             : e.mem.read_cstring(e.arg_slot(1));
+        if (fold_case) {
+            for (char& c : a) if (c >= 'A' && c <= 'Z') c += 32;
+            for (char& c : b) if (c >= 'A' && c <= 'Z') c += 32;
+        }
+        int r = a.compare(b);
+        e.set_result(static_cast<uint64_t>(static_cast<int64_t>(r < 0 ? -1 : r > 0 ? 1 : 0)));
+    };
+    win32("lstrcmpA", 2, [compare_strings](Emulator& e) { compare_strings(e, false, false); });
+    win32("lstrcmpW", 2, [compare_strings](Emulator& e) { compare_strings(e, true, false); });
+    win32("lstrcmpiA", 2, [compare_strings](Emulator& e) { compare_strings(e, false, true); });
+    win32("lstrcmpiW", 2, [compare_strings](Emulator& e) { compare_strings(e, true, true); });
+    win32("lstrcpyA", 2, [](Emulator& e) {
+        uint64_t dst = e.arg_slot(0);
+        e.mem.write_cstring(dst, e.mem.read_cstring(e.arg_slot(1)));
+        e.set_result(dst);
+    });
+    win32("lstrcpyW", 2, [](Emulator& e) {
+        uint64_t dst = e.arg_slot(0), src = e.arg_slot(1), n = 0;
+        for (;; ++n) {
+            uint16_t u = e.mem.read16(src + n * 2);
+            e.mem.write16(dst + n * 2, u);
+            if (!u) break;
+        }
+        e.set_result(dst);
+    });
+    win32("lstrcatA", 2, [](Emulator& e) {
+        uint64_t dst = e.arg_slot(0);
+        e.mem.write_cstring(dst + e.mem.read_cstring(dst).size(),
+                            e.mem.read_cstring(e.arg_slot(1)));
+        e.set_result(dst);
+    });
+    win32("lstrcatW", 2, [](Emulator& e) {
+        uint64_t dst = e.arg_slot(0), src = e.arg_slot(1), at = 0;
+        while (e.mem.read16(dst + at * 2) != 0) ++at;
+        for (uint64_t n = 0;; ++n) {
+            uint16_t u = e.mem.read16(src + n * 2);
+            e.mem.write16(dst + (at + n) * 2, u);
+            if (!u) break;
+        }
+        e.set_result(dst);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -703,8 +760,7 @@ void Emulator::install_ucrt_hooks() {
         uint64_t va = a.next_ptr();
         Args tail = Args::va_list_at(e, va);
         std::string s = format_guest(e, fmt, tail);
-        int fd = e.host_fd(stream);
-        e.write_text(fd == 2 ? 2 : 1, s);
+        e.write_stream(stream, s);
         e.set_result(s.size());
     });
     ucrt("__stdio_common_vsprintf", [](Emulator& e) {
@@ -760,8 +816,7 @@ void Emulator::install_ucrt_hooks() {
         uint64_t va = a.next_ptr();
         Args tail = Args::va_list_at(e, va);
         std::string s = format_guest(e, fmt, tail, true);
-        int fd = e.host_fd(stream);
-        e.write_text(fd == 2 ? 2 : 1, s);
+        e.write_wide_stream(stream, s);
         e.set_result(s.size());
     });
     ucrt("__acrt_iob_func", [](Emulator& e) {

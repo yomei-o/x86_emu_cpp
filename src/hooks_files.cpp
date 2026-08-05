@@ -351,6 +351,13 @@ void Emulator::install_file_hooks() {
         }
 
         FileTable::OpenFlags f;
+        // CreateFile has no text mode: the CRT's "t" translation happens a layer
+        // above, in _open_osfhandle and the FILE* it wraps.  Leaving this unset
+        // meant every binary file a Windows guest opened through the Win32 API
+        // lost a byte per CRLF, silently and only in the middle of large ones -
+        // link.exe reported LIBCMT.lib as a corrupt library, which is exactly
+        // what a static library with bytes missing from the middle is.
+        f.binary = true;
         f.read = (access & 0x80000000u) != 0;   // GENERIC_READ
         f.write = (access & 0x40000000u) != 0;  // GENERIC_WRITE
         // FILE_READ_ATTRIBUTES on its own is how a metadata-only open looks.

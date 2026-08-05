@@ -707,6 +707,37 @@ bool Cpu::execute_sse(uint8_t op) {
             }
             return true;
         }
+        // PINSRW takes a 16-bit source from a general register or memory and
+        // PEXTRW writes one to a general register.  They are the only SSE2
+        // instructions that move a *word* between the two register files, which is
+        // why compilers reach for them when packing a small struct - link.exe
+        // stores a PE header field this way.
+        case 0xC4: {  // PINSRW xmm, r32/m16, imm8
+            if (sel != Sel::P66) {
+                unsupported("PINSRW (MMX) is not supported", op, start);
+                return true;
+            }
+            RM rm = decode_modrm(1);
+            uint16_t value = static_cast<uint16_t>(rm.is_reg ? regs[rm.reg] : mem_.read16(rm.addr));
+            uint8_t imm = fetch8();
+            xmm[modrm_reg_].w[imm & 7] = value;
+            return true;
+        }
+        case 0xC5: {  // PEXTRW r32, xmm, imm8
+            if (sel != Sel::P66) {
+                unsupported("PEXTRW (MMX) is not supported", op, start);
+                return true;
+            }
+            // The source is always a register here: there is no memory form, so
+            // the mod field is 11 and the r/m field names the xmm register while
+            // the reg field names the destination.
+            RM rm = decode_modrm(1);
+            uint8_t imm = fetch8();
+            uint16_t value = xmm[rm.is_reg ? rm.reg : modrm_reg_].w[imm & 7];
+            // The result is zero-extended to the full 32 or 64 bits.
+            regs[modrm_reg_] = value;
+            return true;
+        }
         case 0xC6: {  // SHUFPS / SHUFPD
             RM rm = decode_modrm(1);
             Xmm s = xmm_read(rm);

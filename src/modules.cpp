@@ -194,9 +194,15 @@ uint64_t Emulator::load_library(const std::string& raw_name) {
     bind_imports(raw->image);
     loading_.pop_back();
 
-    // Only run its initialisers if the guest environment is already up; during
-    // the initial load it is not, and run_pending_module_init() catches up.
-    if (guest_env_ready_) run_module_init(*raw);
+    // Only set up its thread-local storage and run its initialisers if the guest
+    // environment is already up; during the initial load it is not, and
+    // run_pending_module_init() catches up.  A library loaded *later* - which is
+    // how a compiler driver loads its front and back ends - needs the same
+    // treatment, and not giving it a TLS slot leaves it reading another module's.
+    if (guest_env_ready_) {
+        setup_static_tls(*raw);
+        run_module_init(*raw);
+    }
     return raw->image.base;
 }
 
@@ -251,28 +257,42 @@ void Emulator::bind_imports(PeImage& img) {
 
 void Emulator::setup_static_tls(Module& module) {
     const PeImage& img = module.image;
+    if (module.tls_ready) return;
     if (!img.tls_index_address || img.tls_raw_end < img.tls_raw_start) return;
+    module.tls_ready = true;
 
     uint32_t slot = next_tls_slot_++;
     uint64_t template_size = img.tls_raw_end - img.tls_raw_start;
     uint64_t total = template_size + img.tls_zero_fill;
     if (total == 0) total = 16;  // a module can declare TLS and use none of it
 
-    uint64_t block = heap_alloc(total);
-    if (!block) return;
-    std::vector<uint8_t> bytes(static_cast<size_t>(total), 0);
-    if (template_size) mem.read(img.tls_raw_start, bytes.data(), template_size);
-    mem.write(block, bytes.data(), bytes.size());
-
     // The code compiled from __declspec(thread) reads the slot number from the
-    // module's own data and indexes the thread's array with it.
+    // module's own data and indexes the thread's array with it.  Leaving that
+    // number at whatever the file held - zero - is not a missing feature but a
+    // collision: the module then reads *another* module's thread-local block and
+    // treats whatever is there as its own data.
     mem.write32(img.tls_index_address, slot);
-    mem.write_sized(tls_array_ + static_cast<uint64_t>(slot) * pointer_size(),
-                    pointer_size(), block);
     // Remember the template: every thread created later needs its own copy.
     tls_templates_.push_back({slot, img.tls_raw_start, template_size, total});
-    log_call("static TLS for %s: slot %u, %llu bytes at 0x%llX", module.name.c_str(), slot,
-             (unsigned long long)total, (unsigned long long)block);
+
+    // Every thread that already exists needs one too, which is what makes this
+    // work for a library loaded at run time rather than at startup.
+    auto install = [&](uint64_t array) {
+        if (!array) return;
+        uint64_t block = heap_alloc(total);
+        if (!block) return;
+        std::vector<uint8_t> bytes(static_cast<size_t>(total), 0);
+        if (template_size) mem.read(img.tls_raw_start, bytes.data(), template_size);
+        mem.write(block, bytes.data(), bytes.size());
+        mem.write_sized(array + static_cast<uint64_t>(slot) * pointer_size(), pointer_size(),
+                        block);
+        log_call("static TLS for %s: slot %u, %llu bytes at 0x%llX in array 0x%llX",
+                 module.name.c_str(), slot, (unsigned long long)total,
+                 (unsigned long long)block, (unsigned long long)array);
+    };
+    install(tls_array_);
+    for (auto& t : threads_)
+        if (t->tls_array && t->tls_array != tls_array_) install(t->tls_array);
 }
 
 void Emulator::run_pending_module_init() {

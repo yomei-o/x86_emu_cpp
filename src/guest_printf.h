@@ -16,6 +16,14 @@ namespace x86emu {
 // the caller converts back if it needs wide output.
 std::string format_guest(Emulator& e, uint64_t fmt_ptr, Emulator::Args& va, bool wide = false);
 
+// Scans `input` according to a guest format string, storing results through the
+// pointers in `va`.  Returns the number of items assigned, or -1 when the input
+// ended before the first conversion could be attempted (scanf's EOF).  `wide`
+// selects the wscanf family: the format is UTF-16 and a bare %s stores wide
+// characters.
+int scan_guest(Emulator& e, const std::string& input, uint64_t fmt_ptr, Emulator::Args& va,
+               bool wide = false);
+
 // UTF-16 <-> UTF-8 for the wide Win32 entry points (BMP only).
 std::string utf16_to_utf8(Emulator& e, uint64_t ptr, int units);
 std::u16string utf8_to_utf16(const std::string& s);

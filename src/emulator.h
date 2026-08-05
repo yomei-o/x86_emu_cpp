@@ -228,6 +228,21 @@ public:
                                 int64_t count);
     void signal_object(uint64_t handle);
     bool try_acquire(uint64_t handle);
+    // Named kernel objects.  CreateEvent/Mutex/Semaphore with a name must hand
+    // back the object that name already refers to, and OpenXxx must *fail* when
+    // nothing created it - a guest uses that failure to decide it is the first
+    // one here and to do the initialisation.  Answering "yes, it exists" to
+    // every Open call makes every process think it is the second one.
+    // The namespace is per process, which is honest for the single-process case
+    // and honestly wrong (a failed Open) across processes; sharing it would mean
+    // sharing the objects themselves, which live in one emulator's table.
+    uint64_t* named_object(const std::string& name) {
+        auto it = named_objects_.find(name);
+        return it == named_objects_.end() ? nullptr : &it->second;
+    }
+    void name_object(const std::string& name, uint64_t handle) {
+        named_objects_[name] = handle;
+    }
 
     void install_thread_hooks();
     const std::vector<std::unique_ptr<GuestThread>>& threads() const { return threads_; }
@@ -244,6 +259,7 @@ public:
         std::string path;      // where it was found
         PeImage image;
         bool initialised = false;
+        bool tls_ready = false;  // its static TLS slot has been allocated
     };
 
     // Loads a DLL if one can be found and is not better served by hooks.  Returns
@@ -371,6 +387,19 @@ public:
     // channel, which is what WriteFile and the Linux write() syscall are.
     void write_text(int fd, const std::string& data);
     void write_raw(int fd, const void* data, size_t len);
+    // Writes to whatever a guest FILE* actually refers to, which every hook that
+    // takes a stream should use.  Several used to resolve the stream and then
+    // write to `fd == 2 ? 2 : 1` anyway, which sends a real file's bytes to the
+    // console: cl.exe writes the linker's response file with fputws, so the file
+    // came out empty, its contents appeared in our own output, and link.exe
+    // reported that no object files had been specified.
+    void write_stream(uint64_t guest_file, const std::string& data);
+    // The wide counterpart.  `text` is UTF-8; what reaches the file depends on
+    // how the stream was opened, which is the whole point (see FileTable::WideIo).
+    void write_wide_stream(uint64_t guest_file, const std::string& text);
+    // Reads one line from a stream, decoding whatever encoding it was opened
+    // with, and returns it as UTF-8.  `found` is false at end of file.
+    std::string read_wide_line(uint64_t guest_file, bool& found);
     // Pushes any buffered guest output out.  A Windows CRT block-buffers stdout
     // when it is not a terminal, so the emulator does too - otherwise a guest
     // that mixes printf with WriteFile would see its output interleaved
@@ -395,10 +424,14 @@ public:
     bool find_advance(uint64_t handle);
     void close_find_handle(uint64_t handle);
 
-    // A guest FILE* is a small synthetic object the emulator owns, holding the
-    // descriptor it stands for; guest_file() creates one on demand.
+    // A guest FILE* is a synthetic object the emulator owns, laid out the way a
+    // Windows CRT's really is - because real DLLs read inside it - and holding
+    // the descriptor it stands for; guest_file() creates one on demand.
     uint64_t guest_file(int fd);
     int host_fd(uint64_t guest_file_ptr) const;
+    // sizeof(FILE) as the guest's C runtime sees it, which is the stride of an
+    // `_iob` array and therefore not ours to choose.
+    uint64_t file_object_stride() const { return is64() ? 88 : 44; }
 
     // Win32 HANDLEs for files are descriptors in disguise.  The offset keeps them
     // clear of 0 (NULL) and of the small integers a guest might treat specially.
@@ -434,6 +467,7 @@ public:
     // Translates a FileTable result (a negative errno-style code) and records it.
     void report_file_error(int64_t code);
 
+    void write_guest_file_object(uint64_t obj, int fd);
     void log_call(const char* fmt, ...);
     const std::vector<std::string>& args() const { return args_; }
 
@@ -473,6 +507,7 @@ public:
     void install_ucrt_hooks();
     void install_process_hooks();
     void install_cl_hooks();
+    void install_link_hooks();
     void install_exception_hooks();
     void install_syscall_handlers();
 
@@ -602,6 +637,7 @@ private:
     bool retry_hook_ = false;
     uint64_t thread_exit_thunk_ = 0;
     std::unordered_map<uint64_t, SyncObject> sync_objects_;
+    std::unordered_map<std::string, uint64_t> named_objects_;
     uint64_t next_sync_handle_ = 0x8000;
     struct FindState {
         std::vector<DirectoryEntry> entries;

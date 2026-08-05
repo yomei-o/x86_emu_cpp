@@ -240,6 +240,15 @@ void Emulator::install_library_hooks() {
 
     // ---- strings -----------------------------------------------------------
     libc("strlen", [](Emulator& e) { e.set_result(e.mem.read_cstring(e.arg_slot(0)).size()); });
+    // strnlen must not read past `max`, which is the whole reason a caller uses
+    // it: the buffer may not be terminated at all.
+    auto bounded_strlen = [](Emulator& e) {
+        uint64_t p = e.arg_slot(0), max = e.arg_slot(1), n = 0;
+        while (n < max && e.mem.read8(p + n) != 0) ++n;
+        e.set_result(n);
+    };
+    libc("strnlen", bounded_strlen);
+    libc("strnlen_s", bounded_strlen);
     libc("strcpy", [](Emulator& e) {
         uint64_t dst = e.arg_slot(0);
         e.mem.write_cstring(dst, e.mem.read_cstring(e.arg_slot(1)));

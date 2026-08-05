@@ -1,5 +1,7 @@
 #include "emulator.h"
 
+#include "guest_printf.h"
+
 #include <algorithm>
 #include <cinttypes>
 #include <limits>
@@ -841,6 +843,92 @@ uint64_t Emulator::alloc_guest_string(const std::string& s) {
 // Guest output
 // ---------------------------------------------------------------------------
 
+void Emulator::write_wide_stream(uint64_t guest_file, const std::string& text) {
+    int fd = host_fd(guest_file);
+    if (fd < 0) fd = 1;
+    FileTable::Entry* entry = files.get(fd);
+    FileTable::WideIo enc = entry ? entry->wide_io : FileTable::WideIo::Multibyte;
+    if (enc != FileTable::WideIo::Utf16) {
+        // Multibyte and UTF-8 are the same thing here: this emulator's narrow
+        // encoding is UTF-8 throughout, and GetACP says so.
+        write_stream(guest_file, text);
+        return;
+    }
+    std::u16string w = utf8_to_utf16(text);
+    std::string bytes;
+    bytes.reserve(w.size() * 2);
+    for (char16_t u : w) {
+        bytes.push_back(static_cast<char>(u & 0xFF));
+        bytes.push_back(static_cast<char>((u >> 8) & 0xFF));
+    }
+    if (fd <= 2) {
+        write_raw(fd, bytes.data(), bytes.size());
+        return;
+    }
+    files.write(fd, bytes.data(), bytes.size());
+}
+
+std::string Emulator::read_wide_line(uint64_t guest_file, bool& found) {
+    found = false;
+    int fd = host_fd(guest_file);
+    if (fd < 0) return {};
+    FileTable::Entry* entry = files.get(fd);
+    FileTable::WideIo enc = entry ? entry->wide_io : FileTable::WideIo::Multibyte;
+    if (enc != FileTable::WideIo::Utf16) {
+        std::string line;
+        char c;
+        while (files.read(fd, &c, 1) == 1) {
+            found = true;
+            line += c;
+            if (c == 0x0A) break;
+        }
+        return line;
+    }
+    // A UTF-16 stream: one code unit at a time, so the newline is recognised in
+    // the same encoding the file is written in.  A byte-oriented reader would
+    // find a newline byte in the low half of any character whose code point is
+    // 0x0A00-something, and stop in the middle of one.
+    std::u16string w;
+    uint8_t pair[2];
+    while (files.read(fd, pair, 2) == 2) {
+        found = true;
+        char16_t u = static_cast<char16_t>(pair[0] | (pair[1] << 8));
+        // The byte-order mark a writer puts at the start is not part of the text.
+        if (u == 0xFEFF) continue;
+        w.push_back(u);
+        if (u == 0x0A) break;
+    }
+    std::string out;
+    for (char16_t u : w) {
+        if (u < 0x80) {
+            out.push_back(static_cast<char>(u));
+        } else if (u < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (u >> 6)));
+            out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xE0 | (u >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+        }
+    }
+    return out;
+}
+
+void Emulator::write_stream(uint64_t guest_file, const std::string& data) {
+    int fd = host_fd(guest_file);
+    // A stream the emulator does not model - one taken from an imported _iob
+    // array, say - is most likely the console, and that is the harmless guess.
+    if (fd < 0) fd = 1;
+    if (fd <= 2) {
+        write_text(fd, data);
+        return;
+    }
+    // FileTable owns whether this descriptor translates newlines, so the data
+    // goes through unchanged; translating here as well would double every
+    // carriage return.
+    files.write(fd, data.data(), data.size());
+}
+
 void Emulator::write_raw(int fd, const void* data, size_t len) {
     if (!len) return;
     // A child process whose stdout is a pipe or a redirected file has a
@@ -906,34 +994,56 @@ void Emulator::write_text(int fd, const std::string& data) {
 // Synthetic stdio streams
 // ---------------------------------------------------------------------------
 
+// Fills in a synthetic FILE using the layout a Windows CRT really has, so that
+// code which reads *inside* the structure - and real DLLs do, `_fileno` being a
+// macro over `_file` - finds what it expects rather than a private encoding.
+// The UCRT's `__crt_stdio_stream_data` is:
+//     0x00 _ptr, 0x08 _base, 0x10 _cnt, 0x14 _flags, 0x18 _file,
+//     0x1C _charbuf, 0x20 _bufsiz, 0x28 _tmpfname, 0x30 CRITICAL_SECTION
+// which is 88 bytes on x64; msvcrt's older form is the same fields at half the
+// pointer width.  `_flags` says the stream is open and in which direction,
+// because a stream with no direction bits reads as closed.
+void Emulator::write_guest_file_object(uint64_t obj, int fd) {
+    constexpr uint32_t kIoRead = 0x0001, kIoWrite = 0x0002, kIoUpdate = 0x0004;
+    uint32_t flags = fd == 0 ? kIoRead : (fd <= 2 ? kIoWrite : (kIoRead | kIoWrite | kIoUpdate));
+    if (is64()) {
+        mem.write32(obj + 0x14, flags);
+        mem.write32(obj + 0x18, static_cast<uint32_t>(fd));
+        mem.write32(obj + 0x1C, 0);
+        mem.write32(obj + 0x20, 4096);   // _bufsiz
+    } else {
+        // 32-bit: _ptr(0) _base(4) _cnt(8) _flags(0xC) _file(0x10) ...
+        mem.write32(obj + 0x0C, flags);
+        mem.write32(obj + 0x10, static_cast<uint32_t>(fd));
+        mem.write32(obj + 0x18, 4096);
+    }
+}
+
 uint64_t Emulator::guest_file(int fd) {
     auto it = guest_files_.find(fd);
     if (it != guest_files_.end()) return it->second;
 
     // The first three are allocated as one contiguous block, because a guest may
     // reach them through an imported _iob[] array rather than one at a time -
-    // and msvcrt code computes `stderr` as `_iob + 2 * sizeof(FILE)`, so the
-    // stride must be the *CRT's* FILE size (48 bytes on x64, 32 on x86), not a
-    // number of our choosing, or the pointer lands between objects and stderr
-    // silently resolves to the default stream.
+    // and CRT code computes `stderr` as `_iob + 2 * sizeof(FILE)`, so the stride
+    // must be the *CRT's* FILE size, not a number of our choosing, or the
+    // pointer lands between objects and stderr silently resolves elsewhere.
+    uint64_t stride = file_object_stride();
     if (guest_files_.empty()) {
-        uint64_t stride = os() == Os::Windows ? (is64() ? 48 : 32) : kFileObjectSize;
-        std::vector<uint8_t> blob(3 * stride, 0);
+        std::vector<uint8_t> blob(static_cast<size_t>(3 * stride), 0);
         uint64_t base = alloc_guest_data(blob.data(), blob.size());
         for (int i = 0; i < 3; ++i) {
             uint64_t obj = base + static_cast<uint64_t>(i) * stride;
-            mem.write32(obj, 0x554D4546);  // 'FEMU', so a stray pointer is obvious
-            mem.write32(obj + 4, static_cast<uint32_t>(i));
+            write_guest_file_object(obj, i);
             guest_files_[i] = obj;
             guest_file_fds_[obj] = i;
         }
         if (fd >= 0 && fd <= 2) return guest_files_[fd];
     }
 
-    std::vector<uint8_t> blob(kFileObjectSize, 0);
+    std::vector<uint8_t> blob(static_cast<size_t>(stride), 0);
     uint64_t obj = alloc_guest_data(blob.data(), blob.size());
-    mem.write32(obj, 0x554D4546);
-    mem.write32(obj + 4, static_cast<uint32_t>(fd));
+    write_guest_file_object(obj, fd);
     guest_files_[fd] = obj;
     guest_file_fds_[obj] = fd;
     return obj;
@@ -942,12 +1052,18 @@ uint64_t Emulator::guest_file(int fd) {
 int Emulator::host_fd(uint64_t ptr) const {
     auto it = guest_file_fds_.find(ptr);
     if (it != guest_file_fds_.end()) return it->second;
-    // A guest that got its FILE* from something the emulator does not model (an
-    // imported _iob array, say) still deserves an answer; the object carries its
-    // descriptor, so read it back if the magic matches.
-    if (ptr) {
+    // A guest that arrived at a FILE* by arithmetic - stepping through an
+    // imported `_iob` array, say - still deserves an answer, and the object
+    // itself carries the descriptor in the field a CRT calls `_file`.  Only
+    // objects inside our own allocations are read this way: anywhere else the
+    // bytes would be someone's data.
+    if (ptr && ptr >= misc_base_ && ptr < misc_next_) {
         try {
-            if (mem.read32(ptr) == 0x554D4546) return static_cast<int>(mem.read32(ptr + 4));
+            uint64_t flags_at = is64() ? 0x14 : 0x0C;
+            if (mem.read32(ptr + flags_at) != 0) {  // a stream with no direction is closed
+                int fd = static_cast<int>(mem.read32(ptr + (is64() ? 0x18 : 0x10)));
+                if (fd >= 0 && fd < 4096) return fd;
+            }
         } catch (const MemoryFault&) {
         }
     }
@@ -1167,6 +1283,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         install_ucrt_hooks();
         install_process_hooks();
         install_cl_hooks();
+        install_link_hooks();
         // Last, so that its real implementations win over the stubs the files
         // above register for a guest that cannot be supported yet.
         install_exception_hooks();

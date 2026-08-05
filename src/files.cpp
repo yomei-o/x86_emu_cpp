@@ -1,6 +1,8 @@
 #include "files.h"
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <vector>
@@ -120,6 +122,8 @@ int FileTable::alloc_slot() {
 }
 
 int FileTable::open(const std::string& path, const OpenFlags& flags) {
+    if (std::getenv("X86EMU_TRACE_OPEN"))
+        std::fprintf(stderr, "x86emu: open(%s)\n", path.c_str());
     std::string mode;
     if (flags.append)
         mode = flags.read ? "a+" : "a";
@@ -159,6 +163,7 @@ int FileTable::open(const std::string& path, const OpenFlags& flags) {
     e.writable = flags.write || flags.append;
     e.append = flags.append;
     e.text_mode = translate_newlines_ && !flags.binary;
+    e.wide_io = flags.wide_io;
     files_[fd] = e;
     return fd;
 }
@@ -355,6 +360,18 @@ int64_t FileTable::size(int fd) {
     return r < 0 ? r : static_cast<int64_t>(s.size);
 }
 
+int FileTable::truncate(int fd, int64_t length) {
+    Entry* e = get(fd);
+    if (!e || e->is_directory || e->is_pipe()) return kEBADF;
+    if (std::fflush(e->fp.get()) != 0) return kEINVAL;
+#if defined(_WIN32)
+    int r = _chsize_s(_fileno(e->fp.get()), length);
+#else
+    int r = ftruncate(fileno(e->fp.get()), length);
+#endif
+    return r == 0 ? 0 : kEINVAL;
+}
+
 int FileTable::flush(int fd) {
     Entry* e = get(fd);
     if (!e) return kEBADF;
@@ -391,6 +408,29 @@ int FileTable::dup(int fd, int to) {
 }
 
 int FileTable::remove_file(const std::string& path) {
+    // X86EMU_KEEP_TEMP dumps a file's contents as the guest deletes it.  A
+    // toolchain that talks to itself through response files destroys the evidence
+    // on the way out, and this is the only way to read what one process actually
+    // handed the next.  Printing rather than keeping the file matters: a guest
+    // that recreates the same name would overwrite whatever was kept.
+    if (std::getenv("X86EMU_KEEP_TEMP")) {
+        std::fprintf(stderr, "x86emu: deleting %s:\n", path.c_str());
+        if (FILE* f = std::fopen(host_path(path).c_str(), "rb")) {
+            unsigned char buf[64];
+            size_t got;
+            size_t total = 0;
+            while ((got = std::fread(buf, 1, sizeof buf, f)) > 0 && total < 512) {
+                for (size_t i = 0; i < got; ++i) std::fprintf(stderr, "%02X ", buf[i]);
+                std::fprintf(stderr, "| ");
+                for (size_t i = 0; i < got; ++i)
+                    std::fputc(buf[i] >= 0x20 && buf[i] < 0x7F ? buf[i] : '.', stderr);
+                std::fputc('\n', stderr);
+                total += got;
+            }
+            std::fclose(f);
+        }
+    }
+
     if (std::remove(host_path(path).c_str()) != 0) return from_errno(errno);
     return 0;
 }

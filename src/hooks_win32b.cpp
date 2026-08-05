@@ -217,7 +217,19 @@ void Emulator::install_win32_extra_hooks() {
         std::string to = utf16_to_utf8(e, e.arg_slot(1), -1);
         e.set_result(FileTable::rename_file(from, to) == 0 ? 1 : 0);
     });
-    win32("SetEndOfFile", 1, [](Emulator& e) { e.set_result(1); });
+    // SetEndOfFile cuts the file at the current position.  Returning success
+    // without doing it leaves a guest that over-allocated its output - a linker
+    // building an image in a mapped view does - with a file full of slack.
+    win32("SetEndOfFile", 1, [](Emulator& e) {
+        int fd = Emulator::fd_from_handle(e.arg_slot(0));
+        int64_t at = fd >= 0 ? e.files.tell(fd) : -1;
+        if (at < 0 || e.files.truncate(fd, at) != 0) {
+            e.set_last_error(6);  // ERROR_INVALID_HANDLE
+            e.set_result(0);
+            return;
+        }
+        e.set_result(1);
+    });
     win32("GetFileSize", 2, [](Emulator& e) {
         int fd = Emulator::fd_from_handle(e.arg_slot(0));
         int64_t size = fd >= 0 ? e.files.size(fd) : -1;
@@ -514,11 +526,8 @@ void Emulator::install_win32_extra_hooks() {
         while (n < max && e.mem.read16(p + n * 2) != 0) ++n;
         e.set_result(n);
     });
-    ucrt("wcstol", [](Emulator& e) {
-        std::string s = utf16_to_utf8(e, e.arg_slot(0), -1);
-        e.set_result(static_cast<uint64_t>(static_cast<int64_t>(
-            std::strtol(s.c_str(), nullptr, static_cast<int>(e.arg_slot(2))))));
-    });
+    // wcstol and the rest of the wide strto* family live in hooks_win32c.cpp,
+    // where they share an implementation that reports the end pointer.
     ucrt("wcscoll", [](Emulator& e) {
         std::string a = utf16_to_utf8(e, e.arg_slot(0), -1);
         std::string b = utf16_to_utf8(e, e.arg_slot(1), -1);
@@ -941,6 +950,28 @@ void Emulator::install_win32_extra_hooks() {
         e.set_result(0);
     });
     ucrt("_pclose", [](Emulator& e) { e.set_result(static_cast<uint64_t>(-1)); });
+    // MEMORYSTATUSEX: a 4-byte length the caller fills in, 4 bytes of padding,
+    // then eight 64-bit counters.  A compiler sizes its caches from these, so
+    // "plenty, half of it free" is the answer that keeps it out of a low-memory
+    // path it would otherwise take.
+    win32("GlobalMemoryStatusEx", 1, [](Emulator& e) {
+        uint64_t p = e.arg_slot(0);
+        if (!p) {
+            e.set_result(0);
+            return;
+        }
+        constexpr uint64_t kTotal = 8ull << 30;
+        e.mem.write32(p, 64);              // dwLength
+        e.mem.write32(p + 4, 25);          // dwMemoryLoad
+        e.mem.write64(p + 8, kTotal);      // ullTotalPhys
+        e.mem.write64(p + 16, kTotal / 2); // ullAvailPhys
+        e.mem.write64(p + 24, kTotal);     // ullTotalPageFile
+        e.mem.write64(p + 32, kTotal / 2); // ullAvailPageFile
+        e.mem.write64(p + 40, 0x00007FFFFFFEFFFFull);  // ullTotalVirtual
+        e.mem.write64(p + 48, 0x00007FFF00000000ull);  // ullAvailVirtual
+        e.mem.write64(p + 56, 0);          // ullAvailExtendedVirtual
+        e.set_result(1);
+    });
     win32("GlobalMemoryStatus", 1, [](Emulator& e) {
         uint64_t p = e.arg_slot(0);
         if (p) {

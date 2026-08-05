@@ -412,6 +412,17 @@ void Emulator::dispatch_exception(uint64_t record, uint64_t ctx) {
     std::fprintf(stderr,
                  "x86emu: unhandled exception 0x%08llX in the guest (no handler accepted it)\n",
                  (unsigned long long)code);
+    // Which instruction raised it is the first thing anyone needs, and for a C++
+    // throw the second parameter points at the ThrowInfo that names the type.
+    uint64_t where = mem.read64(record + kOffAddress);
+    std::fprintf(stderr, "  raised at %s\n", describe_address(where).c_str());
+    if (code == 0xE06D7363u) {
+        uint32_t nparams = mem.read32(record + 0x18);
+        for (uint32_t i = 0; i < nparams && i < 4; ++i)
+            std::fprintf(stderr, "  param[%u] = 0x%llX\n", i,
+                         (unsigned long long)mem.read64(record + kOffParams + 8 * i));
+    }
+    std::fprintf(stderr, "%s", stack_trace(12).c_str());
     exit_process(static_cast<int>(code));
 }
 

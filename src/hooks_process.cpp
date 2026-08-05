@@ -177,6 +177,7 @@ void create_process(Emulator& e, bool wide) {
     std::string program = resolve_program(e, app.empty() ? argv[0] : app);
     e.log_call("CreateProcess(%s) -> %s", (app.empty() ? argv[0] : app).c_str(),
                program.empty() ? "not found" : program.c_str());
+    e.log_call("  command line: %s", cmd.c_str());
     if (program.empty()) {
         e.set_last_error(2);  // ERROR_FILE_NOT_FOUND
         e.set_result(0);

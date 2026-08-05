@@ -12,6 +12,9 @@
 // part wrong is the classic way for threads to appear to work and then corrupt
 // each other's data.
 #include <cstring>
+#include <memory>
+#include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -447,21 +450,65 @@ void Emulator::install_thread_hooks() {
     });
 
     // ---- events, mutexes and semaphores --------------------------------------
-    // CreateEvent(attributes, manual_reset, initial_state, name)
-    auto create_event = [](Emulator& e) {
-        e.set_result(e.create_sync_object(SyncObject::Kind::Event, e.arg_slot(1) != 0,
-                                          e.arg_slot(2) != 0, 0));
+    // ---- named kernel objects --------------------------------------------------
+    // Every Create/Open pair below shares two helpers so that a name behaves the
+    // way the guest expects: creating twice under one name yields one object and
+    // ERROR_ALREADY_EXISTS, and opening a name nobody created fails.
+    auto object_name = [](Emulator& e, int slot, bool wide) -> std::string {
+        uint64_t p = e.arg_slot(slot);
+        if (!p) return {};
+        return wide ? utf16_to_utf8(e, p, -1) : e.mem.read_cstring(p);
     };
-    win32("CreateEventA", 4, create_event);
-    win32("CreateEventW", 4, create_event);
-    win32("CreateEventExW", 4, [](Emulator& e) {
+    auto create_named = [object_name](Emulator& e, int name_slot, bool wide,
+                                     SyncObject::Kind kind, bool manual_reset,
+                                     bool signalled, int64_t count) -> uint64_t {
+        std::string name = object_name(e, name_slot, wide);
+        if (!name.empty()) {
+            if (uint64_t* existing = e.named_object(name)) {
+                e.set_last_error(183);  // ERROR_ALREADY_EXISTS
+                e.set_result(*existing);
+                return *existing;
+            }
+        }
+        uint64_t h = e.create_sync_object(kind, manual_reset, signalled, count);
+        if (!name.empty()) e.name_object(name, h);
+        e.set_result(h);
+        return h;
+    };
+    // OpenXxx(access, inherit, name): the name is the whole request, so an
+    // unknown one is a failure and not something to paper over.
+    auto open_named = [object_name](Emulator& e, bool wide, SyncObject::Kind kind) {
+        std::string name = object_name(e, 2, wide);
+        uint64_t* existing = name.empty() ? nullptr : e.named_object(name);
+        if (!existing || !e.sync_object(*existing) ||
+            e.sync_object(*existing)->kind != kind) {
+            e.set_last_error(2);  // ERROR_FILE_NOT_FOUND
+            e.set_result(0);
+            return;
+        }
+        e.set_result(*existing);
+    };
+
+    // CreateEvent(attributes, manual_reset, initial_state, name)
+    win32("CreateEventA", 4, [create_named](Emulator& e) {
+        create_named(e, 3, false, SyncObject::Kind::Event, e.arg_slot(1) != 0,
+                     e.arg_slot(2) != 0, 0);
+    });
+    win32("CreateEventW", 4, [create_named](Emulator& e) {
+        create_named(e, 3, true, SyncObject::Kind::Event, e.arg_slot(1) != 0,
+                     e.arg_slot(2) != 0, 0);
+    });
+    win32("CreateEventExW", 4, [create_named](Emulator& e) {
         // (attributes, name, flags, access); flags bit 1 is CREATE_EVENT_MANUAL_RESET
         uint64_t flags = e.arg_slot(2);
-        e.set_result(e.create_sync_object(SyncObject::Kind::Event, (flags & 1) != 0,
-                                          (flags & 2) != 0, 0));
+        create_named(e, 1, true, SyncObject::Kind::Event, (flags & 1) != 0,
+                     (flags & 2) != 0, 0);
     });
-    win32("OpenEventW", 3, [](Emulator& e) {
-        e.set_result(e.create_sync_object(SyncObject::Kind::Event, true, false, 0));
+    win32("OpenEventA", 3, [open_named](Emulator& e) {
+        open_named(e, false, SyncObject::Kind::Event);
+    });
+    win32("OpenEventW", 3, [open_named](Emulator& e) {
+        open_named(e, true, SyncObject::Kind::Event);
     });
     win32("SetEvent", 1, [](Emulator& e) {
         e.signal_object(e.arg_slot(0));
@@ -476,16 +523,23 @@ void Emulator::install_thread_hooks() {
         e.signal_object(e.arg_slot(0));
         e.set_result(1);
     });
-    win32("CreateMutexW", 3, [](Emulator& e) {
-        uint64_t h = e.create_sync_object(SyncObject::Kind::Mutex, false, false, 0);
+    // CreateMutex(attributes, initial_owner, name)
+    auto create_mutex = [create_named](Emulator& e, bool wide) {
+        uint64_t h = create_named(e, 2, wide, SyncObject::Kind::Mutex, false, false, 0);
         if (e.arg_slot(1)) e.try_acquire(h);  // bInitialOwner
-        e.set_result(h);
+    };
+    win32("CreateMutexA", 3, [create_mutex](Emulator& e) { create_mutex(e, false); });
+    win32("CreateMutexW", 3, [create_mutex](Emulator& e) { create_mutex(e, true); });
+    win32("CreateMutexExW", 4, [create_named](Emulator& e) {
+        // (attributes, name, flags, access); flags bit 0 asks for initial ownership
+        uint64_t h = create_named(e, 1, true, SyncObject::Kind::Mutex, false, false, 0);
+        if (e.arg_slot(2) & 1) e.try_acquire(h);
     });
-    win32("CreateMutexExW", 4, [](Emulator& e) {
-        e.set_result(e.create_sync_object(SyncObject::Kind::Mutex, false, false, 0));
+    win32("OpenMutexA", 3, [open_named](Emulator& e) {
+        open_named(e, false, SyncObject::Kind::Mutex);
     });
-    win32("OpenMutexW", 3, [](Emulator& e) {
-        e.set_result(e.create_sync_object(SyncObject::Kind::Mutex, false, false, 0));
+    win32("OpenMutexW", 3, [open_named](Emulator& e) {
+        open_named(e, true, SyncObject::Kind::Mutex);
     });
     win32("ReleaseMutex", 1, [](Emulator& e) {
         auto* o = e.sync_object(e.arg_slot(0));
@@ -495,14 +549,27 @@ void Emulator::install_thread_hooks() {
         }
         e.set_result(1);
     });
-    auto create_semaphore = [](Emulator& e) {
-        // (attributes, initial count, maximum count, name)
-        e.set_result(e.create_sync_object(SyncObject::Kind::Semaphore, false, false,
-                                          static_cast<int64_t>(e.arg_slot(1))));
+    // CreateSemaphore(attributes, initial count, maximum count, name); the Ex
+    // form adds flags and access after the name, which changes nothing here.
+    auto create_semaphore = [create_named](Emulator& e, bool wide) {
+        create_named(e, 3, wide, SyncObject::Kind::Semaphore, false, false,
+                     static_cast<int64_t>(e.arg_slot(1)));
     };
-    win32("CreateSemaphoreA", 4, create_semaphore);
-    win32("CreateSemaphoreW", 4, create_semaphore);
-    win32("CreateSemaphoreExW", 6, create_semaphore);
+    win32("CreateSemaphoreA", 4, [create_semaphore](Emulator& e) {
+        create_semaphore(e, false);
+    });
+    win32("CreateSemaphoreW", 4, [create_semaphore](Emulator& e) {
+        create_semaphore(e, true);
+    });
+    win32("CreateSemaphoreExW", 6, [create_semaphore](Emulator& e) {
+        create_semaphore(e, true);
+    });
+    win32("OpenSemaphoreA", 3, [open_named](Emulator& e) {
+        open_named(e, false, SyncObject::Kind::Semaphore);
+    });
+    win32("OpenSemaphoreW", 3, [open_named](Emulator& e) {
+        open_named(e, true, SyncObject::Kind::Semaphore);
+    });
     win32("ReleaseSemaphore", 3, [](Emulator& e) {
         auto* o = e.sync_object(e.arg_slot(0));
         if (o) {
@@ -579,33 +646,73 @@ void Emulator::install_thread_hooks() {
     });
     win32("DeleteCriticalSection", 1, [](Emulator& e) { e.set_result(0); });
 
+    // An SRWLOCK is exactly one pointer-sized word, and `SRWLOCK_INIT` is a zero
+    // in guest memory - a guest may never call InitializeSRWLock at all.  So
+    // everything has to fit in that one word, with zero meaning free:
+    //
+    //     0                       unheld
+    //     (thread id << 1) | 1    held exclusively by that thread
+    //     reader count << 1       held shared by that many readers
+    //
+    // The earlier version kept a recursion count in the *next* word, which is
+    // past the end of the object.  For a statically initialised lock that word
+    // held whatever the guest had put there, so the release path decremented a
+    // large number, never reached zero, and never cleared the owner - after
+    // which every other thread spun on the lock forever.  cl.exe's back end
+    // found this by hanging in exactly that loop.
     win32("InitializeSRWLock", 1, [](Emulator& e) {
         if (e.arg_slot(0)) e.mem.write_sized(e.arg_slot(0), e.pointer_size(), 0);
         e.set_result(0);
     });
-    auto acquire_srw = [enter_lock](Emulator& e) {
-        if (!enter_lock(e, e.arg_slot(0), true)) e.retry_current_call();
-        e.set_result(0);
-    };
-    win32("AcquireSRWLockExclusive", 1, acquire_srw);
-    win32("AcquireSRWLockShared", 1, acquire_srw);
-    auto release_srw = [](Emulator& e) {
-        uint64_t p = e.arg_slot(0);
+    auto take_srw = [](Emulator& e, uint64_t p, bool exclusive) -> bool {
+        if (!p) return true;
         int ps = e.pointer_size();
-        if (p) {
-            uint64_t depth = e.mem.read_sized(p + ps, ps);
-            if (depth > 0) e.mem.write_sized(p + ps, ps, depth - 1);
-            if (depth <= 1) e.mem.write_sized(p, ps, 0);
+        uint64_t word = e.mem.read_sized(p, ps);
+        if (exclusive) {
+            // SRW locks are not recursive; a guest that re-enters one deadlocks
+            // on real Windows too, so there is nothing to be gained by allowing it.
+            if (word != 0) return false;
+            e.mem.write_sized(p, ps, (uint64_t(e.current_thread_id()) << 1) | 1);
+            return true;
+        }
+        if (word & 1) return false;  // an exclusive holder blocks readers
+        e.mem.write_sized(p, ps, word + 2);
+        return true;
+    };
+    auto acquire_srw = [take_srw](Emulator& e, bool exclusive) {
+        if (!take_srw(e, e.arg_slot(0), exclusive)) {
+            // Held: give up the slice and arrange for the same call to happen
+            // again the next time this thread runs.
+            e.yield_now();
+            e.retry_current_call();
         }
         e.set_result(0);
     };
-    win32("ReleaseSRWLockExclusive", 1, release_srw);
-    win32("ReleaseSRWLockShared", 1, release_srw);
-    win32("TryAcquireSRWLockExclusive", 1, [enter_lock](Emulator& e) {
-        e.set_result(enter_lock(e, e.arg_slot(0), false) ? 1 : 0);
+    win32("AcquireSRWLockExclusive", 1,
+          [acquire_srw](Emulator& e) { acquire_srw(e, true); });
+    win32("AcquireSRWLockShared", 1,
+          [acquire_srw](Emulator& e) { acquire_srw(e, false); });
+    auto release_srw = [](Emulator& e, bool exclusive) {
+        uint64_t p = e.arg_slot(0);
+        if (p) {
+            int ps = e.pointer_size();
+            uint64_t word = e.mem.read_sized(p, ps);
+            if (exclusive || (word & 1) || word <= 2)
+                e.mem.write_sized(p, ps, 0);
+            else
+                e.mem.write_sized(p, ps, word - 2);
+        }
+        e.set_result(0);
+    };
+    win32("ReleaseSRWLockExclusive", 1,
+          [release_srw](Emulator& e) { release_srw(e, true); });
+    win32("ReleaseSRWLockShared", 1,
+          [release_srw](Emulator& e) { release_srw(e, false); });
+    win32("TryAcquireSRWLockExclusive", 1, [take_srw](Emulator& e) {
+        e.set_result(take_srw(e, e.arg_slot(0), true) ? 1 : 0);
     });
-    win32("TryAcquireSRWLockShared", 1, [enter_lock](Emulator& e) {
-        e.set_result(enter_lock(e, e.arg_slot(0), false) ? 1 : 0);
+    win32("TryAcquireSRWLockShared", 1, [take_srw](Emulator& e) {
+        e.set_result(take_srw(e, e.arg_slot(0), false) ? 1 : 0);
     });
 
     // A condition variable is a pointer-sized object the caller owns.  With
@@ -629,28 +736,53 @@ void Emulator::install_thread_hooks() {
     });
     win32("CancelWaitableTimer", 1, [](Emulator& e) { e.set_result(1); });
 
-    // A condition variable wait releases its lock, yields, and takes the lock
-    // again - which with cooperative threads is enough for the usual
-    // "wait until a predicate holds" loop to make progress.
-    win32("SleepConditionVariableSRW", 4, [](Emulator& e) {
-        uint64_t lock = e.arg_slot(1);
-        int ps = e.pointer_size();
-        if (lock) {
-            e.mem.write_sized(lock, ps, 0);
-            e.mem.write_sized(lock + ps, ps, 0);
-        }
-        e.yield_now();
+    // A condition variable wait must drop its lock, let other threads run, and
+    // then hold the lock again on return - the caller's predicate loop depends on
+    // both halves.  Dropping it and returning immediately would leave the guest
+    // thinking it owns a lock the word says is free, so the wait happens in two
+    // visits to this hook: the first releases and yields, the second re-takes.
+    // `sleeping` remembers which visit we are on; it is per emulator because
+    // install_thread_hooks() runs once per process.
+    auto sleeping = std::make_shared<std::set<std::pair<uint32_t, uint64_t>>>();
+    win32("SleepConditionVariableSRW", 4, [sleeping, take_srw](Emulator& e) {
+        uint64_t cv = e.arg_slot(0), lock = e.arg_slot(1);
+        bool exclusive = (e.arg_slot(3) & 1) == 0;  // ..._LOCKMODE_SHARED
+        std::pair<uint32_t, uint64_t> key{e.current_thread_id(), cv};
         e.set_result(1);
+        if (!sleeping->count(key)) {
+            if (lock) e.mem.write_sized(lock, e.pointer_size(), 0);
+            sleeping->insert(key);
+            e.yield_now();
+            e.retry_current_call();
+            return;
+        }
+        if (!take_srw(e, lock, exclusive)) {
+            e.yield_now();
+            e.retry_current_call();
+            return;
+        }
+        sleeping->erase(key);
     });
-    win32("SleepConditionVariableCS", 3, [](Emulator& e) {
-        uint64_t lock = e.arg_slot(1);
+    win32("SleepConditionVariableCS", 3, [sleeping, enter_lock](Emulator& e) {
+        uint64_t cv = e.arg_slot(0), lock = e.arg_slot(1);
+        std::pair<uint32_t, uint64_t> key{e.current_thread_id(), cv};
         int ps = e.pointer_size();
-        if (lock) {
-            e.mem.write_sized(lock, ps, 0);
-            e.mem.write_sized(lock + ps, ps, 0);
-        }
-        e.yield_now();
         e.set_result(1);
+        if (!sleeping->count(key)) {
+            if (lock) {
+                e.mem.write_sized(lock, ps, 0);
+                e.mem.write_sized(lock + ps, ps, 0);
+            }
+            sleeping->insert(key);
+            e.yield_now();
+            e.retry_current_call();
+            return;
+        }
+        if (!enter_lock(e, lock, true)) {
+            e.retry_current_call();
+            return;
+        }
+        sleeping->erase(key);
     });
 }
 

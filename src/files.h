@@ -53,6 +53,19 @@ class FileTable {
 public:
     // Open flags, in the emulator's own terms so that neither the Linux nor the
     // Windows spelling leaks into the table.
+    // How wide-character stdio turns wchar_t into bytes on a stream.  The CRT
+    // takes this from the open mode, and it is not a detail: cl.exe writes the
+    // linker's response file with fputws on a *binary* stream, where MSVC emits
+    // the wide characters unchanged, and link.exe reads it back with
+    // `ccs=unicode`.  The two only agree if both halves are UTF-16, and when they
+    // do not the linker sees one garbled argument and reports it as a missing
+    // input file.
+    enum class WideIo {
+        Multibyte,  // a text stream with no ccs: convert through the locale
+        Utf16,      // ccs=UNICODE / ccs=UTF-16LE, and any binary stream
+        Utf8,       // ccs=UTF-8
+    };
+
     struct OpenFlags {
         bool read = false;
         bool write = false;
@@ -61,6 +74,7 @@ public:
         bool truncate = false;
         bool exclusive = false;
         bool binary = true;
+        WideIo wide_io = WideIo::Multibyte;
     };
 
     struct Entry {
@@ -84,6 +98,7 @@ public:
         // a directory to ask about its attributes, which no C library can do.
         bool is_directory = false;
         bool text_mode = false;  // a Windows guest opened it without "b"
+        WideIo wide_io = WideIo::Multibyte;
         bool cloexec = false;    // closed by execve(), as FD_CLOEXEC asks
         bool closed = false;
         // getdents64 iteration state for a directory descriptor: the listing is
@@ -127,6 +142,10 @@ public:
     int64_t tell(int fd);
     int64_t size(int fd);
     int flush(int fd);
+    // Cuts the file off at `length` (SetEndOfFile, ftruncate).  A guest that
+    // builds its output in a memory-mapped view over-allocates and then trims,
+    // so without this the file keeps whatever slack the view had.
+    int truncate(int fd, int64_t length);
     bool eof(int fd);
 
     // Duplicates a descriptor onto the lowest free slot, or onto `to`.

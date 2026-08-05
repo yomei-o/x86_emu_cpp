@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "digest.h"
 #include "emulator.h"
 #include "guest_printf.h"
 #include "processes.h"
@@ -78,6 +79,45 @@ std::string language_name(uint32_t langid) {
     }
 }
 
+
+// Turns a CRT mode string into open flags, including the `ccs=` encoding that
+// decides what the wide stdio calls put on disk.  MSVC's rule, which matters
+// because two halves of one toolchain rely on it: a text stream with no ccs
+// converts wide characters through the locale, `ccs=UNICODE` and `ccs=UTF-16LE`
+// write UTF-16 code units, `ccs=UTF-8` writes UTF-8, and a *binary* stream
+// writes the wide characters unchanged - which on Windows is also UTF-16.
+FileTable::OpenFlags parse_crt_mode(const std::string& mode) {
+    std::string lower;
+    for (char c : mode) lower += static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    // Only the part before the comma names the access; the rest is attributes.
+    std::string access = lower.substr(0, lower.find(','));
+    FileTable::OpenFlags f;
+    f.binary = access.find('b') != std::string::npos;
+    if (access.find('r') != std::string::npos) {
+        f.read = true;
+        if (access.find('+') != std::string::npos) f.write = true;
+    } else if (access.find('w') != std::string::npos) {
+        f.write = f.create = f.truncate = true;
+        if (access.find('+') != std::string::npos) f.read = true;
+    } else {
+        f.append = f.create = true;
+        if (access.find('+') != std::string::npos) f.read = true;
+    }
+    size_t ccs = lower.find("ccs=");
+    if (ccs != std::string::npos) {
+        std::string enc = lower.substr(ccs + 4);
+        enc = enc.substr(0, enc.find(','));
+        while (!enc.empty() && enc.back() == ' ') enc.pop_back();
+        if (enc == "utf-8" || enc == "utf8")
+            f.wide_io = FileTable::WideIo::Utf8;
+        else
+            f.wide_io = FileTable::WideIo::Utf16;  // UNICODE, UTF-16LE
+    } else if (f.binary) {
+        f.wide_io = FileTable::WideIo::Utf16;
+    }
+    return f;
+}
+
 }  // namespace
 
 void Emulator::install_cl_hooks() {
@@ -116,37 +156,52 @@ void Emulator::install_cl_hooks() {
         }
         e.set_result(1);
     });
-    // The hashing side of the crypto API, which a toolchain uses to derive a
-    // name - for a temporary file, or a build key - from some bytes.  A real
-    // digest is needed rather than a stub: the caller uses the *value*, and two
-    // different inputs must not collide.  FNV-1a spread over the requested
-    // length is not MD5, but it is a function of the input, which is what a name
-    // needs; nothing here depends on the digest being cryptographic.
+    // The hashing side of the crypto API, in both the shapes a toolchain uses:
+    // the old CryptCreateHash/CryptHashData/CryptGetHashParam sequence and CNG's
+    // BCrypt* one.  These have to be real digests, not a stub and not a
+    // stand-in: cl.exe records the source file's hash in the object's `.chks64`
+    // section, so the *value* is part of the output, and a debugger later
+    // compares it against the file on disk.  It also explains a subtle
+    // near-miss - with no CNG at all cl silently omits the section, so the object
+    // came out one section and two symbols short of the real one with no
+    // diagnostic anywhere.
     {
         struct Hash {
+            DigestKind kind = DigestKind::Md5;
             std::vector<uint8_t> data;
         };
         auto hashes = std::make_shared<std::unordered_map<uint64_t, Hash>>();
         auto next = std::make_shared<uint64_t>(0xC0DE1000);
-        // (provider, algorithm, key, flags, out handle)
-        win32("CryptCreateHash", 5, [hashes, next](Emulator& e) {
+        auto new_hash = [hashes, next](DigestKind k) {
             uint64_t h = (*next += 16);
-            (*hashes)[h] = Hash{};
+            (*hashes)[h] = Hash{k, {}};
+            return h;
+        };
+        auto feed = [hashes](Emulator& e, uint64_t handle, uint64_t buf, uint64_t len) -> bool {
+            auto it = hashes->find(handle);
+            if (it == hashes->end()) return false;
+            size_t at = it->second.data.size();
+            it->second.data.resize(at + static_cast<size_t>(len));
+            if (len) e.mem.read(buf, it->second.data.data() + at, len);
+            return true;
+        };
+
+        // ---- CryptoAPI ---------------------------------------------------------
+        // (provider, ALG_ID, key, flags, out handle)
+        win32("CryptCreateHash", 5, [new_hash](Emulator& e) {
+            constexpr uint32_t kCalgMd5 = 0x8003, kCalgSha1 = 0x8004, kCalgSha256 = 0x800C;
+            uint32_t alg = static_cast<uint32_t>(e.arg_slot(1));
+            DigestKind k = alg == kCalgSha1 ? DigestKind::Sha1
+                           : alg == kCalgSha256 ? DigestKind::Sha256
+                                                : DigestKind::Md5;
+            (void)kCalgMd5;
+            uint64_t h = new_hash(k);
             if (e.arg_slot(4)) e.mem.write_sized(e.arg_slot(4), e.pointer_size(), h);
             e.set_result(1);
         });
         // (hash, data, length, flags)
-        win32("CryptHashData", 4, [hashes](Emulator& e) {
-            auto it = hashes->find(e.arg_slot(0));
-            if (it == hashes->end()) {
-                e.set_result(0);
-                return;
-            }
-            uint64_t len = e.arg_slot(2);
-            size_t at = it->second.data.size();
-            it->second.data.resize(at + static_cast<size_t>(len));
-            if (len) e.mem.read(e.arg_slot(1), it->second.data.data() + at, len);
-            e.set_result(1);
+        win32("CryptHashData", 4, [feed](Emulator& e) {
+            e.set_result(feed(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2)) ? 1 : 0);
         });
         // (hash, param, buffer, *length, flags).  HP_HASHVAL is 2, HP_HASHSIZE 4.
         win32("CryptGetHashParam", 5, [hashes](Emulator& e) {
@@ -158,8 +213,9 @@ void Emulator::install_cl_hooks() {
             uint32_t param = static_cast<uint32_t>(e.arg_slot(1));
             uint64_t buf = e.arg_slot(2), len_ptr = e.arg_slot(3);
             constexpr uint32_t kHashVal = 2, kHashSize = 4;
+            uint32_t size = static_cast<uint32_t>(digest_length(it->second.kind));
             if (param == kHashSize) {
-                if (buf) e.mem.write32(buf, 16);
+                if (buf) e.mem.write32(buf, size);
                 if (len_ptr) e.mem.write32(len_ptr, 4);
                 e.set_result(1);
                 return;
@@ -168,29 +224,120 @@ void Emulator::install_cl_hooks() {
                 e.set_result(0);
                 return;
             }
-            uint32_t want = len_ptr ? e.mem.read32(len_ptr) : 16;
             if (!buf) {
-                if (len_ptr) e.mem.write32(len_ptr, 16);
+                if (len_ptr) e.mem.write32(len_ptr, size);
                 e.set_result(1);
                 return;
             }
-            if (want > 64) want = 64;
-            // One FNV-1a per output byte, seeded by its index, so the whole
-            // digest depends on the whole input.
-            for (uint32_t i = 0; i < want; ++i) {
-                uint64_t acc = 1469598103934665603ull + i;
-                for (uint8_t b : it->second.data) {
-                    acc ^= b;
-                    acc *= 1099511628211ull;
-                }
-                e.mem.write8(buf + i, static_cast<uint8_t>(acc >> 24));
-            }
+            std::vector<uint8_t> d = compute_digest(it->second.kind, it->second.data);
+            uint32_t want = len_ptr ? e.mem.read32(len_ptr) : size;
+            if (want > size) want = size;
+            e.mem.write(buf, d.data(), want);
             if (len_ptr) e.mem.write32(len_ptr, want);
             e.set_result(1);
         });
         win32("CryptDestroyHash", 1, [hashes](Emulator& e) {
             hashes->erase(e.arg_slot(0));
             e.set_result(1);
+        });
+
+        // ---- CNG (bcrypt) ------------------------------------------------------
+        // These are reached through GetProcAddress rather than an import, so the
+        // only thing that makes them visible is being registered as hooks.
+        // NTSTATUS, so success is 0 and failure is STATUS_NOT_SUPPORTED.
+        constexpr uint64_t kStatusSuccess = 0;
+        constexpr uint64_t kStatusNotSupported = 0xC00000BBull;
+        // An algorithm provider handle encodes which algorithm it is in its low
+        // bits, so it needs no table of its own.
+        auto alg_of = [](uint64_t handle) {
+            return static_cast<DigestKind>(handle & 3);
+        };
+        // (out handle, alg id, implementation, flags)
+        win32("BCryptOpenAlgorithmProvider", 4, [](Emulator& e) {
+            std::string id = utf16_to_utf8(e, e.arg_slot(1), -1);
+            DigestKind k;
+            if (id == "MD5") k = DigestKind::Md5;
+            else if (id == "SHA1") k = DigestKind::Sha1;
+            else if (id == "SHA256") k = DigestKind::Sha256;
+            else {
+                e.set_result(0xC00000BBull);  // STATUS_NOT_SUPPORTED
+                return;
+            }
+            if (e.arg_slot(0))
+                e.mem.write_sized(e.arg_slot(0), e.pointer_size(),
+                                  0xBC000000ull | static_cast<uint64_t>(k));
+            e.set_result(0);
+        });
+        win32("BCryptCloseAlgorithmProvider", 2,
+              [kStatusSuccess](Emulator& e) { e.set_result(kStatusSuccess); });
+        // (handle, property, out, out size, *written, flags).  A caller asks for
+        // ObjectLength so it can allocate the hash object itself, and for
+        // HashDigestLength so it knows how big the answer is.
+        win32("BCryptGetProperty", 6, [alg_of, kStatusSuccess,
+                                       kStatusNotSupported](Emulator& e) {
+            std::string prop = utf16_to_utf8(e, e.arg_slot(1), -1);
+            uint32_t value;
+            if (prop == "ObjectLength")
+                value = 512;  // our hash object is a table entry; any size will do
+            else if (prop == "HashDigestLength")
+                value = static_cast<uint32_t>(digest_length(alg_of(e.arg_slot(0))));
+            else {
+                e.set_result(kStatusNotSupported);
+                return;
+            }
+            if (e.arg_slot(2) && e.arg_slot(3) >= 4) e.mem.write32(e.arg_slot(2), value);
+            if (e.arg_slot(4)) e.mem.write32(e.arg_slot(4), 4);
+            e.set_result(kStatusSuccess);
+        });
+        // (alg, out hash handle, object buffer, object size, secret, secret size, flags)
+        win32("BCryptCreateHash", 7, [new_hash, alg_of, kStatusSuccess](Emulator& e) {
+            uint64_t h = new_hash(alg_of(e.arg_slot(0)));
+            if (e.arg_slot(1)) e.mem.write_sized(e.arg_slot(1), e.pointer_size(), h);
+            e.set_result(kStatusSuccess);
+        });
+        // (hash, input, input size, flags)
+        win32("BCryptHashData", 4, [feed, kStatusSuccess, kStatusNotSupported](Emulator& e) {
+            e.set_result(feed(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2))
+                             ? kStatusSuccess
+                             : kStatusNotSupported);
+        });
+        // (hash, output, output size, flags)
+        win32("BCryptFinishHash", 4, [hashes, kStatusSuccess,
+                                      kStatusNotSupported](Emulator& e) {
+            auto it = hashes->find(e.arg_slot(0));
+            if (it == hashes->end()) {
+                e.set_result(kStatusNotSupported);
+                return;
+            }
+            std::vector<uint8_t> d = compute_digest(it->second.kind, it->second.data);
+            uint64_t want = e.arg_slot(2);
+            if (want > d.size()) want = d.size();
+            if (e.arg_slot(1) && want) e.mem.write(e.arg_slot(1), d.data(), want);
+            e.set_result(kStatusSuccess);
+        });
+        win32("BCryptDestroyHash", 1, [hashes, kStatusSuccess](Emulator& e) {
+            hashes->erase(e.arg_slot(0));
+            e.set_result(kStatusSuccess);
+        });
+        // (alg, secret, secret size, input, input size, output, output size):
+        // the one-shot form, which needs no handle at all.
+        win32("BCryptHash", 7, [alg_of, kStatusSuccess](Emulator& e) {
+            std::vector<uint8_t> in(static_cast<size_t>(e.arg_slot(4)));
+            if (!in.empty()) e.mem.read(e.arg_slot(3), in.data(), in.size());
+            std::vector<uint8_t> d = compute_digest(alg_of(e.arg_slot(0)), in);
+            uint64_t want = e.arg_slot(6);
+            if (want > d.size()) want = d.size();
+            if (e.arg_slot(5) && want) e.mem.write(e.arg_slot(5), d.data(), want);
+            e.set_result(kStatusSuccess);
+        });
+        win32("BCryptGenRandom", 4, [kStatusSuccess](Emulator& e) {
+            uint64_t buf = e.arg_slot(1), len = e.arg_slot(2);
+            uint32_t state = 0xC0FFEE42u;
+            for (uint64_t i = 0; i < len; ++i) {
+                state = state * 1103515245u + 12345u;
+                e.mem.write8(buf + i, static_cast<uint8_t>(state >> 16));
+            }
+            e.set_result(kStatusSuccess);
         });
     }
     ret0("EventRegister", 4);
@@ -449,6 +596,7 @@ void Emulator::install_cl_hooks() {
         uint32_t options = static_cast<uint32_t>(e.arg_slot(creating ? 8 : 5));
 
         FileTable::OpenFlags f;
+        f.binary = true;  // the NT layer, like CreateFile, has no text mode
         constexpr uint64_t kReadData = 0x1, kWriteData = 0x2, kAppendData = 0x4;
         constexpr uint64_t kGenericRead = 0x80000000, kGenericWrite = 0x40000000;
         f.read = (access & (kReadData | kGenericRead)) != 0;
@@ -1004,62 +1152,146 @@ void Emulator::install_cl_hooks() {
         e.set_result(1);
     });
 
-    // File mappings: a view is the file's bytes read into fresh guest pages.
+    // File mappings.  A view is the file's bytes copied into guest pages, and -
+    // the part that took a while to notice - the copy has to go *back*.  link.exe
+    // does not write its output with WriteFile at all: it maps a view over the
+    // new executable, builds the whole image in memory, and unmaps.  With
+    // UnmapViewOfFile as a stub that returned success, every link produced a
+    // zero-byte .exe and reported no error, because from the linker's point of
+    // view nothing had failed.
+    //
+    // Writing back on unmap and on flush is not the same as sharing the pages,
+    // and the difference shows if a guest maps one file twice and expects one
+    // view's stores to appear in the other. Nothing here does that; a mapping
+    // whose bytes reach the file at unmap time is what a writer needs.
     {
         struct Mapping {
             int fd = -1;
+            uint64_t max_size = 0;
+            bool writable = false;
+        };
+        struct View {
+            int fd = -1;
+            uint64_t offset = 0;
+            uint64_t size = 0;
+            bool writable = false;
+            bool owned_pages = false;  // we allocated the address, so we can free it
         };
         auto maps = std::make_shared<std::unordered_map<uint64_t, Mapping>>();
+        auto views = std::make_shared<std::unordered_map<uint64_t, View>>();
         auto next = std::make_shared<uint64_t>(0xE0000000ull);
+        // (file, security, protect, max size high, max size low, name)
         auto create_mapping = [maps, next](Emulator& e) {
             int fd = Emulator::fd_from_handle(e.arg_slot(0));
             if (fd < 0 || !e.files.valid(fd)) {
                 e.set_result(0);
                 return;
             }
+            constexpr uint32_t kPageReadWrite = 0x04, kPageWriteCopy = 0x08,
+                               kPageExecuteReadWrite = 0x40, kPageExecuteWriteCopy = 0x80;
+            uint32_t protect = static_cast<uint32_t>(e.arg_slot(2));
+            uint64_t max_size = (e.arg_slot(3) << 32) | (e.arg_slot(4) & 0xFFFFFFFFull);
+            if (!max_size) {
+                int64_t file_size = e.files.size(fd);
+                max_size = file_size > 0 ? static_cast<uint64_t>(file_size) : 0;
+            }
             uint64_t h = (*next += 16);
-            (*maps)[h] = Mapping{fd};
+            Mapping m;
+            m.fd = fd;
+            m.max_size = max_size;
+            m.writable = (protect & (kPageReadWrite | kPageWriteCopy | kPageExecuteReadWrite |
+                                     kPageExecuteWriteCopy)) != 0;
+            (*maps)[h] = m;
             e.set_result(h);
         };
         win32("CreateFileMappingA", 6, create_mapping);
         win32("CreateFileMappingW", 6, create_mapping);
-        auto map_view = [maps](Emulator& e, uint64_t base) {
+        // (mapping, access, offset high, offset low, bytes[, base])
+        auto map_view = [maps, views](Emulator& e, uint64_t base) {
             auto it = maps->find(e.arg_slot(0));
             if (it == maps->end()) {
                 e.set_result(0);
                 return;
             }
-            int fd = it->second.fd;
+            const Mapping& m = it->second;
             uint64_t offset = (e.arg_slot(2) << 32) | (e.arg_slot(3) & 0xFFFFFFFFull);
             uint64_t size = e.arg_slot(4);
             if (!size) {
-                int64_t file_size = e.files.size(fd);
-                if (file_size < 0 || static_cast<uint64_t>(file_size) < offset) {
+                // Zero means "to the end of the mapping", which is the mapping's
+                // maximum size and not the file's current length - the two differ
+                // exactly when a guest is about to grow the file.
+                if (m.max_size < offset) {
                     e.set_result(0);
                     return;
                 }
-                size = static_cast<uint64_t>(file_size) - offset;
+                size = m.max_size - offset;
+            }
+            if (!size) {
+                e.set_result(0);
+                return;
             }
             uint64_t target;
+            bool owned = false;
             if (base) {
                 e.mem.map(base, size, "file view");
                 target = base;
             } else {
                 target = e.alloc_pages(size);
+                owned = true;
             }
-            int64_t saved = e.files.tell(fd);
-            if (e.files.seek(fd, static_cast<int64_t>(offset), 0) >= 0) {
+            int64_t saved = e.files.tell(m.fd);
+            if (e.files.seek(m.fd, static_cast<int64_t>(offset), 0) >= 0) {
                 std::vector<uint8_t> buf(static_cast<size_t>(size));
-                int64_t got = e.files.read(fd, buf.data(), size);
+                int64_t got = e.files.read(m.fd, buf.data(), size);
                 if (got > 0) e.mem.write(target, buf.data(), static_cast<uint64_t>(got));
             }
-            if (saved >= 0) e.files.seek(fd, saved, 0);
+            if (saved >= 0) e.files.seek(m.fd, saved, 0);
+            constexpr uint32_t kFileMapWrite = 0x0002;
+            View v;
+            v.fd = m.fd;
+            v.offset = offset;
+            v.size = size;
+            v.writable = m.writable &&
+                         (static_cast<uint32_t>(e.arg_slot(1)) & kFileMapWrite) != 0;
+            v.owned_pages = owned;
+            (*views)[target] = v;
             e.set_result(target);
         };
         win32("MapViewOfFile", 5, [map_view](Emulator& e) { map_view(e, 0); });
         win32("MapViewOfFileEx", 6, [map_view](Emulator& e) { map_view(e, e.arg_slot(5)); });
-        ret1("UnmapViewOfFile", 1);
-        ret1("FlushViewOfFile", 2);
+        // Copies a view's bytes back to the file it came from.  `length` bounds
+        // it for FlushViewOfFile, which may name only part of the view.
+        auto write_back = [](Emulator& e, uint64_t base, const View& v, uint64_t length) {
+            if (!v.writable || !length) return;
+            if (length > v.size) length = v.size;
+            std::vector<uint8_t> buf(static_cast<size_t>(length));
+            e.mem.read(base, buf.data(), length);
+            int64_t saved = e.files.tell(v.fd);
+            if (e.files.seek(v.fd, static_cast<int64_t>(v.offset), 0) >= 0)
+                e.files.write(v.fd, buf.data(), length);
+            e.files.flush(v.fd);
+            if (saved >= 0) e.files.seek(v.fd, saved, 0);
+        };
+        win32("UnmapViewOfFile", 1, [views, write_back](Emulator& e) {
+            uint64_t base = e.arg_slot(0);
+            auto it = views->find(base);
+            if (it == views->end()) {
+                e.set_result(1);  // an address we never handed out; nothing to undo
+                return;
+            }
+            write_back(e, base, it->second, it->second.size);
+            if (it->second.owned_pages) e.free_pages(base, it->second.size);
+            views->erase(it);
+            e.set_result(1);
+        });
+        win32("FlushViewOfFile", 2, [views, write_back](Emulator& e) {
+            uint64_t base = e.arg_slot(0);
+            auto it = views->find(base);
+            if (it != views->end())
+                write_back(e, base, it->second,
+                           e.arg_slot(1) ? e.arg_slot(1) : it->second.size);
+            e.set_result(1);
+        });
     }
 
     // ---- vcruntime -----------------------------------------------------------------
@@ -1166,14 +1398,77 @@ void Emulator::install_cl_hooks() {
                                              e.arg_slot(0) + (end - s.c_str()));
         e.set_result_float(v);
     });
-    ucrt("wcstoul", [](Emulator& e) {
-        std::string s = wide_arg(e, e.arg_slot(0));
+    // The wide strto* family needs its own transcription rather than
+    // wide_arg()'s UTF-8 one.  These functions report where they stopped as a
+    // pointer into the *guest's* UTF-16 string, so the count of code units
+    // consumed has to be exact, and UTF-8 makes one code unit anywhere from one
+    // to three bytes.  Mapping each unit to a single narrow char keeps the
+    // count one-to-one; a number never contains a non-ASCII character, so
+    // anything outside ASCII becomes a byte the parser stops on.
+    //
+    // c2.dll found this: it calls wcstol(arg, &end, 0) on numeric command line
+    // options and then dereferences `end` to check the whole argument was
+    // consumed.  Our wcstol left the out parameter alone, so it read a stale
+    // stack slot as a pointer.
+    auto wide_number = [](Emulator& e, uint64_t start, std::string& out) {
+        for (uint64_t p = start; out.size() < 4096; p += 2) {
+            uint16_t u = e.mem.read16(p);
+            if (!u) break;
+            out.push_back(u < 0x80 ? static_cast<char>(u) : '\x01');
+        }
+    };
+    auto wide_to_integer = [wide_number](Emulator& e, bool is_signed, int bytes) {
+        uint64_t start = e.arg_slot(0);
+        std::string s;
+        wide_number(e, start, s);
+        int radix = static_cast<int>(static_cast<int32_t>(e.arg_slot(2)));
+        const char* begin = s.c_str();
         char* end = nullptr;
-        unsigned long v = std::strtoul(s.c_str(), &end, static_cast<int>(e.arg_slot(2)));
-        if (e.arg_slot(1)) e.mem.write_sized(e.arg_slot(1), e.pointer_size(),
-                                             e.arg_slot(0) + 2 * (end - s.c_str()));
-        e.set_result(v);
-    });
+        uint64_t value = is_signed
+                             ? static_cast<uint64_t>(std::strtoll(begin, &end, radix))
+                             : std::strtoull(begin, &end, radix);
+        if (uint64_t end_out = e.arg_slot(1))
+            e.mem.write_sized(end_out, e.pointer_size(),
+                              start + 2 * static_cast<uint64_t>(end - begin));
+        if (bytes == 4)
+            value = is_signed ? static_cast<uint64_t>(static_cast<int64_t>(
+                                    static_cast<int32_t>(value)))
+                              : (value & 0xFFFFFFFFull);
+        e.set_result(value);
+    };
+    ucrt("wcstol", [wide_to_integer](Emulator& e) { wide_to_integer(e, true, 4); });
+    ucrt("wcstoul", [wide_to_integer](Emulator& e) { wide_to_integer(e, false, 4); });
+    ucrt("wcstoll", [wide_to_integer](Emulator& e) { wide_to_integer(e, true, 8); });
+    ucrt("wcstoull", [wide_to_integer](Emulator& e) { wide_to_integer(e, false, 8); });
+    ucrt("_wcstoi64", [wide_to_integer](Emulator& e) { wide_to_integer(e, true, 8); });
+    ucrt("_wcstoui64", [wide_to_integer](Emulator& e) { wide_to_integer(e, false, 8); });
+    // The _l variants take a locale as an extra trailing argument; the leading
+    // three are the same and the locale changes nothing we model.
+    ucrt("_wcstol_l", [wide_to_integer](Emulator& e) { wide_to_integer(e, true, 4); });
+    ucrt("_wcstoul_l", [wide_to_integer](Emulator& e) { wide_to_integer(e, false, 4); });
+    ucrt("_wcstoll_l", [wide_to_integer](Emulator& e) { wide_to_integer(e, true, 8); });
+    ucrt("_wcstoull_l", [wide_to_integer](Emulator& e) { wide_to_integer(e, false, 8); });
+    ucrt("_wcstoi64_l", [wide_to_integer](Emulator& e) { wide_to_integer(e, true, 8); });
+    ucrt("_wcstoui64_l", [wide_to_integer](Emulator& e) { wide_to_integer(e, false, 8); });
+
+    auto wide_to_double = [wide_number](Emulator& e, bool single) {
+        uint64_t start = e.arg_slot(0);
+        std::string s;
+        wide_number(e, start, s);
+        const char* begin = s.c_str();
+        char* end = nullptr;
+        double v = std::strtod(begin, &end);
+        if (uint64_t end_out = e.arg_slot(1))
+            e.mem.write_sized(end_out, e.pointer_size(),
+                              start + 2 * static_cast<uint64_t>(end - begin));
+        if (single)
+            e.set_result_float(static_cast<float>(v));
+        else
+            e.set_result_double(v);
+    };
+    ucrt("wcstod", [wide_to_double](Emulator& e) { wide_to_double(e, false); });
+    ucrt("wcstof", [wide_to_double](Emulator& e) { wide_to_double(e, true); });
+    ucrt("_wcstod_l", [wide_to_double](Emulator& e) { wide_to_double(e, false); });
 
     // ---- UCRT: environment and filesystem, wide ---------------------------------------
     ucrt("_wgetenv_s", [](Emulator& e) {
@@ -1203,6 +1498,16 @@ void Emulator::install_cl_hooks() {
         e.set_result(static_cast<uint64_t>(static_cast<int64_t>(ok)));
     });
     ucrt("_wremove", [](Emulator& e) {
+        // X86EMU_KEEP_TEMP leaves a guest's temporary files behind and says where
+        // they are.  A toolchain that talks to itself through response files
+        // deletes the evidence on the way out, and this is the only way to read
+        // what one process actually handed the next.
+        if (std::getenv("X86EMU_KEEP_TEMP")) {
+            std::string path = wide_arg(e, e.arg_slot(0));
+            std::fprintf(stderr, "x86emu: keeping %s\n", path.c_str());
+            e.set_result(0);
+            return;
+        }
         e.set_result(FileTable::remove_file(wide_arg(e, e.arg_slot(0))) == 0 ? 0
                                                                              : static_cast<uint64_t>(-1));
     });
@@ -1257,6 +1562,77 @@ void Emulator::install_cl_hooks() {
         e.set_result(0);
     });
     ucrt("_callnewh", [](Emulator& e) { e.set_result(1); });
+
+    // Aligned allocation.  The emulator's heap already hands out 16-byte aligned
+    // blocks, so anything up to that is free; a stricter request is satisfied by
+    // over-allocating and remembering the real block just below the pointer that
+    // is handed back, which is how a real CRT does it too - and _aligned_free
+    // has to look there rather than at what it was given.
+    {
+        auto aligned_alloc = [](Emulator& e, uint64_t size, uint64_t alignment,
+                                uint64_t offset) {
+            if (alignment < 16) alignment = 16;
+            if (alignment & (alignment - 1)) {  // not a power of two
+                e.set_guest_errno(22);          // EINVAL
+                e.set_result(0);
+                return;
+            }
+            int ps = e.pointer_size();
+            uint64_t raw = e.heap_alloc(size + alignment + offset + ps);
+            if (!raw) {
+                e.set_guest_errno(12);  // ENOMEM
+                e.set_result(0);
+                return;
+            }
+            uint64_t user = (raw + ps + offset + alignment - 1) & ~(alignment - 1);
+            if (user - ps < raw) user += alignment;
+            e.mem.write_sized(user - ps, ps, raw);  // where the real block starts
+            e.set_result(user);
+        };
+        ucrt("_aligned_malloc", [aligned_alloc](Emulator& e) {
+            aligned_alloc(e, e.arg_slot(0), e.arg_slot(1), 0);
+        });
+        ucrt("_aligned_offset_malloc", [aligned_alloc](Emulator& e) {
+            aligned_alloc(e, e.arg_slot(0), e.arg_slot(1), e.arg_slot(2));
+        });
+        ucrt("_aligned_free", [](Emulator& e) {
+            uint64_t user = e.arg_slot(0);
+            if (!user) return;
+            int ps = e.pointer_size();
+            e.heap_free(e.mem.read_sized(user - ps, ps));
+        });
+        ucrt("_aligned_msize", [](Emulator& e) {
+            uint64_t user = e.arg_slot(0);
+            int ps = e.pointer_size();
+            uint64_t raw = user ? e.mem.read_sized(user - ps, ps) : 0;
+            uint64_t total = raw ? e.heap_block_size(raw) : 0;
+            e.set_result(total > (user - raw) ? total - (user - raw) : 0);
+        });
+        ucrt("_aligned_realloc", [aligned_alloc](Emulator& e) {
+            // Allocate afresh and copy: the old block's usable size is known, so
+            // this is exact rather than optimistic.
+            uint64_t user = e.arg_slot(0), size = e.arg_slot(1), alignment = e.arg_slot(2);
+            int ps = e.pointer_size();
+            uint64_t raw = user ? e.mem.read_sized(user - ps, ps) : 0;
+            uint64_t old_usable = 0;
+            if (raw) {
+                uint64_t total = e.heap_block_size(raw);
+                old_usable = total > (user - raw) ? total - (user - raw) : 0;
+            }
+            aligned_alloc(e, size, alignment, 0);
+            uint64_t fresh = e.cpu().regs[RAX];
+            if (fresh && user) {
+                uint64_t copy = old_usable < size ? old_usable : size;
+                if (copy) {
+                    std::vector<uint8_t> tmp(static_cast<size_t>(copy));
+                    e.mem.read(user, tmp.data(), copy);
+                    e.mem.write(fresh, tmp.data(), copy);
+                }
+                if (raw) e.heap_free(raw);
+            }
+            e.set_result(fresh);
+        });
+    }
     // (buffer, size, errno): the message for an errno value, bounded.
     auto strerror_s = [](Emulator& e, bool wide) {
         uint64_t buf = e.arg_slot(0), size = e.arg_slot(1);
@@ -1487,17 +1863,7 @@ void Emulator::install_cl_hooks() {
     auto fsopen = [](Emulator& e, bool wide) {
         std::string path = wide ? wide_arg(e, e.arg_slot(0)) : e.mem.read_cstring(e.arg_slot(0));
         std::string mode = wide ? wide_arg(e, e.arg_slot(1)) : e.mem.read_cstring(e.arg_slot(1));
-        FileTable::OpenFlags f;
-        f.binary = mode.find('b') != std::string::npos;
-        if (mode.find('r') != std::string::npos) {
-            f.read = true;
-            if (mode.find('+') != std::string::npos) f.write = true;
-        } else if (mode.find('w') != std::string::npos) {
-            f.write = f.create = f.truncate = true;
-            if (mode.find('+') != std::string::npos) f.read = true;
-        } else {
-            f.append = f.create = true;
-        }
+        FileTable::OpenFlags f = parse_crt_mode(mode);
         int fd = e.files.open(path, f);
         if (fd < 0) {
             e.report_file_error(fd);
@@ -1544,18 +1910,7 @@ void Emulator::install_cl_hooks() {
         uint64_t out = e.arg_slot(0);
         std::string path = wide_arg(e, e.arg_slot(1));
         std::string mode = wide_arg(e, e.arg_slot(2));
-        FileTable::OpenFlags f;
-        f.binary = mode.find('b') != std::string::npos;
-        if (mode.find('r') != std::string::npos) {
-            f.read = true;
-            if (mode.find('+') != std::string::npos) f.write = true;
-        } else if (mode.find('w') != std::string::npos) {
-            f.write = f.create = f.truncate = true;
-            if (mode.find('+') != std::string::npos) f.read = true;
-        } else {
-            f.append = f.create = true;
-        }
-        int fd = e.files.open(path, f);
+        int fd = e.files.open(path, parse_crt_mode(mode));
         if (out) e.mem.write_sized(out, e.pointer_size(), fd < 0 ? 0 : e.guest_file(fd));
         e.set_result(fd < 0 ? 2 : 0);
     });
@@ -1577,33 +1932,28 @@ void Emulator::install_cl_hooks() {
             out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
             out += static_cast<char>(0x80 | (c & 0x3F));
         }
-        int fd = e.host_fd(e.arg_slot(1));
-        e.write_text(fd == 2 ? 2 : 1, out);
+        e.write_wide_stream(e.arg_slot(1), out);
         e.set_result(c);
     });
     ucrt("fputws", [](Emulator& e) {
         std::string s = wide_arg(e, e.arg_slot(0));
-        int fd = e.host_fd(e.arg_slot(1));
-        e.write_text(fd == 2 ? 2 : 1, s);
+        e.write_wide_stream(e.arg_slot(1), s);
         e.set_result(0);
     });
     ucrt("fgetws", [](Emulator& e) {
-        // (buf, n, stream): read a line, widen it.
+        // (buf, n, stream): one line, decoded from whatever encoding the stream
+        // was opened with.  Reading a UTF-16 file a byte at a time and widening
+        // afterwards produces a string twice as long, every other character NUL -
+        // which is how link.exe came to see one enormous argument.
         uint64_t buf = e.arg_slot(0);
-        int64_t n = static_cast<int64_t>(e.arg_slot(1));
-        int fd = e.host_fd(e.arg_slot(2));
-        std::string line;
-        while (static_cast<int64_t>(line.size()) < n - 1) {
-            uint8_t b = 0;
-            if (e.files.read(fd, &b, 1) != 1) break;
-            line += static_cast<char>(b);
-            if (b == '\n') break;
-        }
-        if (line.empty()) {
+        uint64_t n = e.arg_slot(1);
+        bool found = false;
+        std::string line = e.read_wide_line(e.arg_slot(2), found);
+        if (!found) {
             e.set_result(0);
             return;
         }
-        put_wide(e, buf, line, static_cast<uint64_t>(n));
+        put_wide(e, buf, line, n);
         e.set_result(buf);
     });
     ucrt("getwchar", [](Emulator& e) {
@@ -1682,22 +2032,41 @@ void Emulator::install_cl_hooks() {
     });
     auto wcs_copy = [](Emulator& e, bool cat, bool bounded) {
         // wcscpy_s(dst, size, src) / wcsncpy_s(dst, size, src, count)
+        // Same contract as the narrow forms below, including `_TRUNCATE`, and the
+        // same reason to respect the destination size: this used to copy until the
+        // source ended no matter how big the destination was.
+        constexpr uint64_t kTruncate = ~0ull;   // _TRUNCATE
+        constexpr uint64_t kSTruncate = 80;     // STRUNCATE
         uint64_t dst = e.arg_slot(0);
+        uint64_t capacity = e.arg_slot(1);
         uint64_t src = e.arg_slot(2);
-        uint64_t count = bounded ? e.arg_slot(3) : ~0ull;
+        uint64_t count = bounded ? e.arg_slot(3) : kTruncate;
+        if (!dst || !capacity) {
+            e.set_result(22);  // EINVAL
+            return;
+        }
         uint64_t at = 0;
         if (cat)
-            while (e.mem.read16(dst + at * 2) != 0) ++at;
-        for (uint64_t i = 0; i < count; ++i) {
+            while (at < capacity && e.mem.read16(dst + at * 2) != 0) ++at;
+        uint64_t i = 0;
+        bool truncated = false;
+        for (;; ++i) {
+            if (count != kTruncate && i >= count) break;
             uint16_t c = e.mem.read16(src + i * 2);
-            e.mem.write16(dst + (at + i) * 2, c);
-            if (!c) {
-                e.set_result(0);
-                return;
+            if (!c) break;
+            if (at + i + 1 >= capacity) {
+                truncated = true;
+                break;
             }
+            e.mem.write16(dst + (at + i) * 2, c);
         }
-        e.mem.write16(dst + (at + count) * 2, 0);
-        e.set_result(0);
+        if (truncated && count != kTruncate) {
+            e.mem.write16(dst, 0);
+            e.set_result(34);  // ERANGE
+            return;
+        }
+        e.mem.write16(dst + (at + i) * 2, 0);
+        e.set_result(truncated ? kSTruncate : 0);
     };
     ucrt("wcscpy_s", [wcs_copy](Emulator& e) { wcs_copy(e, false, false); });
     ucrt("wcscat_s", [wcs_copy](Emulator& e) { wcs_copy(e, true, false); });
@@ -1707,17 +2076,40 @@ void Emulator::install_cl_hooks() {
     // The narrow bounded forms, same shape: (dst, dst size, src[, count]).  They
     // return 0 on success and ERANGE when the destination is too small, and a
     // caller that checks - this toolchain does - notices the difference.
+    //
+    // The count may be `_TRUNCATE`, which is `(size_t)-1` and means the opposite
+    // of a length: "copy whatever fits and tell me you truncated".  Reading it as
+    // a length makes every such call overflow the capacity check and fail, and a
+    // failing strncpy_s leaves the destination untouched - so the caller reads
+    // whatever was in its buffer before.  link.exe copies archive member names
+    // this way, and a garbage member name is reported as `LNK1127: the library is
+    // corrupt`, which is a long way from the actual cause.
     auto str_copy = [](Emulator& e, bool cat, bool bounded) {
+        constexpr uint64_t kTruncate = ~0ull;   // _TRUNCATE
+        constexpr uint64_t kSTruncate = 80;     // STRUNCATE
         uint64_t dst = e.arg_slot(0);
         uint64_t capacity = e.arg_slot(1);
+        uint64_t count = bounded ? e.arg_slot(3) : kTruncate;
         std::string src = e.mem.read_cstring(e.arg_slot(2));
-        if (bounded) {
-            uint64_t count = e.arg_slot(3);
-            if (src.size() > count) src.resize(static_cast<size_t>(count));
+        if (count != kTruncate && src.size() > count) src.resize(static_cast<size_t>(count));
+        std::string prefix = cat ? e.mem.read_cstring(dst) : std::string();
+        if (!dst || !capacity) {
+            e.set_result(22);  // EINVAL
+            return;
         }
-        std::string result = cat ? e.mem.read_cstring(dst) + src : src;
-        if (!dst || result.size() + 1 > capacity) {
-            e.set_result(34);  // ERANGE
+        std::string result = prefix + src;
+        if (result.size() + 1 > capacity) {
+            if (count != kTruncate) {
+                // A real bounded copy that does not fit empties the destination,
+                // so a caller that ignores the return value at least gets a valid
+                // empty string rather than a stale one.
+                e.mem.write8(dst, 0);
+                e.set_result(34);  // ERANGE
+                return;
+            }
+            result.resize(static_cast<size_t>(capacity - 1));
+            e.mem.write_cstring(dst, result);
+            e.set_result(kSTruncate);
             return;
         }
         e.mem.write_cstring(dst, result);
