@@ -582,7 +582,8 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             // Deterministic bytes: reproducible runs beat unpredictability here,
             // and nothing in the emulator is trying to be cryptographically sound.
             uint64_t buf = a[0], len = a[1];
-            uint32_t state = 0x12345678u;
+            static uint32_t state = 0x12345678u;  // a stream, not a constant: a guest
+                                                  // that retries a name draws new bytes
             for (uint64_t i = 0; i < len; ++i) {
                 state = state * 1103515245u + 12345u;
                 e.mem.write8(buf + i, static_cast<uint8_t>(state >> 16));

@@ -545,8 +545,7 @@ void Emulator::install_cl_hooks() {
         uint64_t buf = e.alloc_guest_data(raw.data(), raw.size());
         e.mem.write16(out, static_cast<uint16_t>(w.size() * 2));
         e.mem.write16(out + 2, static_cast<uint16_t>((w.size() + 1) * 2));
-        // UNICODE_STRING.Buffer follows the two lengths at pointer alignment.
-        e.mem.write_sized(out + (e.is64() ? 8 : 4), e.pointer_size(), buf);
+        e.mem.write_sized(out + 8, e.pointer_size(), buf);
         e.set_result(1);
     });
     ret0("RtlFreeUnicodeString", 1);
@@ -559,15 +558,10 @@ void Emulator::install_cl_hooks() {
     auto nt_path = [](Emulator& e, uint64_t object_attributes) -> std::string {
         if (!object_attributes) return {};
         int ps = e.pointer_size();
-        // OBJECT_ATTRIBUTES and UNICODE_STRING both change shape with the
-        // pointer size: ObjectName sits at +0x10/+0x8 and the string buffer at
-        // +8/+4.  Reading the 64-bit offsets in a 32-bit guest produced an
-        // empty path, and a c1 that "could not find" a directory that was
-        // plainly there.
-        uint64_t name = e.mem.read_sized(object_attributes + (ps == 8 ? 0x10 : 0x8), ps);
+        uint64_t name = e.mem.read_sized(object_attributes + 0x10, ps);
         if (!name) return {};
         uint32_t bytes = e.mem.read16(name);
-        uint64_t buf = e.mem.read_sized(name + (ps == 8 ? 8 : 4), ps);
+        uint64_t buf = e.mem.read_sized(name + 8, ps);
         if (!buf) return {};
         std::string path = utf16_to_utf8(e, buf, static_cast<int>(bytes / 2));
         // "\??\" and "\DosDevices\" both introduce a drive-letter path.
@@ -577,7 +571,7 @@ void Emulator::install_cl_hooks() {
         // RootDirectory turns the name into a *relative* one - which is how a
         // guest opens a directory once and then the files inside it, and how
         // this call ends up looking like it was given only a directory name.
-        uint64_t root = e.mem.read_sized(object_attributes + (ps == 8 ? 8 : 4), ps);
+        uint64_t root = e.mem.read_sized(object_attributes + 8, ps);
         if (root) {
             int dir_fd = Emulator::fd_from_handle(root);
             FileTable::Entry* dir = dir_fd >= 0 ? e.files.get(dir_fd) : nullptr;
@@ -1254,13 +1248,6 @@ void Emulator::install_cl_hooks() {
                 std::vector<uint8_t> buf(static_cast<size_t>(size));
                 int64_t got = e.files.read(m.fd, buf.data(), size);
                 if (got > 0) e.mem.write(target, buf.data(), static_cast<uint64_t>(got));
-                if (e.options().trace_calls)
-                    e.log_call("MapViewOfFile(fd %d, offset 0x%llX, size 0x%llX) read %lld,"
-                               " head %02X %02X %02X %02X",
-                               m.fd, (unsigned long long)offset, (unsigned long long)size,
-                               (long long)got, buf.size() > 0 ? buf[0] : 0,
-                               buf.size() > 1 ? buf[1] : 0, buf.size() > 2 ? buf[2] : 0,
-                               buf.size() > 3 ? buf[3] : 0);
             }
             if (saved >= 0) e.files.seek(m.fd, saved, 0);
             constexpr uint32_t kFileMapWrite = 0x0002;
@@ -2086,11 +2073,7 @@ void Emulator::install_cl_hooks() {
         // Same contract as the narrow forms below, including `_TRUNCATE`, and the
         // same reason to respect the destination size: this used to copy until the
         // source ended no matter how big the destination was.
-        // _TRUNCATE is (size_t)-1, which is 32 bits wide in a 32-bit guest:
-        // comparing against ~0ull there turns every truncating copy into a
-        // "bounded copy that does not fit", which empties the destination -
-        // and an emptied archive member name is LNK1127, library corrupt.
-        const uint64_t kTruncate = e.is64() ? ~0ull : 0xFFFFFFFFull;
+        constexpr uint64_t kTruncate = ~0ull;   // _TRUNCATE
         constexpr uint64_t kSTruncate = 80;     // STRUNCATE
         uint64_t dst = e.arg_slot(0);
         uint64_t capacity = e.arg_slot(1);
@@ -2140,11 +2123,7 @@ void Emulator::install_cl_hooks() {
     // this way, and a garbage member name is reported as `LNK1127: the library is
     // corrupt`, which is a long way from the actual cause.
     auto str_copy = [](Emulator& e, bool cat, bool bounded) {
-        // _TRUNCATE is (size_t)-1, which is 32 bits wide in a 32-bit guest:
-        // comparing against ~0ull there turns every truncating copy into a
-        // "bounded copy that does not fit", which empties the destination -
-        // and an emptied archive member name is LNK1127, library corrupt.
-        const uint64_t kTruncate = e.is64() ? ~0ull : 0xFFFFFFFFull;
+        constexpr uint64_t kTruncate = ~0ull;   // _TRUNCATE
         constexpr uint64_t kSTruncate = 80;     // STRUNCATE
         uint64_t dst = e.arg_slot(0);
         uint64_t capacity = e.arg_slot(1);

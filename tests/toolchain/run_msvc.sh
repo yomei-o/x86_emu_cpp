@@ -45,8 +45,6 @@ sdk_inc=$(find_sdk) || { echo "MSVC toolchain: skipped (no Windows SDK found)"; 
 sdk_lib=$(echo "$sdk_inc" | sed 's|/Include/|/Lib/|')
 
 export INCLUDE="$msvc/include;$sdk_inc/ucrt;$sdk_inc/shared;$sdk_inc/um;$sdk_inc/winrt"
-export LIB="$msvc/lib/x64;$sdk_lib/ucrt/x64;$sdk_lib/um/x64"
-cl="$msvc/bin/Hostx64/x64/cl.exe"
 
 # The scratch directory sits inside the tree rather than under /tmp, because the
 # guest must be able to open it by the name we hand it, and a shell's idea of
@@ -75,7 +73,18 @@ report() {
     fi
 }
 
-echo "MSVC toolchain (emulated cl.exe/link.exe vs. native)"
+# Both architectures of the same toolset: x64 (Hostx64/x64) and x86
+# (Hostx86/x86).  The 32-bit cl is not a smaller test - it is a different
+# guest entirely (PE32, int 0x80-era CRT conventions, 32-bit NT structures),
+# and every bug it has found so far was invisible to the 64-bit run.
+run_arch() {
+    arch=$1
+    export LIB="$msvc/lib/$arch;$sdk_lib/ucrt/$arch;$sdk_lib/um/$arch"
+    cl="$msvc/bin/Host$arch/$arch/cl.exe"
+    [ "$arch" = x64 ] && cl="$msvc/bin/Hostx64/x64/cl.exe"
+    [ "$arch" = x86 ] && cl="$msvc/bin/Hostx86/x86/cl.exe"
+    [ -x "$cl" ] || { echo "  skip  $arch (no cl.exe)"; return 0; }
+    echo "MSVC toolchain, $arch (emulated cl.exe/link.exe vs. native)"
 
 # Both builds happen in the same directory, because the object records the
 # absolute path of its own source in .debug$S: compiling one file from two
@@ -150,6 +159,12 @@ EOF
         report FAIL "cl hi.cpp (no executable produced)"
     fi
 fi
+
+    rm -rf "$work/build"/*.obj "$work/build"/*.exe "$work"/*.obj
+}
+
+run_arch x64
+run_arch x86
 
 rm -rf tests/toolchain/.work
 echo

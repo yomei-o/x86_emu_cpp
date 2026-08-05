@@ -619,6 +619,10 @@ void Emulator::install_link_hooks() {
         Args tail = Args::va_list_at(e, a.next_ptr());
         std::string input = wide ? utf16_to_utf8(e, buffer, -1) : e.mem.read_cstring(buffer);
         int n = scan_guest(e, input, fmt, tail, wide);
+        if (e.options().trace_calls) {
+            std::string f = wide ? utf16_to_utf8(e, fmt, -1) : e.mem.read_cstring(fmt);
+            e.log_call("vsscanf(\"%.40s\", \"%.24s\") = %d", input.c_str(), f.c_str(), n);
+        }
         e.set_result(static_cast<uint64_t>(static_cast<int64_t>(n)));
     };
     ucrt("__stdio_common_vsscanf", [common_vsscanf](Emulator& e) { common_vsscanf(e, false); });

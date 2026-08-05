@@ -555,18 +555,49 @@ void Emulator::seed_environment() {
     // A language runtime finds its own installation through the environment, so
     // the guest inherits the host's rather than starting empty.
 #if defined(_WIN32)
-    char** block = _environ;
-#else
-    char** block = environ;
-#endif
-    for (char** p = block; p && *p; ++p) {
-        std::string entry = *p;
-        size_t eq = entry.find('=');
+    // The wide environment, converted to UTF-8: the narrow one is in the host's
+    // ANSI code page, and passing those bytes on turned a Japanese username in
+    // %TMP% into mojibake the guest then failed to open.
+    if (!_wenviron) (void)_wgetenv(L"PATH");  // force the wide environment into being
+    for (wchar_t** p = _wenviron; p && *p; ++p) {
+        std::u16string entry(reinterpret_cast<const char16_t*>(*p));
+        std::string utf8;
+        utf8.reserve(entry.size());
+        for (size_t i = 0; i < entry.size();) {
+            uint32_t cp = entry[i++];
+            if (cp >= 0xD800 && cp < 0xDC00 && i < entry.size() &&
+                entry[i] >= 0xDC00 && entry[i] < 0xE000)
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (entry[i++] - 0xDC00);
+            if (cp < 0x80) {
+                utf8 += static_cast<char>(cp);
+            } else if (cp < 0x800) {
+                utf8 += static_cast<char>(0xC0 | (cp >> 6));
+                utf8 += static_cast<char>(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                utf8 += static_cast<char>(0xE0 | (cp >> 12));
+                utf8 += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                utf8 += static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+                utf8 += static_cast<char>(0xF0 | (cp >> 18));
+                utf8 += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                utf8 += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                utf8 += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+        }
+        size_t eq = utf8.find('=');
         // A leading '=' marks Windows's hidden per-drive current directories,
         // which mean nothing here.
         if (eq == std::string::npos || eq == 0) continue;
+        env_.emplace_back(utf8.substr(0, eq), utf8.substr(eq + 1));
+    }
+#else
+    for (char** p = environ; p && *p; ++p) {
+        std::string entry = *p;
+        size_t eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
         env_.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
     }
+#endif
 }
 
 const std::string* Emulator::getenv(const std::string& name) const {
@@ -606,13 +637,10 @@ uint64_t Emulator::environment_block(bool wide) {
 
     if (!wide) return alloc_guest_data(flat.data(), flat.size());
 
-    std::vector<uint8_t> raw;
-    raw.reserve(flat.size() * 2);
-    for (char c : flat) {
-        raw.push_back(static_cast<uint8_t>(c));
-        raw.push_back(0);
-    }
-    return alloc_guest_data(raw.data(), raw.size());
+    // env_ is UTF-8 now (see seed_environment); the wide block has to be real
+    // UTF-16, not zero-extended bytes.
+    std::u16string w = utf8_to_utf16(flat);
+    return alloc_guest_data(w.data(), (w.size() + 0) * 2);
 }
 
 uint64_t Emulator::environment_vector() {
@@ -1366,8 +1394,14 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
         image_.image_base = exe.base;
         image_.image_size = exe.size;
         image_.brk = exe.base + exe.size;
-        // Real DLLs are mapped above the executable, well clear of it.
+        // Real DLLs are mapped above the executable, well clear of it - and,
+        // in a 32-bit guest, clear of the *stack*: the exe ends near 0x500000
+        // and the stack occupies 0x140000..0x540000, so "just past the exe"
+        // loaded msvcp140 into memory the guest's own stack frames grow into.
+        // c1.dll's initialisers, whose locals run to 33 KB, overwrote its code
+        // and the crash surfaced two DLL loads later, inside mspdbcore.
         dll_next_base_ = (exe.base + exe.size + 0xFFFFF) & ~0xFFFFFull;
+        if (!is64() && dll_next_base_ < 0x60000000ull) dll_next_base_ = 0x60000000ull;
         // The main image is registered as a module too, so that GetModuleHandle
         // and GetProcAddress can treat it like any other.
         auto self = std::make_unique<Module>();

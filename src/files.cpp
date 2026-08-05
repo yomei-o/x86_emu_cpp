@@ -11,16 +11,47 @@
 
 #if defined(_WIN32)
 #include <io.h>
-#define x86emu_stat _stat64
 #define x86emu_stat_struct struct _stat64
 #else
 #include <unistd.h>
-#define x86emu_stat stat
 #define x86emu_stat_struct struct stat
 #endif
 
+#include "guest_printf.h"  // utf8_to_utf16, for wide host paths on Windows
+
 namespace x86emu {
 namespace {
+
+// Host paths are UTF-8 strings everywhere in the emulator.  On Windows the
+// narrow CRT interprets bytes in the ANSI code page, so a path with anything
+// beyond ASCII in it - a Japanese %TMP%, say - has to go through the wide
+// entry points instead.  On other hosts the bytes pass straight through.
+#if defined(_WIN32)
+std::wstring host_wide(const std::string& utf8) {
+    std::u16string w = utf8_to_utf16(utf8);
+    return std::wstring(w.begin(), w.end());
+}
+std::FILE* host_fopen(const std::string& path, const char* mode) {
+    std::wstring wmode(mode, mode + std::strlen(mode));
+    return _wfopen(host_wide(path).c_str(), wmode.c_str());
+}
+int x86emu_stat(const char* path, x86emu_stat_struct* st) {
+    return _wstat64(host_wide(path).c_str(), st);
+}
+int host_remove(const std::string& path) { return _wremove(host_wide(path).c_str()); }
+int host_rename(const std::string& from, const std::string& to) {
+    return _wrename(host_wide(from).c_str(), host_wide(to).c_str());
+}
+#else
+std::FILE* host_fopen(const std::string& path, const char* mode) {
+    return std::fopen(path.c_str(), mode);
+}
+#define x86emu_stat stat
+int host_remove(const std::string& path) { return std::remove(path.c_str()); }
+int host_rename(const std::string& from, const std::string& to) {
+    return std::rename(from.c_str(), to.c_str());
+}
+#endif
 
 // errno-style negatives, using the Linux numbers.  The Win32 hooks translate
 // them into their own error codes, and the Linux syscalls pass them straight
@@ -144,10 +175,10 @@ int FileTable::open(const std::string& path, const OpenFlags& flags) {
     }
     // Opening for update without O_CREAT must not create the file, and "r+"
     // already behaves that way; the reverse case needs no special handling.
-    std::FILE* fp = std::fopen(host.c_str(), mode.c_str());
+    std::FILE* fp = host_fopen(host, mode.c_str());
     if (!fp && flags.write && flags.read && flags.create && !flags.truncate) {
         // "r+" failed because the file does not exist yet and we may create it.
-        fp = std::fopen(host.c_str(), flags.binary ? "w+b" : "w+");
+        fp = host_fopen(host, flags.binary ? "w+b" : "w+");
     }
     if (!fp) return from_errno(errno);
 
@@ -415,7 +446,7 @@ int FileTable::remove_file(const std::string& path) {
     // that recreates the same name would overwrite whatever was kept.
     if (std::getenv("X86EMU_KEEP_TEMP")) {
         std::fprintf(stderr, "x86emu: deleting %s:\n", path.c_str());
-        if (FILE* f = std::fopen(host_path(path).c_str(), "rb")) {
+        if (FILE* f = host_fopen(host_path(path), "rb")) {
             unsigned char buf[64];
             size_t got;
             size_t total = 0;
@@ -431,12 +462,12 @@ int FileTable::remove_file(const std::string& path) {
         }
     }
 
-    if (std::remove(host_path(path).c_str()) != 0) return from_errno(errno);
+    if (host_remove(host_path(path)) != 0) return from_errno(errno);
     return 0;
 }
 
 int FileTable::rename_file(const std::string& from, const std::string& to) {
-    if (std::rename(host_path(from).c_str(), host_path(to).c_str()) != 0)
+    if (host_rename(host_path(from), host_path(to)) != 0)
         return from_errno(errno);
     return 0;
 }

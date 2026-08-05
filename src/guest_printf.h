@@ -27,5 +27,8 @@ int scan_guest(Emulator& e, const std::string& input, uint64_t fmt_ptr, Emulator
 // UTF-16 <-> UTF-8 for the wide Win32 entry points (BMP only).
 std::string utf16_to_utf8(Emulator& e, uint64_t ptr, int units);
 std::u16string utf8_to_utf16(const std::string& s);
+// The same conversion for a host-side UTF-16 string (surrogates included):
+// host paths and environment travel through the emulator as UTF-8.
+std::string utf16_string_to_utf8(const std::u16string& s);
 
 }  // namespace x86emu

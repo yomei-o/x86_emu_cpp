@@ -73,12 +73,10 @@ std::string program_path(const Emulator& e) {
     bool absolute = (path.size() > 1 && path[1] == ':') ||
                     (!path.empty() && (path[0] == '/' || path[0] == '\\'));
     if (!absolute) {
-#if defined(_WIN32)
-        wchar_t cwd[4096];
-        if (_wgetcwd(cwd, 4096))
-            path = utf16_string_to_utf8(std::u16string(cwd, cwd + wcslen(cwd))) + "/" + path;
-#else
         char cwd[4096];
+#if defined(_WIN32)
+        if (_getcwd(cwd, sizeof cwd)) path = std::string(cwd) + "/" + path;
+#else
         if (getcwd(cwd, sizeof cwd)) path = std::string(cwd) + "/" + path;
 #endif
     }
@@ -153,30 +151,12 @@ void Emulator::install_win32_hooks() {
     win32("GetCurrentThread", 0, [](Emulator& e) { e.set_result(~1ull); });
     win32("GetCurrentProcessId", 0, [](Emulator& e) { e.set_result(e.pid()); });
     win32("GetCurrentThreadId", 0, [](Emulator& e) { e.set_result(1234); });
-    // A name must resolve the way GetModuleHandleEx resolves it: cl 14.31's CRT
-    // asks for the synch apiset and then kernel32 while wiring up WaitOnAddress,
-    // and fastfails if *both* come back null - answering 0 for every name was
-    // an instant INT3 ten thousand instructions in.
-    auto get_module_handle = [](Emulator& e, bool wide) {
-        uint64_t name_ptr = e.arg_slot(0);
-        if (!name_ptr) {
-            e.set_result(e.image().image_base);
-            return;
-        }
-        std::string name = wide ? utf16_to_utf8(e, name_ptr, -1)
-                                : e.mem.read_cstring(name_ptr);
-        uint64_t base = 0;
-        if (Emulator::Module* m = e.module_by_name(lowercase_name(name)))
-            base = m->image.base;
-        else
-            base = e.hooked_module_handle(name);
-        if (!base) e.set_last_error(126);  // ERROR_MOD_NOT_FOUND
-        e.set_result(base);
-    };
-    win32("GetModuleHandleA", 1,
-          [get_module_handle](Emulator& e) { get_module_handle(e, false); });
-    win32("GetModuleHandleW", 1,
-          [get_module_handle](Emulator& e) { get_module_handle(e, true); });
+    win32("GetModuleHandleA", 1, [](Emulator& e) {
+        e.set_result(e.arg_slot(0) == 0 ? e.image().image_base : 0);
+    });
+    win32("GetModuleHandleW", 1, [](Emulator& e) {
+        e.set_result(e.arg_slot(0) == 0 ? e.image().image_base : 0);
+    });
     // (flags, name-or-address, out module).  The interesting flag is
     // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, which asks "which module is this
     // address in?" - a caller uses it to find *itself* from a function pointer,
@@ -261,10 +241,6 @@ void Emulator::install_win32_hooks() {
         }
         std::string symbol = e.mem.read_cstring(name_or_ordinal);
         uint64_t addr = e.find_export(module, symbol);
-        if (e.options().trace_calls)
-            e.log_call("GetProcAddress(0x%llX, %s) = 0x%llX",
-                       (unsigned long long)module, symbol.c_str(),
-                       (unsigned long long)addr);
         if (!addr) {
             // Either a hooked module, or a real one that does not export it.  A
             // hook exists only if the emulator implements the function; asking

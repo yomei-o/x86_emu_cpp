@@ -109,10 +109,14 @@ std::vector<Emulator::DirectoryEntry> Emulator::list_directory(const std::string
 
     std::vector<DirectoryEntry> found;
     std::error_code ec;
-    std::filesystem::directory_iterator it(directory, ec);
+    // Paths are UTF-8 strings here; going through u8path/u8string keeps the
+    // host's ANSI code page out of it.  path::string() is worse than lossy on
+    // MSVC - a filename it cannot represent *throws*, and an uncaught throw
+    // inside a hook takes the whole emulator down with no message.
+    std::filesystem::directory_iterator it(std::filesystem::u8path(directory), ec);
     if (ec) return found;
     for (const auto& item : it) {
-        std::string name = item.path().filename().string();
+        std::string name = item.path().filename().u8string();
         if (!matches(name, pattern)) continue;
         DirectoryEntry entry;
         entry.name = name;
@@ -123,7 +127,7 @@ std::vector<Emulator::DirectoryEntry> Emulator::list_directory(const std::string
             ec.clear();
         }
         FileTable::Stat st;
-        entry.mtime = FileTable::stat_path(item.path().string(), st) == 0 ? st.mtime : 0;
+        entry.mtime = FileTable::stat_path(item.path().u8string(), st) == 0 ? st.mtime : 0;
         found.push_back(std::move(entry));
     }
     // A stable order keeps a guest's output reproducible, which the host's
@@ -280,6 +284,36 @@ void Emulator::install_win32_fs_hooks() {
         e.mem.write32(out + 40, 1);       // number of links
         e.set_result(1);
     });
+    // (handle, volume name buf+size, serial*, max component*, fs flags*, fs
+    // name buf+size).  cl 14.31's c1 asks about the volume its source file
+    // lives on; the serial matches GetFileInformationByHandle's, because a
+    // caller may correlate the two.
+    win32("GetVolumeInformationByHandleW", 8, [](Emulator& e) {
+        uint64_t vol_name = e.arg_slot(1), vol_len = e.arg_slot(2);
+        uint64_t serial = e.arg_slot(3), max_comp = e.arg_slot(4);
+        uint64_t flags = e.arg_slot(5), fs_name = e.arg_slot(6), fs_len = e.arg_slot(7);
+        if (vol_name && vol_len) e.mem.write16(vol_name, 0);
+        if (serial) e.mem.write32(serial, 0x1234);
+        if (max_comp) e.mem.write32(max_comp, 255);
+        if (flags) e.mem.write32(flags, 0x03E700FF);  // what NTFS reports
+        if (fs_name && fs_len >= 5)
+            for (int i = 0; i < 5; ++i) e.mem.write16(fs_name + i * 2, "NTFS"[i]);
+        e.set_result(1);
+    });
+    // The by-path sibling: (root path, volume name buf+size, serial*, max
+    // component*, fs flags*, fs name buf+size).
+    win32("GetVolumeInformationW", 8, [](Emulator& e) {
+        uint64_t vol_name = e.arg_slot(1), vol_len = e.arg_slot(2);
+        uint64_t serial = e.arg_slot(3), max_comp = e.arg_slot(4);
+        uint64_t flags = e.arg_slot(5), fs_name = e.arg_slot(6), fs_len = e.arg_slot(7);
+        if (vol_name && vol_len) e.mem.write16(vol_name, 0);
+        if (serial) e.mem.write32(serial, 0x1234);
+        if (max_comp) e.mem.write32(max_comp, 255);
+        if (flags) e.mem.write32(flags, 0x03E700FF);
+        if (fs_name && fs_len >= 5)
+            for (int i = 0; i < 5; ++i) e.mem.write16(fs_name + i * 2, "NTFS"[i]);
+        e.set_result(1);
+    });
     // (handle, information class, buffer, size).  CPython's os.stat needs the
     // attribute-tag class in particular: it opens the path, asks for the basic
     // information, and then asks whether it is a reparse point.
@@ -322,9 +356,15 @@ void Emulator::install_win32_fs_hooks() {
                 break;
             }
             case 18: {  // FileIdInfo: a volume serial and a 128-bit file id
+                // The id must be *distinct per file*: cl 14.31's include cache
+                // keys directories by it, and an all-zero id made every include
+                // directory the same directory - reported as "cannot open
+                // stdio.h" with the path plainly correct.  st.ino is the same
+                // stable per-path hash the Linux side hands musl's ld.so.
                 std::vector<uint8_t> zeros(24, 0);
                 e.mem.write(out, zeros.data(), zeros.size());
                 e.mem.write64(out + 0, 0x1234);
+                e.mem.write64(out + 8, st.ino);
                 break;
             }
             default:

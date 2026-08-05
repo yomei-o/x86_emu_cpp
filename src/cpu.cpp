@@ -882,6 +882,36 @@ void Cpu::execute_0f() {
                 reg_write(RAX, size, dst);
             return;
         }
+        case 0xC7: {  // group 9: CMPXCHG8B / CMPXCHG16B
+            RM rm = decode_modrm();
+            int sub = modrm_reg_ & 7;
+            if (sub != 1 || rm.is_reg) throw CpuError(start, "unsupported 0F C7 form");
+            if (pfx_.rex_w) {  // CMPXCHG16B m128
+                uint64_t lo = mem_.read64(rm.addr), hi = mem_.read64(rm.addr + 8);
+                if (lo == regs[RAX] && hi == regs[RDX]) {
+                    mem_.write64(rm.addr, regs[RBX]);
+                    mem_.write64(rm.addr + 8, regs[RCX]);
+                    set_flag(FLAG_ZF, true);
+                } else {
+                    regs[RAX] = lo;
+                    regs[RDX] = hi;
+                    set_flag(FLAG_ZF, false);
+                }
+                return;
+            }
+            // CMPXCHG8B m64: compare EDX:EAX, exchange with ECX:EBX.
+            uint64_t cur = mem_.read64(rm.addr);
+            uint64_t want = (regs[RDX] << 32) | (regs[RAX] & 0xFFFFFFFFull);
+            if (cur == want) {
+                mem_.write64(rm.addr, (regs[RCX] << 32) | (regs[RBX] & 0xFFFFFFFFull));
+                set_flag(FLAG_ZF, true);
+            } else {
+                reg_write(RAX, 4, cur & 0xFFFFFFFFull);
+                reg_write(RDX, 4, cur >> 32);
+                set_flag(FLAG_ZF, false);
+            }
+            return;
+        }
         case 0xC0:
         case 0xC1: {  // XADD
             int size = op == 0xC0 ? 1 : opsize_;

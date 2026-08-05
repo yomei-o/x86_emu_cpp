@@ -322,6 +322,33 @@ std::string utf16_to_utf8(Emulator& e, uint64_t ptr, int units) {
     return out;
 }
 
+std::string utf16_string_to_utf8(const std::u16string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        uint32_t c = s[i];
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < s.size() &&
+            s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000)
+            c = 0x10000 + ((c - 0xD800) << 10) + (s[++i] - 0xDC00);
+        if (c < 0x80) {
+            out += static_cast<char>(c);
+        } else if (c < 0x800) {
+            out += static_cast<char>(0xC0 | (c >> 6));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out += static_cast<char>(0xE0 | (c >> 12));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (c >> 18));
+            out += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
 std::u16string utf8_to_utf16(const std::string& s) {
     std::u16string out;
     size_t i = 0;

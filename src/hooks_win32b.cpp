@@ -24,10 +24,15 @@ namespace x86emu {
 namespace {
 
 std::string current_directory() {
-    char buf[4096];
 #if defined(_WIN32)
-    if (_getcwd(buf, sizeof buf)) return buf;
+    // Wide, then UTF-8: the narrow _getcwd answers in the ANSI code page, and
+    // a working directory with a Japanese username in it came out as bytes no
+    // later conversion could rescue.
+    wchar_t wbuf[4096];
+    if (_wgetcwd(wbuf, 4096))
+        return utf16_string_to_utf8(std::u16string(wbuf, wbuf + wcslen(wbuf)));
 #else
+    char buf[4096];
     if (getcwd(buf, sizeof buf)) return buf;
 #endif
     return ".";
@@ -302,7 +307,7 @@ void Emulator::install_win32_extra_hooks() {
         // Deterministic bytes, for the same reason getrandom() is: reproducible
         // runs are worth more here than unpredictability.
         uint64_t buf = e.arg_slot(1), len = e.arg_slot(2);
-        uint32_t state = 0x9E3779B9u;
+        static uint32_t state = 0x9E3779B9u;  // a stream, not a constant: see CryptGenRandom
         for (uint64_t i = 0; i < len; ++i) {
             state = state * 1103515245u + 12345u;
             e.mem.write8(buf + i, static_cast<uint8_t>(state >> 16));

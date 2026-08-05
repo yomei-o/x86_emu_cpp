@@ -390,6 +390,67 @@ fine, so the configuration is legitimate — but a guest that genuinely needs a
 deep stack will hit it, and the honest next step is a real
 setrlimit(RLIMIT_STACK) that grows the stack mapping.
 
+## Done 2026-08-06 (later): MSVC cl.exe on both bitnesses, on this machine's 14.31
+
+`tests/toolchain/run_msvc.sh` now runs **x64 and x86** (8 checks) and both are
+green: C and C++ objects byte-identical to native, and the linked executables
+run under the emulator. Getting there was two stories.
+
+**cl 14.31 (this machine's toolset) vs the 14.4x the suite last ran against** -
+version drift found real gaps:
+
+- `GetModuleHandleA/W` answered 0 for every *name*. 14.31's CRT probes the
+  synch apiset then kernel32 while wiring up WaitOnAddress and fastfails
+  (INT3, no message) when both are null. Names resolve through the module
+  table and hooked-module handles now, like GetModuleHandleEx always did.
+- The deterministic random hooks reset their seed *per call*, so every
+  CryptGenRandom answered the same bytes - and cl 14.31 retries its temp-file
+  name against collisions by drawing again, seven identical draws, D8037.
+  CryptGenRandom/BCryptGenRandom/getrandom are persistent streams now
+  (still deterministic per run).
+- `GetVolumeInformation(ByHandle)W` and a *distinct* 128-bit id per file in
+  `GetFileInformationByHandleEx(FileIdInfo)`: c1's include cache keys
+  directories by that id, and all-zero ids made every include directory the
+  same directory ("cannot open stdio.h", path plainly correct). st.ino - the
+  same per-path hash musl's ld.so gets - is the id.
+
+**A Japanese username in every path** (this machine's %TMP% and cwd) flushed
+out the assumption that host bytes are ASCII: the guest environment is now
+seeded from `_wenviron` as UTF-8 and the wide environment block is real
+UTF-16; host file access goes through `_wfopen`/`_wstat64`/`_wremove`/
+`_wrename`; the working directory is read wide (three call sites); and
+`list_directory` walks `u8path`s - MSVC's `path::string()` *throws* on a
+filename outside the ANSI code page, and an uncaught throw in a hook kills
+the emulator with no message at all.
+
+**The 32-bit toolset is a different guest, and it found five more:**
+
+- **The DLL region sat inside the guest's stack.** A 32-bit Windows guest's
+  stack is 0x140000..0x540000 and DLLs were mapped "just past the exe" at
+  ~0x500000, so msvcp140.dll loaded *into the stack* and c1's initialisers -
+  33 KB of locals - overwrote its code. The crash surfaced two DLL loads
+  later, inside mspdbcore, as a jump into stack bytes. 32-bit DLLs map from
+  0x60000000 now. (Found with X86EMU_WATCH on the clobbered code byte.)
+- **OBJECT_ATTRIBUTES and UNICODE_STRING change shape with the pointer
+  size** - ObjectName at +0x10/+0x8, the string buffer at +8/+4. Reading the
+  64-bit offsets in a 32-bit guest handed NtCreateFile an empty path, and c1
+  "could not find" the current directory. RtlCreateUnicodeString wrote its
+  buffer pointer at the wrong offset the same way.
+- **CMPXCHG8B** (`0F C7 /1`), 82 million instructions into the compile - the
+  32-bit lock-free primitive; CMPXCHG16B came along for free.
+- **`_TRUNCATE` is `(size_t)-1`, and size_t is 32 bits there.** The
+  strncpy_s/wcsncpy_s hooks compared against ~0ull, so every truncating copy
+  became a "bounded copy that does not fit", which empties the destination -
+  and an emptied archive member name is LNK1127 "library is corrupt". The
+  64-bit flavour of this exact bug is already in these notes; the 32-bit
+  flavour hid behind it.
+- The ELF-side siblings from the same day (interp/PIE bases truncating,
+  mmap2's page offsets, _llseek) are in the 32-bit glibc gcc section above.
+
+`--trace-calls` now prints GetProcAddress names, _waccess_s paths, vsscanf
+inputs and MapViewOfFile reads - each added mid-hunt, each kept because the
+next hunt will want it.
+
 ## Done 2026-08-06: 32-bit glibc gcc — Ubuntu jammy i386, real ld-linux.so.2
 
 The same exercise in 32-bit mode: **Ubuntu 22.04's i386 gcc-11 compiles, links
