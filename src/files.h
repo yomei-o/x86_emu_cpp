@@ -167,6 +167,12 @@ public:
     Entry* get(int fd);
     bool valid(int fd) const;
 
+    // What the guest opened this descriptor with.  The memory map is far more
+    // use when a file mapping says which library it is than when every one of
+    // them says "mmap": the guest's own ld.so does the mapping, so this is the
+    // only place the name is still known.
+    std::string path_of(int fd) const;
+
     // Filesystem operations that do not involve a descriptor.
     static int remove_file(const std::string& path);
     static int rename_file(const std::string& from, const std::string& to);

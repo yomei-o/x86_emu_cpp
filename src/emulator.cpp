@@ -20,7 +20,15 @@ extern "C" char** environ;
 namespace x86emu {
 
 Emulator::Emulator(Options opt) : opt_(opt) {}
-Emulator::~Emulator() = default;
+Emulator::~Emulator() {
+    // The profile is printed here rather than by the caller: every front end
+    // would otherwise have to remember to, and the one that forgets is the one
+    // being used when the question comes up.
+    if (cpu_ && cpu_->profiling()) {
+        std::string report = cpu_->profile_report();
+        if (!report.empty()) std::fputs(report.c_str(), stderr);
+    }
+}
 
 Abi Emulator::abi() const {
     if (!is64()) return Abi::Cdecl32;
@@ -794,7 +802,8 @@ uint64_t Emulator::heap_alloc(uint64_t size) {
     return addr;
 }
 
-uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment) {
+uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment,
+                               const std::string& name) {
     uint64_t need = (size + 0xFFF) & ~0xFFFull;
     if (alignment > 0x1000) {
         // Round the frontier up instead of searching the free list: an
@@ -804,7 +813,7 @@ uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment) {
         if (mmap_next_ + need > mmap_limit_) return 0;
         uint64_t addr = mmap_next_;
         mmap_next_ += need;
-        mem.map(addr, need);
+        mem.map(addr, need, name);
         mmap_live_[addr] = need;
         return addr;
     }
@@ -825,7 +834,7 @@ uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment) {
             mmap_free_[best] = {addr + need, have - need};  // keep the remainder
         else
             mmap_free_.erase(mmap_free_.begin() + static_cast<long>(best));
-        mem.map(addr, need);
+        mem.map(addr, need, name);
         mmap_live_[addr] = need;
         return addr;
     }
@@ -833,7 +842,7 @@ uint64_t Emulator::alloc_pages(uint64_t size, uint64_t alignment) {
     if (mmap_next_ + need > mmap_limit_) return 0;
     uint64_t addr = mmap_next_;
     mmap_next_ += need;
-    mem.map(addr, need);
+    mem.map(addr, need, name);
     mmap_live_[addr] = need;
     return addr;
 }
@@ -1023,10 +1032,20 @@ void Emulator::write_raw(int fd, const void* data, size_t len) {
     // nothing about the C runtime's buffer on real Windows either, so a guest
     // that mixes the two sees its raw writes overtake its buffered ones - and
     // matching that is the whole point of buffering here.
-    if (output_sink)
+    if (output_sink) {
         output_sink(fd, static_cast<const char*>(data), len);
-    else
-        std::fwrite(data, 1, len, fd == 2 ? stderr : stdout);
+        return;
+    }
+    std::FILE* out = fd == 2 ? stderr : stdout;
+    std::fwrite(data, 1, len, out);
+    // ...but the bytes do have to leave the emulator.  When our stdout is a
+    // pipe rather than a terminal the C runtime gives it a 4 KB buffer that
+    // nobody empties, so a guest that answers a request and waits for the next
+    // one, and a caller that sent a request and waits for the answer, wait for
+    // each other forever.  The guest's own fflush only gets the bytes as far as
+    // here.  It also means a long run's progress can be watched through a
+    // redirect, which it could not before.
+    std::fflush(out);
 }
 
 void Emulator::flush_guest_output() {
@@ -1037,10 +1056,12 @@ void Emulator::flush_guest_output() {
         files.write(1, out.data(), out.size());
         return;
     }
-    if (output_sink)
+    if (output_sink) {
         output_sink(1, out.data(), out.size());
-    else
-        std::fwrite(out.data(), 1, out.size(), stdout);
+        return;
+    }
+    std::fwrite(out.data(), 1, out.size(), stdout);
+    std::fflush(stdout);
 }
 
 void Emulator::write_text(int fd, const std::string& data) {
@@ -1346,6 +1367,12 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     image_.format = format;
 
     cpu_ = std::make_unique<Cpu>(mem, mode);
+    // X86EMU_PROFILE=N: sample the instruction pointer every N instructions.
+    // Reported by mapping at teardown - see Cpu::profile_report.
+    if (const char* pv = std::getenv("X86EMU_PROFILE")) {
+        uint64_t every = std::strtoull(pv, nullptr, 0);
+        if (every) cpu_->enable_profile(every);
+    }
     cpu_->trace = opt_.trace;
     files.set_text_translation(os_kind == Os::Windows);
     // A Windows CRT block-buffers stdout unless it is a terminal.  Matching that

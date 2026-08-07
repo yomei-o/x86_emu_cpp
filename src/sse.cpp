@@ -7,13 +7,34 @@
 // SSE instruction a byte means depends on a mandatory prefix (none / 66 / F3 /
 // F2).  execute_sse() returns false for anything it does not own so that
 // execute_0f() can carry on with the integer forms.
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "cpu.h"
 
 namespace x86emu {
 namespace {
+
+// X86EMU_AES_COUNT reports at exit how many AES-NI instructions actually ran.
+// It is the cheapest way to tell "the decrypt never happened" from "the decrypt
+// happened and something after it is wrong", and it costs an increment when the
+// guest is doing AES at all - which no guest that is not doing AES ever is.
+struct AesCensus {
+    unsigned long long imc = 0, enc = 0, enclast = 0, dec = 0, declast = 0, keygen = 0;
+    ~AesCensus() {
+        if (!std::getenv("X86EMU_AES_COUNT")) return;
+        std::fprintf(stderr,
+                     "[aes] aesimc=%llu aesenc=%llu aesenclast=%llu aesdec=%llu "
+                     "aesdeclast=%llu aeskeygenassist=%llu\n",
+                     imc, enc, enclast, dec, declast, keygen);
+        std::fflush(stderr);
+    }
+};
+AesCensus g_aes;
 
 // The prefix that selects between the four variants of an SSE opcode.
 enum class Sel { None, P66, PF3, PF2 };
@@ -27,6 +48,98 @@ float to_float(uint32_t bits) {
     float f;
     std::memcpy(&f, &bits, 4);
     return f;
+}
+
+// ---- AES-NI ---------------------------------------------------------------
+// The AES round exactly as FIPS-197 defines it.  The 128-bit register holds the
+// state column by column: byte 4c+r is row r of column c, which is the only
+// thing about these instructions that is not in the standard.
+const uint8_t kAesSbox[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+};
+
+uint8_t aes_inv_sbox(uint8_t v) {
+    static const std::array<uint8_t, 256> table = [] {
+        std::array<uint8_t, 256> t{};
+        for (int i = 0; i < 256; ++i) t[kAesSbox[i]] = static_cast<uint8_t>(i);
+        return t;
+    }();
+    return table[v];
+}
+
+// Multiplication in GF(2^8) modulo the AES polynomial.
+uint8_t aes_gmul(uint8_t a, uint8_t b) {
+    uint8_t r = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (b & 1) r ^= a;
+        bool high = (a & 0x80) != 0;
+        a = static_cast<uint8_t>(a << 1);
+        if (high) a ^= 0x1B;
+        b = static_cast<uint8_t>(b >> 1);
+    }
+    return r;
+}
+
+Cpu::Xmm aes_xor(Cpu::Xmm a, const Cpu::Xmm& b) {
+    a.q[0] ^= b.q[0];
+    a.q[1] ^= b.q[1];
+    return a;
+}
+
+// ShiftRows followed by SubBytes, or their inverses.  The two commute, and the
+// instructions are specified in this order.
+Cpu::Xmm aes_sub_shift(const Cpu::Xmm& s, bool inverse) {
+    Cpu::Xmm r{};
+    for (int col = 0; col < 4; ++col)
+        for (int row = 0; row < 4; ++row) {
+            int src = inverse ? (col - row + 4) % 4 : (col + row) % 4;
+            uint8_t v = s.b[4 * src + row];
+            r.b[4 * col + row] = inverse ? aes_inv_sbox(v) : kAesSbox[v];
+        }
+    return r;
+}
+
+Cpu::Xmm aes_mix_columns(const Cpu::Xmm& s) {
+    Cpu::Xmm r{};
+    for (int c = 0; c < 4; ++c) {
+        const uint8_t* v = &s.b[4 * c];
+        r.b[4 * c + 0] = aes_gmul(v[0], 2) ^ aes_gmul(v[1], 3) ^ v[2] ^ v[3];
+        r.b[4 * c + 1] = v[0] ^ aes_gmul(v[1], 2) ^ aes_gmul(v[2], 3) ^ v[3];
+        r.b[4 * c + 2] = v[0] ^ v[1] ^ aes_gmul(v[2], 2) ^ aes_gmul(v[3], 3);
+        r.b[4 * c + 3] = aes_gmul(v[0], 3) ^ v[1] ^ v[2] ^ aes_gmul(v[3], 2);
+    }
+    return r;
+}
+
+Cpu::Xmm aes_inv_mix_columns(const Cpu::Xmm& s) {
+    Cpu::Xmm r{};
+    for (int c = 0; c < 4; ++c) {
+        const uint8_t* v = &s.b[4 * c];
+        r.b[4 * c + 0] = aes_gmul(v[0], 14) ^ aes_gmul(v[1], 11) ^ aes_gmul(v[2], 13) ^
+                         aes_gmul(v[3], 9);
+        r.b[4 * c + 1] = aes_gmul(v[0], 9) ^ aes_gmul(v[1], 14) ^ aes_gmul(v[2], 11) ^
+                         aes_gmul(v[3], 13);
+        r.b[4 * c + 2] = aes_gmul(v[0], 13) ^ aes_gmul(v[1], 9) ^ aes_gmul(v[2], 14) ^
+                         aes_gmul(v[3], 11);
+        r.b[4 * c + 3] = aes_gmul(v[0], 11) ^ aes_gmul(v[1], 13) ^ aes_gmul(v[2], 9) ^
+                         aes_gmul(v[3], 14);
+    }
+    return r;
 }
 
 // MXCSR carries the same rounding-mode field as the x87 control word, in bits
@@ -279,10 +392,9 @@ bool Cpu::execute_sse(uint8_t op) {
             // 0x2C truncates; 0x2D rounds to nearest (the default MXCSR mode).
             double r = op == 0x2C ? std::trunc(v) : round_by_mxcsr(mxcsr, v);
             if (opsize_ == 8)
-                reg_write(modrm_reg_, 8, static_cast<uint64_t>(static_cast<int64_t>(r)));
+                reg_write(modrm_reg_, 8, static_cast<uint64_t>(to_int64_x86(r)));
             else
-                reg_write(modrm_reg_, 4,
-                          static_cast<uint32_t>(static_cast<int32_t>(r)));
+                reg_write(modrm_reg_, 4, static_cast<uint32_t>(to_int32_x86(r)));
             return true;
         }
         case 0x5A: {  // CVTSS2SD / CVTSD2SS / CVTPS2PD / CVTPD2PS
@@ -313,7 +425,7 @@ bool Cpu::execute_sse(uint8_t op) {
             } else {
                 for (int i = 0; i < 4; ++i) {
                     float f = s.f32[i];
-                    r.d[i] = static_cast<uint32_t>(static_cast<int32_t>(
+                    r.d[i] = static_cast<uint32_t>(to_int32_x86(
                         sel == Sel::PF3 ? std::trunc(f) : round_by_mxcsr(mxcsr, f)));
                 }
             }
@@ -328,7 +440,7 @@ bool Cpu::execute_sse(uint8_t op) {
                 r.f64[1] = static_cast<int32_t>(s.d[1]);
             } else {
                 for (int i = 0; i < 2; ++i)
-                    r.d[i] = static_cast<uint32_t>(static_cast<int32_t>(
+                    r.d[i] = static_cast<uint32_t>(to_int32_x86(
                         sel == Sel::P66 ? std::trunc(s.f64[i]) : round_by_mxcsr(mxcsr, s.f64[i])));
             }
             xmm[modrm_reg_] = r;
@@ -435,6 +547,28 @@ bool Cpu::execute_sse(uint8_t op) {
             }
             return true;
         }
+        case 0x52:
+        case 0x53: {  // RSQRTPS / RSQRTSS / RCPPS / RCPSS
+            // These are the *approximate* reciprocal instructions: hardware
+            // answers them to about twelve bits and the exact value differs
+            // between CPU generations, so the architecture only bounds the
+            // relative error at 1.5 * 2^-12.  Computing them exactly in single
+            // precision sits well inside that, and every caller either refines
+            // with a Newton step or does not care - which is why MLAS reaches
+            // for them in the first place.
+            if (sel == Sel::P66 || sel == Sel::PF2) return false;  // no double form
+            RM rm = decode_modrm();
+            auto approx = [op](float v) {
+                return op == 0x52 ? 1.0f / std::sqrt(v) : 1.0f / v;
+            };
+            if (sel == Sel::PF3) {
+                xmm[modrm_reg_].f32[0] = approx(to_float(xmm_read_d(rm)));
+            } else {
+                Xmm s = xmm_read(rm);
+                for (int i = 0; i < 4; ++i) xmm[modrm_reg_].f32[i] = approx(s.f32[i]);
+            }
+            return true;
+        }
         case 0x54:
         case 0x55:
         case 0x56:
@@ -479,13 +613,16 @@ bool Cpu::execute_sse(uint8_t op) {
                     case 0x59: pd_op(dst, src, lanes, [](double a, double b) { return a * b; }); break;
                     case 0x5C: pd_op(dst, src, lanes, [](double a, double b) { return a - b; }); break;
                     case 0x5E: pd_op(dst, src, lanes, [](double a, double b) { return a / b; }); break;
-                    // MIN/MAX return the second operand when either is NaN, per
-                    // the hardware definition.
+                    // MIN is "if SRC1 < SRC2 then SRC1 else SRC2", exactly, and
+                    // the "else" carries two cases worth naming: either operand
+                    // NaN gives SRC2, and so does a tie - which is how MINPD
+                    // tells +0.0 from -0.0.  Testing b < a instead returns SRC1
+                    // on a tie, which is wrong for -0.0 and for the NaN in SRC1.
                     case 0x5D: pd_op(dst, src, lanes, [](double a, double b) {
-                                   return (std::isnan(a) || std::isnan(b) || b < a) ? b : a; });
+                                   return a < b ? a : b; });
                                break;
                     default: pd_op(dst, src, lanes, [](double a, double b) {
-                                 return (std::isnan(a) || std::isnan(b) || b > a) ? b : a; });
+                                 return a > b ? a : b; });
                              break;
                 }
             } else {
@@ -495,10 +632,10 @@ bool Cpu::execute_sse(uint8_t op) {
                     case 0x5C: ps_op(dst, src, lanes, [](float a, float b) { return a - b; }); break;
                     case 0x5E: ps_op(dst, src, lanes, [](float a, float b) { return a / b; }); break;
                     case 0x5D: ps_op(dst, src, lanes, [](float a, float b) {
-                                   return (std::isnan(a) || std::isnan(b) || b < a) ? b : a; });
+                                   return a < b ? a : b; });
                                break;
                     default: ps_op(dst, src, lanes, [](float a, float b) {
-                                 return (std::isnan(a) || std::isnan(b) || b > a) ? b : a; });
+                                 return a > b ? a : b; });
                              break;
                 }
             }
@@ -593,11 +730,16 @@ bool Cpu::execute_sse(uint8_t op) {
                     uint64_t lane = width == 2 ? v.w[i] : width == 4 ? v.d[i] : v.q[i];
                     int bits = width * 8;
                     uint64_t out;
+                    // The /reg field picks the direction: /2 PSRLx, /4 PSRAx,
+                    // /6 PSLLx.  Four and six are not interchangeable and were
+                    // swapped here, which made every PSLLQ an arithmetic shift
+                    // right - invisible to a compiler's output and fatal to
+                    // hand-written SIMD.
                     if (sub == 2) {  // logical right
                         out = count >= bits ? 0 : lane >> count;
-                    } else if (sub == 4) {  // left
+                    } else if (sub == 6) {  // left
                         out = count >= bits ? 0 : lane << count;
-                    } else {  // 6: arithmetic right
+                    } else {  // 4: arithmetic right (no quadword form exists)
                         int64_t s = width == 2 ? static_cast<int16_t>(lane)
                                   : width == 4 ? static_cast<int32_t>(lane)
                                                : static_cast<int64_t>(lane);
@@ -1004,6 +1146,274 @@ bool Cpu::execute_sse(uint8_t op) {
                 set_flag(FLAG_AF, false);
                 return true;
             }
+            // AES-NI.  A guest reaches these only when CPUID says AES, and the
+            // reason to implement them is that the alternative is worse than
+            // not running: a library that finds no AES bit does not always fall
+            // back to software, it can decline the work and hand its caller
+            // bytes it never transformed.
+            if (sel == Sel::P66 && op3 >= 0xDB && op3 <= 0xDF) {
+                RM rm = decode_modrm();
+                Xmm s = xmm_read(rm), d = xmm[modrm_reg_], r{};
+                switch (op3) {
+                    case 0xDB:  // AESIMC: the equivalent-inverse key schedule
+                        r = aes_inv_mix_columns(s);
+                        ++g_aes.imc;
+                        break;
+                    case 0xDC:  // AESENC
+                        r = aes_xor(aes_mix_columns(aes_sub_shift(d, false)), s);
+                        ++g_aes.enc;
+                        break;
+                    case 0xDD:  // AESENCLAST - the final round omits MixColumns
+                        r = aes_xor(aes_sub_shift(d, false), s);
+                        ++g_aes.enclast;
+                        break;
+                    case 0xDE:  // AESDEC
+                        r = aes_xor(aes_inv_mix_columns(aes_sub_shift(d, true)), s);
+                        ++g_aes.dec;
+                        break;
+                    default:    // 0xDF, AESDECLAST
+                        r = aes_xor(aes_sub_shift(d, true), s);
+                        ++g_aes.declast;
+                        break;
+                }
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            // ---- SSSE3 and SSE4.1 -------------------------------------
+            // CPUID does not advertise these yet, but implementing them is
+            // what makes advertising them possible - and ONNX Runtime's SSE2
+            // fallback kernels are the slowest path it has.  Every one of
+            // them is checked against a real CPU and qemu by isatest.
+            if (sel == Sel::P66 && ((op3 >= 0x01 && op3 <= 0x0B) ||
+                                    (op3 >= 0x1C && op3 <= 0x1E))) {  // SSSE3
+                RM rm = decode_modrm();
+                Xmm a = xmm[modrm_reg_], b = xmm_read(rm), r{};
+                auto sat_sw = [](int32_t v) -> uint16_t {
+                    return v < -32768 ? 0x8000 : v > 32767 ? 0x7FFF : static_cast<uint16_t>(v);
+                };
+                auto sw = [](uint16_t v) { return static_cast<int16_t>(v); };
+                switch (op3) {
+                    case 0x01:  // PHADDW: pairs within the destination, then the source
+                    case 0x05:  // PHSUBW
+                        for (int i = 0; i < 4; ++i) {
+                            r.w[i] = static_cast<uint16_t>(op3 == 0x01 ? a.w[2 * i] + a.w[2 * i + 1]
+                                                                      : a.w[2 * i] - a.w[2 * i + 1]);
+                            r.w[4 + i] = static_cast<uint16_t>(
+                                op3 == 0x01 ? b.w[2 * i] + b.w[2 * i + 1]
+                                            : b.w[2 * i] - b.w[2 * i + 1]);
+                        }
+                        break;
+                    case 0x02:  // PHADDD
+                    case 0x06:  // PHSUBD
+                        for (int i = 0; i < 2; ++i) {
+                            r.d[i] = op3 == 0x02 ? a.d[2 * i] + a.d[2 * i + 1]
+                                                 : a.d[2 * i] - a.d[2 * i + 1];
+                            r.d[2 + i] = op3 == 0x02 ? b.d[2 * i] + b.d[2 * i + 1]
+                                                     : b.d[2 * i] - b.d[2 * i + 1];
+                        }
+                        break;
+                    case 0x03:  // PHADDSW
+                    case 0x07:  // PHSUBSW
+                        for (int i = 0; i < 4; ++i) {
+                            r.w[i] = sat_sw(op3 == 0x03 ? sw(a.w[2 * i]) + sw(a.w[2 * i + 1])
+                                                        : sw(a.w[2 * i]) - sw(a.w[2 * i + 1]));
+                            r.w[4 + i] = sat_sw(op3 == 0x03 ? sw(b.w[2 * i]) + sw(b.w[2 * i + 1])
+                                                            : sw(b.w[2 * i]) - sw(b.w[2 * i + 1]));
+                        }
+                        break;
+                    case 0x04:  // PMADDUBSW: the destination is unsigned, the source signed
+                        for (int i = 0; i < 8; ++i) {
+                            int32_t lo = static_cast<int32_t>(a.b[2 * i]) *
+                                         static_cast<int8_t>(b.b[2 * i]);
+                            int32_t hi = static_cast<int32_t>(a.b[2 * i + 1]) *
+                                         static_cast<int8_t>(b.b[2 * i + 1]);
+                            r.w[i] = sat_sw(lo + hi);
+                        }
+                        break;
+                    case 0x08:  // PSIGNB
+                    case 0x09:  // PSIGNW
+                    case 0x0A:  // PSIGND
+                        // The source's sign decides: negate, zero, or leave alone.
+                        if (op3 == 0x08)
+                            for (int i = 0; i < 16; ++i) {
+                                int8_t s = static_cast<int8_t>(b.b[i]);
+                                r.b[i] = s < 0 ? static_cast<uint8_t>(-static_cast<int8_t>(a.b[i]))
+                                               : (s == 0 ? 0 : a.b[i]);
+                            }
+                        else if (op3 == 0x09)
+                            for (int i = 0; i < 8; ++i) {
+                                int16_t s = sw(b.w[i]);
+                                r.w[i] = s < 0 ? static_cast<uint16_t>(-sw(a.w[i]))
+                                               : (s == 0 ? 0 : a.w[i]);
+                            }
+                        else
+                            for (int i = 0; i < 4; ++i) {
+                                int32_t s = static_cast<int32_t>(b.d[i]);
+                                r.d[i] = s < 0 ? static_cast<uint32_t>(-static_cast<int32_t>(a.d[i]))
+                                               : (s == 0 ? 0 : a.d[i]);
+                            }
+                        break;
+                    case 0x0B:  // PMULHRSW: multiply, keep the top, round to nearest
+                        for (int i = 0; i < 8; ++i) {
+                            int32_t p = sw(a.w[i]) * sw(b.w[i]);
+                            r.w[i] = static_cast<uint16_t>(((p >> 14) + 1) >> 1);
+                        }
+                        break;
+                    case 0x1C:  // PABSB - the source is the operand, not the destination
+                        for (int i = 0; i < 16; ++i) {
+                            int8_t v = static_cast<int8_t>(b.b[i]);
+                            r.b[i] = static_cast<uint8_t>(v < 0 ? -v : v);
+                        }
+                        break;
+                    case 0x1D:  // PABSW
+                        for (int i = 0; i < 8; ++i) {
+                            int16_t v = sw(b.w[i]);
+                            r.w[i] = static_cast<uint16_t>(v < 0 ? -v : v);
+                        }
+                        break;
+                    default:  // 0x1E, PABSD
+                        for (int i = 0; i < 4; ++i) {
+                            int32_t v = static_cast<int32_t>(b.d[i]);
+                            r.d[i] = static_cast<uint32_t>(v < 0 ? -v : v);
+                        }
+                        break;
+                }
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            if (sel == Sel::P66 && (op3 == 0x10 || op3 == 0x14 || op3 == 0x15)) {
+                // PBLENDVB / BLENDVPS / BLENDVPD: the mask is xmm0, implicitly,
+                // and only the top bit of each element of it is read.
+                RM rm = decode_modrm();
+                Xmm a = xmm[modrm_reg_], b = xmm_read(rm), m = xmm[0], r = a;
+                if (op3 == 0x10)
+                    for (int i = 0; i < 16; ++i) r.b[i] = (m.b[i] & 0x80) ? b.b[i] : a.b[i];
+                else if (op3 == 0x14)
+                    for (int i = 0; i < 4; ++i) r.d[i] = (m.d[i] & 0x80000000u) ? b.d[i] : a.d[i];
+                else
+                    for (int i = 0; i < 2; ++i)
+                        r.q[i] = (m.q[i] & 0x8000000000000000ull) ? b.q[i] : a.q[i];
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            if (sel == Sel::P66 && ((op3 >= 0x20 && op3 <= 0x25) ||
+                                    (op3 >= 0x30 && op3 <= 0x35))) {
+                // PMOVSX / PMOVZX: widen the low part of the source.  The two
+                // families differ only in what fills the new high bits.
+                RM rm = decode_modrm();
+                Xmm b = xmm_read(rm), r{};
+                bool zero = op3 >= 0x30;
+                switch (op3 & 0x0F) {
+                    case 0x0:  // byte -> word
+                        for (int i = 0; i < 8; ++i)
+                            r.w[i] = zero ? b.b[i]
+                                          : static_cast<uint16_t>(static_cast<int8_t>(b.b[i]));
+                        break;
+                    case 0x1:  // byte -> dword
+                        for (int i = 0; i < 4; ++i)
+                            r.d[i] = zero ? b.b[i]
+                                          : static_cast<uint32_t>(static_cast<int8_t>(b.b[i]));
+                        break;
+                    case 0x2:  // byte -> qword
+                        for (int i = 0; i < 2; ++i)
+                            r.q[i] = zero ? b.b[i]
+                                          : static_cast<uint64_t>(static_cast<int8_t>(b.b[i]));
+                        break;
+                    case 0x3:  // word -> dword
+                        for (int i = 0; i < 4; ++i)
+                            r.d[i] = zero ? b.w[i]
+                                          : static_cast<uint32_t>(static_cast<int16_t>(b.w[i]));
+                        break;
+                    case 0x4:  // word -> qword
+                        for (int i = 0; i < 2; ++i)
+                            r.q[i] = zero ? b.w[i]
+                                          : static_cast<uint64_t>(static_cast<int16_t>(b.w[i]));
+                        break;
+                    default:  // 0x5, dword -> qword
+                        for (int i = 0; i < 2; ++i)
+                            r.q[i] = zero ? b.d[i]
+                                          : static_cast<uint64_t>(static_cast<int32_t>(b.d[i]));
+                        break;
+                }
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            if (sel == Sel::P66 && (op3 == 0x28 || op3 == 0x29 || op3 == 0x2B ||
+                                    op3 == 0x37 || (op3 >= 0x38 && op3 <= 0x41))) {
+                RM rm = decode_modrm();
+                Xmm a = xmm[modrm_reg_], b = xmm_read(rm), r{};
+                auto sd = [](uint32_t v) { return static_cast<int32_t>(v); };
+                switch (op3) {
+                    case 0x28:  // PMULDQ: the even dwords, signed, to qwords
+                        for (int i = 0; i < 2; ++i)
+                            r.q[i] = static_cast<uint64_t>(static_cast<int64_t>(sd(a.d[2 * i])) *
+                                                           sd(b.d[2 * i]));
+                        break;
+                    case 0x29:  // PCMPEQQ
+                        for (int i = 0; i < 2; ++i) r.q[i] = a.q[i] == b.q[i] ? ~0ull : 0;
+                        break;
+                    case 0x2B: {  // PACKUSDW: signed dwords -> unsigned words
+                        auto sat = [](int32_t v) -> uint16_t {
+                            return v < 0 ? 0 : v > 65535 ? 0xFFFF : static_cast<uint16_t>(v);
+                        };
+                        for (int i = 0; i < 4; ++i) r.w[i] = sat(sd(a.d[i]));
+                        for (int i = 0; i < 4; ++i) r.w[4 + i] = sat(sd(b.d[i]));
+                        break;
+                    }
+                    case 0x37:  // PCMPGTQ (SSE4.2)
+                        for (int i = 0; i < 2; ++i)
+                            r.q[i] = static_cast<int64_t>(a.q[i]) > static_cast<int64_t>(b.q[i])
+                                         ? ~0ull
+                                         : 0;
+                        break;
+                    case 0x38:  // PMINSB
+                    case 0x3C:  // PMAXSB
+                        for (int i = 0; i < 16; ++i) {
+                            int8_t x = static_cast<int8_t>(a.b[i]), y = static_cast<int8_t>(b.b[i]);
+                            r.b[i] = static_cast<uint8_t>(op3 == 0x38 ? (x < y ? x : y)
+                                                                     : (x > y ? x : y));
+                        }
+                        break;
+                    case 0x39:  // PMINSD
+                    case 0x3D:  // PMAXSD
+                        for (int i = 0; i < 4; ++i) {
+                            int32_t x = sd(a.d[i]), y = sd(b.d[i]);
+                            r.d[i] = static_cast<uint32_t>(op3 == 0x39 ? (x < y ? x : y)
+                                                                      : (x > y ? x : y));
+                        }
+                        break;
+                    case 0x3A:  // PMINUW
+                    case 0x3E:  // PMAXUW
+                        for (int i = 0; i < 8; ++i)
+                            r.w[i] = op3 == 0x3A ? (a.w[i] < b.w[i] ? a.w[i] : b.w[i])
+                                                 : (a.w[i] > b.w[i] ? a.w[i] : b.w[i]);
+                        break;
+                    case 0x3B:  // PMINUD
+                    case 0x3F:  // PMAXUD
+                        for (int i = 0; i < 4; ++i)
+                            r.d[i] = op3 == 0x3B ? (a.d[i] < b.d[i] ? a.d[i] : b.d[i])
+                                                 : (a.d[i] > b.d[i] ? a.d[i] : b.d[i]);
+                        break;
+                    case 0x40:  // PMULLD: the low half of the signed product
+                        for (int i = 0; i < 4; ++i)
+                            r.d[i] = static_cast<uint32_t>(sd(a.d[i]) * sd(b.d[i]));
+                        break;
+                    default: {  // 0x41, PHMINPOSUW: the smallest word, and where it was
+                        int at = 0;
+                        uint16_t best = b.w[0];
+                        for (int i = 1; i < 8; ++i)
+                            if (b.w[i] < best) {
+                                best = b.w[i];
+                                at = i;
+                            }
+                        r.w[0] = best;
+                        r.w[1] = static_cast<uint16_t>(at);
+                        break;
+                    }
+                }
+                xmm[modrm_reg_] = r;
+                return true;
+            }
             unsupported("0F 38 opcode", op3, start);
         }
         case 0x3A: {
@@ -1034,6 +1444,143 @@ bool Cpu::execute_sse(uint8_t op) {
                     int idx = i + n;
                     r.b[i] = idx < 16 ? s.b[idx] : (idx < 32 ? a.b[idx - 16] : 0);
                 }
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            if (sel == Sel::P66 && (op3 == 0x08 || op3 == 0x09)) {  // ROUNDPS / ROUNDPD
+                RM rm = decode_modrm(1);
+                Xmm s = xmm_read(rm), r{};
+                uint8_t imm = fetch8();
+                // Bit 2 says "use MXCSR"; otherwise bits 1:0 name the mode.
+                auto round = [&](double v) {
+                    if (imm & 4) return round_by_mxcsr(mxcsr, v);
+                    switch (imm & 3) {
+                        case 0: return std::nearbyint(v);
+                        case 1: return std::floor(v);
+                        case 2: return std::ceil(v);
+                        default: return std::trunc(v);
+                    }
+                };
+                if (op3 == 0x09)
+                    for (int i = 0; i < 2; ++i) r.f64[i] = round(s.f64[i]);
+                else
+                    for (int i = 0; i < 4; ++i)
+                        r.f32[i] = static_cast<float>(round(s.f32[i]));
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            if (sel == Sel::P66 && (op3 == 0x0C || op3 == 0x0D || op3 == 0x0E)) {
+                // BLENDPS / BLENDPD / PBLENDW: one immediate bit per element.
+                RM rm = decode_modrm(1);
+                Xmm a = xmm[modrm_reg_], b = xmm_read(rm), r = a;
+                uint8_t imm = fetch8();
+                if (op3 == 0x0C)
+                    for (int i = 0; i < 4; ++i) r.d[i] = (imm >> i) & 1 ? b.d[i] : a.d[i];
+                else if (op3 == 0x0D)
+                    for (int i = 0; i < 2; ++i) r.q[i] = (imm >> i) & 1 ? b.q[i] : a.q[i];
+                else
+                    for (int i = 0; i < 8; ++i) r.w[i] = (imm >> i) & 1 ? b.w[i] : a.w[i];
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            if (sel == Sel::P66 && op3 == 0x21) {  // INSERTPS
+                RM rm = decode_modrm(1);
+                Xmm s = xmm_read(rm);
+                uint8_t imm = fetch8();
+                // imm[7:6] picks the source dword (register form only), imm[5:4]
+                // the destination one, and imm[3:0] then zeroes whichever
+                // elements it names - including the one just written.
+                uint32_t v = rm.is_reg ? s.d[(imm >> 6) & 3] : s.d[0];
+                Xmm& d = xmm[modrm_reg_];
+                d.d[(imm >> 4) & 3] = v;
+                for (int i = 0; i < 4; ++i)
+                    if ((imm >> i) & 1) d.d[i] = 0;
+                return true;
+            }
+            if (sel == Sel::P66 && (op3 == 0x14 || op3 == 0x15 || op3 == 0x16 || op3 == 0x17)) {
+                // PEXTRB / PEXTRW / PEXTRD / PEXTRQ / EXTRACTPS.  The register
+                // form zero-extends into the whole general register; the memory
+                // form writes exactly the element's width.
+                RM rm = decode_modrm(1);
+                Xmm s = xmm[modrm_reg_];
+                uint8_t imm = fetch8();
+                uint64_t v;
+                int width;
+                if (op3 == 0x14) {
+                    v = s.b[imm & 15];
+                    width = 1;
+                } else if (op3 == 0x15) {
+                    v = s.w[imm & 7];
+                    width = 2;
+                } else if (op3 == 0x17) {
+                    v = s.d[imm & 3];
+                    width = 4;
+                } else if (pfx_.rex_w) {
+                    v = s.q[imm & 1];
+                    width = 8;
+                } else {
+                    v = s.d[imm & 3];
+                    width = 4;
+                }
+                if (rm.is_reg)
+                    reg_write(rm.reg, width == 8 ? 8 : 4, v);
+                else
+                    mem_.write_sized(rm.addr, width, v);
+                return true;
+            }
+            if (sel == Sel::P66 && (op3 == 0x20 || op3 == 0x22)) {
+                // PINSRB / PINSRD / PINSRQ, from a general register or memory.
+                RM rm = decode_modrm(1);
+                int width = op3 == 0x20 ? 1 : (pfx_.rex_w ? 8 : 4);
+                uint64_t v = rm.is_reg ? reg_read(rm.reg, width == 8 ? 8 : 4)
+                                       : mem_.read_sized(rm.addr, width);
+                uint8_t imm = fetch8();
+                Xmm& d = xmm[modrm_reg_];
+                if (width == 1)
+                    d.b[imm & 15] = static_cast<uint8_t>(v);
+                else if (width == 4)
+                    d.d[imm & 3] = static_cast<uint32_t>(v);
+                else
+                    d.q[imm & 1] = v;
+                return true;
+            }
+            if (op3 == 0xDF && sel == Sel::P66) {  // AESKEYGENASSIST
+                RM rm = decode_modrm(1);
+                Xmm s = xmm_read(rm);
+                uint8_t rcon = fetch8();
+                auto sub_word = [](uint32_t w) {
+                    uint32_t r = 0;
+                    for (int i = 0; i < 4; ++i)
+                        r |= static_cast<uint32_t>(kAesSbox[(w >> (i * 8)) & 0xFF]) << (i * 8);
+                    return r;
+                };
+                auto rot_word = [](uint32_t w) { return (w >> 8) | (w << 24); };
+                Xmm r{};
+                r.d[0] = sub_word(s.d[1]);
+                r.d[1] = rot_word(sub_word(s.d[1])) ^ rcon;
+                r.d[2] = sub_word(s.d[3]);
+                r.d[3] = rot_word(sub_word(s.d[3])) ^ rcon;
+                ++g_aes.keygen;
+                xmm[modrm_reg_] = r;
+                return true;
+            }
+            if (op3 == 0x44 && sel == Sel::P66) {  // PCLMULQDQ
+                RM rm = decode_modrm(1);
+                Xmm s = xmm_read(rm), d = xmm[modrm_reg_];
+                uint8_t imm = fetch8();
+                uint64_t a = d.q[(imm & 0x01) ? 1 : 0], b = s.q[(imm & 0x10) ? 1 : 0];
+                // Carry-less: the same shift-and-add as a multiply, with XOR
+                // standing in for the add, so nothing ever carries.
+                uint64_t lo = 0, hi = 0;
+                for (int i = 0; i < 64; ++i) {
+                    if ((a >> i) & 1) {
+                        lo ^= b << i;
+                        if (i) hi ^= b >> (64 - i);
+                    }
+                }
+                Xmm r{};
+                r.q[0] = lo;
+                r.q[1] = hi;
                 xmm[modrm_reg_] = r;
                 return true;
             }

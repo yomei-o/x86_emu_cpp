@@ -187,7 +187,7 @@ void Cpu::execute_x87(uint8_t op) {
                     case 2:
                     case 3: {  // FISTTP / FIST / FISTP m32
                         double v = st[st_top];
-                        int32_t i = static_cast<int32_t>(
+                        int32_t i = to_int32_x86(
                             sub == 1 ? std::trunc(v) : round_by(fpu_control, v));
                         mem_.write32(addr, static_cast<uint32_t>(i));
                         if (sub != 2) fpu_pop();
@@ -271,7 +271,7 @@ void Cpu::execute_x87(uint8_t op) {
                         return;
                     case 2:
                     case 3: {  // FIST / FISTP m16
-                        int16_t i = static_cast<int16_t>(round_by(fpu_control, st[st_top]));
+                        int16_t i = to_int16_x86(round_by(fpu_control, st[st_top]));
                         mem_.write16(addr, static_cast<uint16_t>(i));
                         if (sub == 3) fpu_pop();
                         return;
@@ -280,7 +280,7 @@ void Cpu::execute_x87(uint8_t op) {
                         fpu_push(static_cast<double>(static_cast<int64_t>(mem_.read64(addr))));
                         return;
                     case 7: {  // FISTP m64
-                        int64_t i = static_cast<int64_t>(round_by(fpu_control, fpu_pop()));
+                        int64_t i = to_int64_x86(round_by(fpu_control, fpu_pop()));
                         mem_.write64(addr, static_cast<uint64_t>(i));
                         return;
                     }

@@ -45,10 +45,23 @@ public:
         uint64_t base;
         uint64_t size;
         std::string name;
+        // For a file mapping, where the bytes came from.  Anything capturing
+        // this address space can then leave out the pages that still match the
+        // file and read them back instead - which for a guest that has mapped a
+        // 98 MB dictionary is most of what it would otherwise carry.
+        std::string file;
+        uint64_t file_offset = 0;
     };
 
     // Makes [addr, addr+size) readable/writable, zero filled.  Pages that are
     // already present are left untouched, so overlapping maps are harmless.
+    //
+    // The pages are *reserved*, not allocated: the table gets an empty slot for
+    // each and the 4 KiB behind it appears on the first access.  A slot is
+    // about fifty bytes against the page's four thousand, which is the
+    // difference between a guest that maps a 460 MB library and one that can.
+    // Most of that library is device code the emulator never runs; a segment of
+    // it that is never touched now costs nothing.
     void map(uint64_t addr, uint64_t size, const std::string& name = "");
 
     bool is_mapped(uint64_t addr) const {
@@ -59,6 +72,26 @@ public:
     // later map() of the same range gets fresh zero-filled pages, which is what
     // munmap() followed by mmap() means.
     void unmap(uint64_t addr, uint64_t size);
+
+    // Every guest memory access ends up in host_ptr, so what host_ptr costs is
+    // multiplied by billions.  A hash lookup per byte is far more than the work
+    // it is finding, and a guest with a gigabyte live has a quarter of a
+    // million pages for the table to spread over.
+    //
+    // So: a direct-mapped cache of resolved pages, the smallest thing that
+    // works.  Code and stack and the array being walked land in different slots
+    // and all stay resident, which is the case that matters; a conflict costs
+    // one hash lookup, which is what every access used to cost.
+    //
+    // A cached entry can only go stale when a page is freed, so unmap() and
+    // clone_from() clear it and nothing else has to.  map() never replaces a
+    // page that exists, and a miss is never cached, so neither can invalidate
+    // anything.  The pages themselves are separately allocated, so the table
+    // rehashing does not move them.  A reserved-but-unbacked page is never
+    // cached either - host_ptr_slow allocates it first.
+    static constexpr int kTlbBits = 10;
+    static constexpr int kTlbSize = 1 << kTlbBits;
+    static constexpr uint64_t kTlbNone = ~0ull;
 
     void read(uint64_t addr, void* dst, uint64_t len) const;
     void write(uint64_t addr, const void* src, uint64_t len);
@@ -103,17 +136,48 @@ public:
     // what fork() means for an address space.
     void clone_from(const Memory& other) {
         pages_.clear();
+        tlb_flush();
         for (const auto& [index, page] : other.pages_)
-            pages_[index] = std::make_unique<Page>(*page);
+            pages_[index] = page ? std::make_unique<Page>(*page) : nullptr;
         regions_ = other.regions_;
     }
 
     const std::vector<Region>& regions() const { return regions_; }
 
+    // Records what a mapping was read from.  Separate from map() because the
+    // syscall knows the file and the allocator does not.
+    void set_region_file(uint64_t base, std::string path, uint64_t offset);
+
+    // The pages that have memory behind them, and the bytes of one.  Reserved
+    // but untouched pages are not listed: they read as zero, so anything
+    // capturing this address space can leave them out and get them back for
+    // free.  Sorted, so a capture is reproducible.
+    std::vector<uint64_t> live_pages() const;
+    const uint8_t* page_data(uint64_t index) const;
+
 private:
     using Page = std::array<uint8_t, kPageSize>;
 
-    uint8_t* host_ptr(uint64_t addr, bool for_write) const;
+    struct TlbEntry {
+        uint64_t page = kTlbNone;
+        uint8_t* host = nullptr;
+    };
+
+    uint8_t* host_ptr(uint64_t addr, bool for_write) const {
+        uint64_t page = addr >> kPageBits;
+        const TlbEntry& e = tlb_[page & (kTlbSize - 1)];
+        if (e.page == page) return e.host + (addr & kPageMask);
+        return host_ptr_slow(addr, for_write);
+    }
+
+    uint8_t* host_ptr_slow(uint64_t addr, bool for_write) const;
+
+    void tlb_flush() {
+        for (auto& e : tlb_) {
+            e.page = kTlbNone;
+            e.host = nullptr;
+        }
+    }
 
     template <typename T>
     T read_int(uint64_t addr) const {
@@ -139,7 +203,18 @@ private:
         write(addr, &v, sizeof(T));
     }
 
+    // Whether a page is reserved but has never been touched.  Such a page
+    // reads as zero, so writing zeros over the whole of one is a no-op - which
+    // is what keeps a library's 419 MB of unused device code from being copied
+    // into memory it will never be read from.
+    bool unbacked(uint64_t addr) const {
+        auto it = pages_.find(addr >> kPageBits);
+        return it != pages_.end() && !it->second;
+    }
+
+    // A null slot means reserved; the Page appears on first access.
     mutable std::unordered_map<uint64_t, std::unique_ptr<Page>> pages_;
+    mutable TlbEntry tlb_[kTlbSize];
     std::vector<Region> regions_;
 };
 

@@ -272,6 +272,11 @@ bool FileTable::valid(int fd) const {
            (it->second.fp != nullptr || it->second.is_directory || it->second.pipe_end);
 }
 
+std::string FileTable::path_of(int fd) const {
+    auto it = files_.find(fd);
+    return it == files_.end() ? std::string() : it->second.path;
+}
+
 FileTable::Entry* FileTable::get(int fd) {
     auto it = files_.find(fd);
     if (it == files_.end() || it->second.closed) return nullptr;
@@ -351,10 +356,20 @@ int64_t FileTable::write(int fd, const void* src, uint64_t len) {
         }
         if (std::fwrite(expanded.data(), 1, expanded.size(), e->fp.get()) != expanded.size())
             return 0;
+        if (e->standard_stream) std::fflush(e->fp.get());
         // Report the count the guest asked about, not the expanded one.
         return static_cast<int64_t>(len);
     }
     size_t put = std::fwrite(src, 1, static_cast<size_t>(len), e->fp.get());
+    // A guest write to a standard stream has to leave the emulator, not sit in
+    // the emulator's own stdio buffer.  The guest flushing its buffer only gets
+    // the bytes as far as here, and when stdout is a pipe rather than a
+    // terminal that buffer is 4 KB and nobody empties it - so a guest that
+    // writes an answer and waits for the next request, and a host that wrote a
+    // request and waits for the answer, wait for each other forever.  It also
+    // means a long run's progress can be watched through a redirect, which it
+    // could not before.
+    if (e->standard_stream) std::fflush(e->fp.get());
     return static_cast<int64_t>(put);
 }
 

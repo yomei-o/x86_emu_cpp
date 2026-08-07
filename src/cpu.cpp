@@ -2,7 +2,11 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace x86emu {
 
@@ -39,10 +43,12 @@ struct Census {
     }
 };
 
-Census* census() {
+// Resolved once, at load.  A function-local static costs a guarded load on
+// every instruction executed, and Cpu::step is the hottest path there is.
+Census* const g_census = [] {
     static Census c;
     return c.out ? &c : nullptr;
-}
+}();
 
 uint64_t mask_of(int size) {
     return size == 8 ? ~0ull : ((1ull << (size * 8)) - 1);
@@ -718,6 +724,8 @@ void Cpu::execute_0f() {
                 EDX_FXSR = 1u << 24,
                 EDX_SSE = 1u << 25,
                 EDX_SSE2 = 1u << 26,
+                ECX_PCLMULQDQ = 1u << 1,
+                ECX_AES = 1u << 25,
             };
             switch (static_cast<uint32_t>(regs[RAX])) {
                 case 0:
@@ -731,7 +739,14 @@ void Cpu::execute_0f() {
                 case 1:
                     regs[RAX] = 0x000306C3;  // a Haswell-era family/model/stepping
                     regs[RBX] = 0x00000800;  // one logical processor, CLFLUSH 64B
-                    regs[RCX] = 0;           // no SSE3 or later
+                    // AES and PCLMULQDQ are the exception to "advertise nothing
+                    // in ECX": both are implemented (sse.cpp), and neither is a
+                    // bit glibc's IFUNC dispatch consults, so turning them on
+                    // does not drag memcpy into SSSE3 code that is not here.
+                    // A crypto library that finds no AES bit does not reliably
+                    // fall back to software - it can decline to transform the
+                    // data at all, and hand its caller the input unchanged.
+                    regs[RCX] = ECX_PCLMULQDQ | ECX_AES;
                     regs[RDX] = EDX_FPU | EDX_TSC | EDX_CX8 | EDX_CMOV | EDX_MMX |
                                 EDX_FXSR | EDX_SSE | EDX_SSE2;
                     break;
@@ -858,13 +873,28 @@ void Cpu::execute_0f() {
             uint64_t count = (from_cl ? regs[RCX] : fetch8()) & (opsize_ == 8 ? 63 : 31);
             uint64_t dst = rm_read(rm, opsize_);
             int bits = opsize_ * 8;
-            if (count > 0 && count < static_cast<uint64_t>(bits)) {
+            if (count == 0) {
+                // A count of zero shifts nothing and touches no flag, but the
+                // destination register is still written - and a 32-bit write
+                // zeroes the upper half.  Returning without writing leaves the
+                // old upper half in place, which is a different 64-bit value.
+                if (rm.is_reg) rm_write(rm, opsize_, dst);
+                return;
+            }
+            if (count < static_cast<uint64_t>(bits)) {
                 uint64_t r = left ? ((dst << count) | (src >> (bits - count)))
                                   : ((dst >> count) | (src << (bits - count)));
                 r &= mask_of(opsize_);
                 set_flag(FLAG_CF, left ? ((dst >> (bits - count)) & 1) != 0
                                        : ((dst >> (count - 1)) & 1) != 0);
                 set_szp(r, opsize_);
+                // OF is defined for a count of one only, and then it says the
+                // sign changed.  For any other count it is undefined and left
+                // alone deliberately.
+                if (count == 1) {
+                    uint64_t sign = 1ull << (bits - 1);
+                    set_flag(FLAG_OF, ((dst ^ r) & sign) != 0);
+                }
                 rm_write(rm, opsize_, r);
             }
             return;
@@ -932,6 +962,44 @@ void Cpu::execute_0f() {
 // Main dispatch
 // ---------------------------------------------------------------------------
 
+// Where the samples fell, by mapping, commonest first.
+//
+// Regions can overlap - map() is called with a name more than once over the
+// same span - so a sample is attributed to the *last* one that contains it,
+// which is the same rule the fault message uses and keeps the two consistent.
+std::string Cpu::profile_report() const {
+    if (profile_samples_.empty()) return {};
+    const auto& regions = mem_.regions();
+    std::unordered_map<std::string, uint64_t> hits;
+    uint64_t unattributed = 0;
+    for (uint64_t rip : profile_samples_) {
+        const std::string* where = nullptr;
+        for (const auto& r : regions)
+            if (rip >= r.base && rip < r.base + r.size) where = &r.name;
+        if (where)
+            hits[*where]++;
+        else
+            unattributed++;
+    }
+    std::vector<std::pair<uint64_t, std::string>> sorted;
+    for (const auto& [name, n] : hits) sorted.push_back({n, name});
+    if (unattributed) sorted.push_back({unattributed, "(unmapped or hooks)"});
+    std::sort(sorted.rbegin(), sorted.rend());
+
+    std::string out = "[profile] " + std::to_string(profile_samples_.size()) +
+                      " samples, one every " + std::to_string(profile_every_) +
+                      " instructions\n";
+    char line[256];
+    double total = static_cast<double>(profile_samples_.size());
+    for (const auto& [n, name] : sorted) {
+        std::snprintf(line, sizeof line, "[profile] %6.2f %%  %8llu  %s\n",
+                      100.0 * static_cast<double>(n) / total,
+                      static_cast<unsigned long long>(n), name.c_str());
+        out += line;
+    }
+    return out;
+}
+
 void Cpu::unsupported(const char* what, uint8_t opcode, uint64_t start_rip) {
     // Show a few raw bytes so an unknown encoding can be looked up quickly.
     char bytes[64] = {};
@@ -943,9 +1011,18 @@ void Cpu::unsupported(const char* what, uint8_t opcode, uint64_t start_rip) {
             break;
         }
     }
-    char buf[192];
-    std::snprintf(buf, sizeof buf, "unsupported %s 0x%02X at 0x%llX [%s]", what, opcode,
-                  static_cast<unsigned long long>(start_rip), bytes);
+    // Which mapping the address is in.  A bare address says nothing when a
+    // dozen libraries are loaded; the name says whether this is the guest's own
+    // code, the C library, or some third-party .so that wants an instruction
+    // set this emulator does not have.
+    std::string where;
+    for (const auto& r : mem_.regions())
+        if (start_rip >= r.base && start_rip < r.base + r.size) where = r.name;
+
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "unsupported %s 0x%02X at 0x%llX [%s]%s%s", what, opcode,
+                  static_cast<unsigned long long>(start_rip), bytes,
+                  where.empty() ? "" : " in ", where.c_str());
     throw CpuError(start_rip, buf);
 }
 
@@ -958,7 +1035,11 @@ void Cpu::step() {
 
     uint64_t start = rip;
     g_watch_rip = start;
-    if (Census* c = census()) c->record(start);
+    if (--profile_countdown_ == 0) {
+        profile_countdown_ = profile_every_ ? profile_every_ : ~0ull;
+        if (profile_every_) profile_samples_.push_back(start);
+    }
+    if (g_census) g_census->record(start);
     if (!history_.empty()) {
         history_[history_pos_] = start;
         history_pos_ = (history_pos_ + 1) % history_.size();
@@ -968,39 +1049,43 @@ void Cpu::step() {
 
     // Prefix bytes.  Segment overrides other than fs:/gs: are accepted and
     // ignored, because the loaders set up a flat address space.
-    for (;;) {
+    //
+    // A switch, not a chain of comparisons: this runs for every instruction the
+    // guest executes, and the chain it replaces tested nine other things before
+    // reaching REX - which is the commonest prefix there is in 64-bit code, and
+    // "no prefix at all" was the tenth.
+    bool more_prefixes = true;
+    while (more_prefixes) {
         uint8_t b = mem_.read8(rip);
-        if (b == 0x66) {
-            pfx_.opsize16 = true;
-        } else if (b == 0x67) {
-            pfx_.addr_override = true;
-        } else if (b == 0xF0) {
-            pfx_.lock = true;
-        } else if (b == 0xF2) {
-            pfx_.repne = true;
-        } else if (b == 0xF3) {
-            pfx_.rep = true;
-        } else if (b == 0x64) {
-            pfx_.seg_base = fs_base;
-            pfx_.seg_override = true;
-        } else if (b == 0x65) {
-            pfx_.seg_base = gs_base;
-            pfx_.seg_override = true;
-        } else if (b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) {
+        switch (b) {
+            case 0x40: case 0x41: case 0x42: case 0x43:
+            case 0x44: case 0x45: case 0x46: case 0x47:
+            case 0x48: case 0x49: case 0x4A: case 0x4B:
+            case 0x4C: case 0x4D: case 0x4E: case 0x4F:
+                // In 32-bit mode these are INC/DEC, not prefixes.
+                if (!is64()) {
+                    more_prefixes = false;
+                    break;
+                }
+                pfx_.has_rex = true;
+                pfx_.rex_w = (b & 8) != 0;
+                pfx_.rex_r = (b & 4) != 0;
+                pfx_.rex_x = (b & 2) != 0;
+                pfx_.rex_b = (b & 1) != 0;
+                ++rip;
+                more_prefixes = false;  // REX must be the last prefix
+                break;
+            case 0x66: pfx_.opsize16 = true; ++rip; break;
+            case 0x67: pfx_.addr_override = true; ++rip; break;
+            case 0xF0: pfx_.lock = true; ++rip; break;
+            case 0xF2: pfx_.repne = true; ++rip; break;
+            case 0xF3: pfx_.rep = true; ++rip; break;
+            case 0x64: pfx_.seg_base = fs_base; pfx_.seg_override = true; ++rip; break;
+            case 0x65: pfx_.seg_base = gs_base; pfx_.seg_override = true; ++rip; break;
             // cs:/ss:/ds:/es: - all zero based here
-        } else if (is64() && b >= 0x40 && b <= 0x4F) {
-            // REX must be the last prefix before the opcode.
-            pfx_.has_rex = true;
-            pfx_.rex_w = (b & 8) != 0;
-            pfx_.rex_r = (b & 4) != 0;
-            pfx_.rex_x = (b & 2) != 0;
-            pfx_.rex_b = (b & 1) != 0;
-            ++rip;
-            break;
-        } else {
-            break;
+            case 0x2E: case 0x36: case 0x3E: case 0x26: ++rip; break;
+            default: more_prefixes = false; break;
         }
-        ++rip;
     }
 
     opsize_ = pfx_.rex_w ? 8 : (pfx_.opsize16 ? 2 : 4);

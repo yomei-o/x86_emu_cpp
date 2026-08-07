@@ -18,6 +18,32 @@
 
 namespace x86emu {
 
+// Converting a floating point value to an integer the way x86 does: the value
+// arrives already rounded, and the answer is the destination's "integer
+// indefinite" - its INT_MIN - when it will not fit or the source is a NaN.
+//
+// These exist because writing it as a plain cast is undefined behaviour, and
+// undefined behaviour is not portable.  Compiled for x86 the cast becomes the
+// very instruction being emulated and looks perfectly correct; compiled to
+// WebAssembly it becomes a trapping or saturating truncate and quietly is not.
+// The comparisons are written so that a NaN fails them: NaN is not >= anything.
+inline int16_t to_int16_x86(double v) {
+    if (!(v >= -32768.0 && v <= 32767.0)) return INT16_MIN;
+    return static_cast<int16_t>(v);
+}
+
+inline int32_t to_int32_x86(double v) {
+    if (!(v >= -2147483648.0 && v <= 2147483647.0)) return INT32_MIN;
+    return static_cast<int32_t>(v);
+}
+
+inline int64_t to_int64_x86(double v) {
+    // 2^63 is exactly representable as a double; 2^63 - 1 is not, so the upper
+    // bound is strict against 2^63 rather than inclusive of INT64_MAX.
+    if (!(v >= -9223372036854775808.0 && v < 9223372036854775808.0)) return INT64_MIN;
+    return static_cast<int64_t>(v);
+}
+
 struct CpuError : std::runtime_error {
     uint64_t rip;
     CpuError(uint64_t rip_, const std::string& what)
@@ -111,6 +137,21 @@ public:
         history_filled_ = 0;
     }
     size_t history_size() const { return history_.size(); }
+
+    // X86EMU_PROFILE=N samples the instruction pointer every N instructions and
+    // reports, at exit, which mapping the samples fell in.  A guest that spends
+    // six minutes somewhere will not say where on its own, and "which library"
+    // is usually the whole answer - especially now that a file mapping is named
+    // after its file.
+    //
+    // The cost when it is off is one decrement and a not-taken branch, which is
+    // less than the hook check already sitting in the same path.
+    void enable_profile(uint64_t every) {
+        profile_every_ = every;
+        profile_countdown_ = every ? every : ~0ull;
+    }
+    bool profiling() const { return profile_every_ != 0; }
+    std::string profile_report() const;
     // The addresses, oldest first.
     std::vector<uint64_t> history() const;
 
@@ -265,6 +306,9 @@ private:
     std::vector<uint64_t> history_;
     size_t history_pos_ = 0;
     size_t history_filled_ = 0;
+    uint64_t profile_every_ = 0;
+    uint64_t profile_countdown_ = ~0ull;
+    std::vector<uint64_t> profile_samples_;
 
     Memory& mem_;
     Mode mode_;

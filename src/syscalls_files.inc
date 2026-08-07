@@ -58,6 +58,34 @@ inline void write_stat(Emulator& e, uint64_t buf, const FileTable::Stat& st, boo
     }
 }
 
+// Fills a struct statx (256 bytes, the same on both architectures).  glibc 2.28
+// and later reach for statx first and only fall back to fstatat if the kernel
+// answers ENOSYS - and that fallback is what a missing statx costs: glibc's
+// generic path calls fstatat with a NULL pathname to probe, which is a read of
+// address zero rather than an error the caller can see.
+inline void write_statx(Emulator& e, uint64_t buf, const FileTable::Stat& st) {
+    std::vector<uint8_t> zeros(256, 0);
+    e.mem.write(buf, zeros.data(), zeros.size());
+    uint32_t mode = (st.is_dir ? 0040000u : st.is_char_device ? 0020000u : 0100000u) | 0666u;
+    // STATX_BASIC_STATS, minus the fields there is nothing behind: what a caller
+    // may believe is exactly what stx_mask says was filled in.
+    constexpr uint32_t kType = 0x001, kMode = 0x002, kNlink = 0x004, kUid = 0x008,
+                       kGid = 0x010, kAtime = 0x020, kMtime = 0x040, kCtime = 0x080,
+                       kIno = 0x100, kSize = 0x200, kBlocks = 0x400;
+    e.mem.write32(buf + 0, kType | kMode | kNlink | kUid | kGid | kAtime | kMtime | kCtime |
+                               kIno | kSize | kBlocks);  // stx_mask
+    e.mem.write32(buf + 4, 4096);                        // stx_blksize
+    e.mem.write32(buf + 16, 1);                          // stx_nlink
+    e.mem.write16(buf + 28, static_cast<uint16_t>(mode));  // stx_mode
+    e.mem.write64(buf + 32, st.ino);                     // stx_ino
+    e.mem.write64(buf + 40, st.size);                    // stx_size
+    e.mem.write64(buf + 48, (st.size + 511) / 512);      // stx_blocks
+    for (uint64_t off : {64ull, 96ull, 112ull})          // atime, ctime, mtime
+        e.mem.write64(buf + off, static_cast<uint64_t>(st.mtime));  // .tv_sec
+    e.mem.write32(buf + 136, static_cast<uint32_t>(st.dev >> 8));   // stx_dev_major
+    e.mem.write32(buf + 140, static_cast<uint32_t>(st.dev & 0xFF));  // stx_dev_minor
+}
+
 inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
     switch (sys) {
         case Sys::Open:
@@ -171,8 +199,27 @@ inline int64_t do_file_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             write_stat(e, a[1], st, e.is64());
             return 0;
         }
+        case Sys::Statx: {
+            // (dirfd, path, flags, mask, statxbuf).  Rust's standard library
+            // decides whether statx exists at all by calling it with NULL
+            // pointers and reading errno back: ENOSYS or EPERM means "fall back
+            // to fstat", anything else - EFAULT here, as on a real kernel -
+            // means the syscall is present.  Answering the probe with a fault
+            // instead of an error is what killed the guest.
+            if (a[1] == 0 || a[4] == 0) return -14;  // EFAULT
+            constexpr uint32_t kAtEmptyPath = 0x1000;
+            std::string path = e.mem.read_cstring(a[1]);
+            FileTable::Stat st;
+            int r = (path.empty() && (a[2] & kAtEmptyPath))
+                        ? e.files.stat_fd(static_cast<int>(static_cast<int32_t>(a[0])), st)
+                        : FileTable::stat_path(path, st);
+            if (r != 0) return r;
+            write_statx(e, a[4], st);
+            return 0;
+        }
         case Sys::Newfstatat: {
             // (dirfd, path, statbuf, flags); an empty path means "the descriptor".
+            if (a[1] == 0 || a[2] == 0) return -14;  // EFAULT, not a read of zero
             std::string path = e.mem.read_cstring(a[1]);
             FileTable::Stat st;
             int r = path.empty() ? e.files.stat_fd(static_cast<int>(a[0]), st)

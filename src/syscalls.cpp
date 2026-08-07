@@ -25,7 +25,7 @@ namespace {
 enum class Sys {
     Unknown,
     Read, Write, Writev, Readv, Close, Fstat, Ioctl,
-    Open, Lseek, Stat, Lstat, Newfstatat, Unlink, Unlinkat, Rename,
+    Open, Lseek, Stat, Lstat, Newfstatat, Statx, Unlink, Unlinkat, Rename,
     Access, Faccessat, Getcwd, Getdents64, Fcntl, Dup, Dup2, Dup3, Pread, Pwrite, Ftruncate,
     Mmap, Mmap2, Munmap, Brk, Llseek,
     Exit, ExitGroup,
@@ -102,6 +102,7 @@ Sys map_x86_64(uint64_t nr) {
         case 273: return Sys::SetRobustList;
         case 302: return Sys::Prlimit64;
         case 318: return Sys::GetRandom;
+        case 332: return Sys::Statx;
         case 334: return Sys::Ignored;    // rseq
         default: return Sys::Unknown;
     }
@@ -160,6 +161,7 @@ Sys map_i386(uint64_t nr) {
         case 180: return Sys::Pread;
         case 181: return Sys::Pwrite;
         case 300: return Sys::Newfstatat;  // fstatat64
+        case 383: return Sys::Statx;
         case 301: return Sys::Unlinkat;
         case 307: return Sys::Faccessat;
         case 330: return Sys::Dup3;
@@ -311,6 +313,19 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             constexpr uint32_t kMapFixed = 0x10, kMapAnon = 0x20;
             if (len == 0) return -22;  // EINVAL
 
+            // A file mapping is worth naming after the file.  The guest's own
+            // ld.so does the mapping, so this syscall is the last place the name
+            // is known - and without it every library in the memory map, and
+            // every fault inside one, reads only as "mmap".
+            std::string region = "mmap";
+            constexpr uint32_t kMapAnonymous = 0x20;
+            if (!(flags & kMapAnonymous) && fd >= 0 && e.files.valid(fd)) {
+                std::string p = e.files.path_of(fd);
+                size_t slash = p.find_last_of("/\\");
+                if (slash != std::string::npos) p = p.substr(slash + 1);
+                if (!p.empty()) region = "mmap " + p;
+            }
+
             uint64_t target;
             if (flags & kMapFixed) {           // ld.so reserves a span, then drops
                 target = addr;                 // each segment at a fixed sub-address
@@ -322,18 +337,35 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
                 uint64_t page = target & ~0xFFFull;
                 uint64_t span = (target - page + len + 0xFFF) & ~0xFFFull;
                 e.mem.unmap(page, span);
-                e.mem.map(target, len, "mmap");
+                e.mem.map(target, len, region);
             } else {
-                target = e.alloc_pages(len);   // a fresh region (hint addr ignored)
+                target = e.alloc_pages(len, 0x1000, region);   // a fresh region
                 if (!target) return -12;       // ENOMEM
             }
 
             if (!(flags & kMapAnon) && fd >= 0 && e.files.valid(fd)) {
+                // Where these bytes came from, for anything that later wants to
+                // re-read them rather than carry a copy.
+                e.mem.set_region_file(target, e.files.path_of(fd), offset);
                 int64_t saved = e.files.tell(fd);   // mmap must not disturb the fd
                 if (e.files.seek(fd, static_cast<int64_t>(offset), 0) >= 0) {
-                    std::vector<uint8_t> buf(static_cast<size_t>(len));
-                    int64_t got = e.files.read(fd, buf.data(), len);   // short at EOF -> rest stays zero
-                    if (got > 0) e.mem.write(target, buf.data(), static_cast<uint64_t>(got));
+                    // A chunk at a time, not the whole segment.  One library
+                    // here has a 430 MB PT_LOAD, and reading it into a single
+                    // buffer put 430 MB on the peak for the duration of one
+                    // syscall - on top of the pages it was being copied into.
+                    // The chunk is page-aligned so that Memory::write can still
+                    // recognise a whole page of zeros and leave it unbacked.
+                    constexpr uint64_t kChunk = 1u << 20;
+                    std::vector<uint8_t> buf(static_cast<size_t>(len < kChunk ? len : kChunk));
+                    uint64_t done = 0;
+                    while (done < len) {
+                        uint64_t want = len - done;
+                        if (want > kChunk) want = kChunk;
+                        int64_t got = e.files.read(fd, buf.data(), want);
+                        if (got <= 0) break;   // short at EOF -> the rest stays zero
+                        e.mem.write(target + done, buf.data(), static_cast<uint64_t>(got));
+                        done += static_cast<uint64_t>(got);
+                    }
                 }
                 if (saved >= 0) e.files.seek(fd, saved, 0);
             }
@@ -717,6 +749,18 @@ void Emulator::install_syscall_handlers() {
         uint64_t nr = cpu_->regs[RAX];
         const uint64_t a[6] = {cpu_->regs[RDI], cpu_->regs[RSI], cpu_->regs[RDX],
                                cpu_->regs[R10], cpu_->regs[R8],  cpu_->regs[R9]};
+        // An embedder can put host services behind one reserved number.  The
+        // emulator knows nothing about what they are: it hands over an id and a
+        // pointer to the guest's argument block and returns whatever comes
+        // back.  Nothing is reserved here that Linux could ever use - its
+        // numbers are three digits - so a guest that has not been built for
+        // this cannot reach it by accident.
+        if (nr == kHostCallSyscall) {
+            if (!on_host_call) return static_cast<void>(cpu_->regs[RAX] = (uint64_t)kENOSYS);
+            cpu_->regs[RAX] = static_cast<uint64_t>(on_host_call(*this, a[0], a[1]));
+            return;
+        }
+
         Sys sys = map_x86_64(nr);
         if (sys == Sys::Unknown && opt_.trace_calls)
             std::fprintf(stderr, "[sys] unimplemented syscall %llu\n",

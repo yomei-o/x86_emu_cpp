@@ -393,7 +393,8 @@ public:
     // collector cycles through mmap/munmap thousands of times, and never
     // reusing an address exhausts the mmap window mid-compilation.
     // `alignment` must be a power of two; VirtualAlloc needs 64 KiB.
-    uint64_t alloc_pages(uint64_t size, uint64_t alignment = 0x1000);
+    uint64_t alloc_pages(uint64_t size, uint64_t alignment = 0x1000,
+                         const std::string& name = std::string());
     // Claims an address range without creating its pages, for a guest that
     // reserves address space and commits parts of it later.  Nothing else will
     // be handed out inside it.
@@ -433,6 +434,20 @@ public:
     // that mixes printf with WriteFile would see its output interleaved
     // differently here than on Windows.
     void flush_guest_output();
+
+    // ---- host services an embedder provides ----------------------------------
+    //
+    // One reserved syscall number, and an embedder-supplied handler behind it.
+    // The emulator knows nothing about what the services are: it passes an id
+    // and the guest address of an argument block, and returns what comes back.
+    // A guest reaches it with `syscall(kHostCallSyscall, id, args)`.
+    //
+    // This exists so that work a guest would otherwise interpret can be done at
+    // full speed on the host - the arithmetic of a neural network, say, where
+    // the guest is a runtime that hands every kernel across a documented C
+    // boundary anyway.  Unset, the syscall answers ENOSYS.
+    static constexpr uint64_t kHostCallSyscall = 0x7654321;
+    std::function<int64_t(Emulator&, uint64_t id, uint64_t args)> on_host_call;
 
     // ---- files ---------------------------------------------------------------
     FileTable files;

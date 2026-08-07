@@ -1,5 +1,6 @@
 #include "memory.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -30,10 +31,10 @@ void Memory::map(uint64_t addr, uint64_t size, const std::string& name) {
     if (size == 0) return;
     uint64_t first = addr >> kPageBits;
     uint64_t last = (addr + size - 1) >> kPageBits;
-    for (uint64_t p = first; p <= last; ++p) {
-        auto& slot = pages_[p];
-        if (!slot) slot = std::make_unique<Page>();
-    }
+    // Reserve, do not allocate.  operator[] default-constructs a null
+    // unique_ptr, which is exactly the "reserved" state; a page that already
+    // has memory behind it keeps it.
+    for (uint64_t p = first; p <= last; ++p) pages_[p];
     if (!name.empty()) regions_.push_back({addr, size, name});
 }
 
@@ -41,11 +42,22 @@ void Memory::unmap(uint64_t addr, uint64_t size) {
     if (size == 0) return;
     uint64_t first = addr >> kPageBits;
     uint64_t last = (addr + size - 1) >> kPageBits;
-    for (uint64_t p = first; p <= last; ++p) pages_.erase(p);
+    for (uint64_t p = first; p <= last; ++p) {
+        pages_.erase(p);
+        // The freed page may be in the cache, and a stale entry there is a
+        // pointer into released memory.  Clearing only the slot it could
+        // occupy keeps a large munmap from costing the whole cache.
+        TlbEntry& e = tlb_[p & (kTlbSize - 1)];
+        if (e.page == p) {
+            e.page = kTlbNone;
+            e.host = nullptr;
+        }
+    }
 }
 
-uint8_t* Memory::host_ptr(uint64_t addr, bool for_write) const {
-    auto it = pages_.find(addr >> kPageBits);
+uint8_t* Memory::host_ptr_slow(uint64_t addr, bool for_write) const {
+    uint64_t page = addr >> kPageBits;
+    auto it = pages_.find(page);
     if (it == pages_.end()) {
         char buf[128];
         std::snprintf(buf, sizeof buf, "unmapped memory %s at 0x%016llX",
@@ -53,7 +65,15 @@ uint8_t* Memory::host_ptr(uint64_t addr, bool for_write) const {
                       static_cast<unsigned long long>(addr));
         throw MemoryFault(addr, for_write, buf);
     }
-    return it->second->data() + (addr & kPageMask);
+    // Reserved but never touched: the memory appears now, zero filled, which is
+    // what the guest was promised when it mapped the range.  Reading is as good
+    // a reason as writing - a fresh page reads as zero either way.
+    if (!it->second) it->second = std::make_unique<Page>();
+    uint8_t* base = it->second->data();
+    TlbEntry& e = tlb_[page & (kTlbSize - 1)];
+    e.page = page;
+    e.host = base;
+    return base + (addr & kPageMask);
 }
 
 void Memory::read(uint64_t addr, void* dst, uint64_t len) const {
@@ -77,11 +97,43 @@ void Memory::write(uint64_t addr, const void* src, uint64_t len) {
         uint64_t off = addr & kPageMask;
         uint64_t n = kPageSize - off;
         if (n > len) n = len;
-        std::memcpy(host_ptr(addr, true), in, n);
+        // A whole page of zeros over a page that has never been touched is a
+        // no-op, and skipping it leaves the page unbacked.  That is not a
+        // micro-optimisation: a loader mapping a library whose 419 MB of device
+        // code the emulator never runs writes exactly this, page after page.
+        bool all_zero = n == kPageSize && unbacked(addr);
+        for (uint64_t i = 0; all_zero && i < n; ++i)
+            if (in[i]) all_zero = false;
+        if (!all_zero) std::memcpy(host_ptr(addr, true), in, n);
         in += n;
         addr += n;
         len -= n;
     }
+}
+
+void Memory::set_region_file(uint64_t base, std::string path, uint64_t offset) {
+    // The most recent region with this base: mmap appends one per call, and a
+    // MAP_FIXED drop into a reservation makes several with the same name.
+    for (auto it = regions_.rbegin(); it != regions_.rend(); ++it)
+        if (it->base == base) {
+            it->file = std::move(path);
+            it->file_offset = offset;
+            return;
+        }
+}
+
+std::vector<uint64_t> Memory::live_pages() const {
+    std::vector<uint64_t> out;
+    out.reserve(pages_.size());
+    for (const auto& [index, page] : pages_)
+        if (page) out.push_back(index);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+const uint8_t* Memory::page_data(uint64_t index) const {
+    auto it = pages_.find(index);
+    return (it == pages_.end() || !it->second) ? nullptr : it->second->data();
 }
 
 std::string Memory::read_cstring(uint64_t addr, uint64_t max_len) const {
