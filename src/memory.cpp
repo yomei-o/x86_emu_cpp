@@ -40,6 +40,15 @@ void Memory::map(uint64_t addr, uint64_t size, const std::string& name) {
 
 void Memory::unmap(uint64_t addr, uint64_t size) {
     if (size == 0) return;
+    // A contiguous mapping is dropped whole: it is one allocation, and half of
+    // one is not a thing this can represent.  Nothing maps over part of one.
+    for (size_t i = spans_.size(); i-- > 0;) {
+        const Span& s = spans_[i];
+        if (addr < s.base + s.size && s.base < addr + size) {
+            tlb_flush();
+            spans_.erase(spans_.begin() + static_cast<long>(i));
+        }
+    }
     uint64_t first = addr >> kPageBits;
     uint64_t last = (addr + size - 1) >> kPageBits;
     for (uint64_t p = first; p <= last; ++p) {
@@ -55,8 +64,39 @@ void Memory::unmap(uint64_t addr, uint64_t size) {
     }
 }
 
+void Memory::map_contiguous(uint64_t addr, uint64_t size, const std::string& name) {
+    if (size == 0) return;
+    // Whole pages, so that a span and the page table never disagree about who
+    // owns a page.
+    uint64_t base = addr & ~kPageMask;
+    uint64_t end = (addr + size + kPageMask) & ~kPageMask;
+    unmap(base, end - base);
+    Span s;
+    s.base = base;
+    s.size = end - base;
+    s.data.reset(new uint8_t[s.size]());
+    spans_.push_back(std::move(s));
+    if (!name.empty()) regions_.push_back({base, end - base, name, std::string(), 0});
+}
+
+uint8_t* Memory::host_span(uint64_t addr, uint64_t size) const {
+    const Span* s = span_for(addr);
+    if (!s || addr + size > s->base + s->size) return nullptr;
+    return s->data.get() + (addr - s->base);
+}
+
 uint8_t* Memory::host_ptr_slow(uint64_t addr, bool for_write) const {
     uint64_t page = addr >> kPageBits;
+    // A contiguous mapping answers before the page table, and caches into the
+    // TLB exactly like a page does, so the fast path never learns the
+    // difference.
+    if (const Span* s = span_for(addr)) {
+        uint8_t* base = s->data.get() + ((page << kPageBits) - s->base);
+        TlbEntry& e = tlb_[page & (kTlbSize - 1)];
+        e.page = page;
+        e.host = base;
+        return base + (addr & kPageMask);
+    }
     auto it = pages_.find(page);
     if (it == pages_.end()) {
         char buf[128];
@@ -127,11 +167,20 @@ std::vector<uint64_t> Memory::live_pages() const {
     out.reserve(pages_.size());
     for (const auto& [index, page] : pages_)
         if (page) out.push_back(index);
+    // A contiguous mapping is guest memory like any other, and anything
+    // capturing this address space has to capture it - otherwise a snapshot
+    // silently loses whatever lives there.
+    for (const auto& s : spans_)
+        for (uint64_t a = s.base; a < s.base + s.size; a += kPageSize)
+            out.push_back(a >> kPageBits);
     std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
 
 const uint8_t* Memory::page_data(uint64_t index) const {
+    uint64_t addr = index << kPageBits;
+    if (const Span* s = span_for(addr)) return s->data.get() + (addr - s->base);
     auto it = pages_.find(index);
     return (it == pages_.end() || !it->second) ? nullptr : it->second->data();
 }

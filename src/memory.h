@@ -65,7 +65,7 @@ public:
     void map(uint64_t addr, uint64_t size, const std::string& name = "");
 
     bool is_mapped(uint64_t addr) const {
-        return pages_.find(addr >> kPageBits) != pages_.end();
+        return pages_.find(addr >> kPageBits) != pages_.end() || span_for(addr);
     }
 
     // Drops the pages covering [addr, addr+size), releasing their memory.  A
@@ -132,13 +132,38 @@ public:
     std::string read_cstring(uint64_t addr, uint64_t max_len = 1ull << 20) const;
     void write_cstring(uint64_t addr, const std::string& s);
 
+    // One contiguous mapping.  Kept apart from pages_ rather than threaded
+    // through it: a Page is separately owned, and a span's pages are not.
+    struct Span {
+        uint64_t base = 0;
+        uint64_t size = 0;
+        std::unique_ptr<uint8_t[]> data;
+    };
+    const Span* span_for(uint64_t addr) const {
+        for (const auto& s : spans_)
+            if (addr >= s.base && addr < s.base + s.size) return &s;
+        return nullptr;
+    }
+
     // Replaces this memory with a page-for-page copy of another - the whole of
     // what fork() means for an address space.
     void clone_from(const Memory& other) {
         pages_.clear();
+        spans_.clear();
         tlb_flush();
         for (const auto& [index, page] : other.pages_)
             pages_[index] = page ? std::make_unique<Page>(*page) : nullptr;
+        // Contiguous mappings are copied like everything else: fork() gives the
+        // child its own memory, and a span that both halves pointed at would be
+        // shared memory, which is a different thing entirely.
+        for (const auto& s : other.spans_) {
+            Span copy;
+            copy.base = s.base;
+            copy.size = s.size;
+            copy.data.reset(new uint8_t[s.size]);
+            std::memcpy(copy.data.get(), s.data.get(), s.size);
+            spans_.push_back(std::move(copy));
+        }
         regions_ = other.regions_;
     }
 
@@ -147,6 +172,25 @@ public:
     // Records what a mapping was read from.  Separate from map() because the
     // syscall knows the file and the allocator does not.
     void set_region_file(uint64_t base, std::string path, uint64_t offset);
+
+    // Maps [addr, addr+size) backed by one contiguous host allocation.
+    //
+    // Ordinary pages are separate 4 KiB blocks, which is right for a sparse
+    // address space and wrong for anything outside the emulator that wants to
+    // work on a guest buffer in place - a host library handed a guest pointer
+    // needs the bytes to actually be consecutive.
+    //
+    // The point is not speed but *addressing*: with this, such a caller can
+    // keep guest addresses everywhere and translate one to a host pointer with
+    // a subtraction.  Keeping host pointers in guest memory instead works until
+    // the two have different widths, or until the state is saved on one host
+    // and restored on another - both of which stop being possible the moment a
+    // host address is written into the guest's memory.
+    void map_contiguous(uint64_t addr, uint64_t size, const std::string& name = "");
+
+    // The host address of a guest range, or nullptr if the range is not inside
+    // one contiguous mapping.  Never true of ordinary pages.
+    uint8_t* host_span(uint64_t addr, uint64_t size) const;
 
     // The pages that have memory behind them, and the bytes of one.  Reserved
     // but untouched pages are not listed: they read as zero, so anything
@@ -214,6 +258,7 @@ private:
 
     // A null slot means reserved; the Page appears on first access.
     mutable std::unordered_map<uint64_t, std::unique_ptr<Page>> pages_;
+    std::vector<Span> spans_;
     mutable TlbEntry tlb_[kTlbSize];
     std::vector<Region> regions_;
 };
