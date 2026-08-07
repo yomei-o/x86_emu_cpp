@@ -439,7 +439,7 @@ bool Emulator::save_state(const std::string& path) const {
         std::vector<std::pair<uint64_t, std::string>> ranked;
         for (const auto& [name, n] : by_region) ranked.emplace_back(n, name);
         std::sort(ranked.rbegin(), ranked.rend());
-        for (size_t i = 0; i < ranked.size() && i < 8; i++)
+        for (size_t i = 0; i < ranked.size() && i < 12; i++)
             std::fprintf(stderr, "save_state:   %8.1f MB  %s\n",
                          ranked[i].first * Memory::kPageSize / 1048576.0,
                          ranked[i].second.c_str());
@@ -650,6 +650,11 @@ bool Emulator::load_state(const std::string& path) {
             }
             FileCache cache;
             uint64_t restored = s.u64(), missing = 0;
+            // Which file, not how many.  A page that was left to a file and
+            // cannot be read back is a hole in the guest's code, and it shows
+            // up as an invalid instruction a long way from here - so the file's
+            // name is the whole of the diagnosis.
+            std::map<std::string, uint64_t> lost;
             for (uint64_t i = 0; i < restored && s.ok(); i++) {
                 uint64_t index = s.u64();
                 uint64_t addr = index * Memory::kPageSize;
@@ -664,14 +669,20 @@ bool Emulator::load_state(const std::string& path) {
                 if (!home ||
                     !cache.page(home->file, home->file_offset + (addr - home->base), page)) {
                     missing++;
+                    lost[home ? home->file : std::string("(no mapping)")]++;
                     continue;
                 }
                 if (!mem.is_mapped(addr)) mem.map(addr, Memory::kPageSize);
                 mem.write(addr, page, Memory::kPageSize);
             }
-            std::fprintf(stderr, "load_state: %llu pages carried, %llu from the files%s\n",
-                         (unsigned long long)count, (unsigned long long)(restored - missing),
-                         missing ? " (some files are gone)" : "");
+            std::fprintf(stderr, "load_state: %llu pages carried, %llu from the files\n",
+                         (unsigned long long)count,
+                         (unsigned long long)(restored - missing));
+            for (const auto& [file, n] : lost)
+                std::fprintf(stderr,
+                             "load_state:   %llu pages missing from %s - the guest "
+                             "will run into the hole\n",
+                             (unsigned long long)n, file.c_str());
         }
         if (!s.ok()) {
             std::fprintf(stderr, "load_state: section is short\n");
