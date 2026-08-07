@@ -17,9 +17,12 @@
 // half-read.  Everything is little-endian, which is what both hosts are.
 
 #include "emulator.h"
+#include "files.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -140,7 +143,11 @@ public:
     bool page(const std::string& path, uint64_t offset, const uint8_t*& out) {
         if (path != path_) {
             if (fp_) std::fclose(fp_);
-            fp_ = std::fopen(path.c_str(), "rb");
+            // The region records the path the *guest* asked for.  Opening that
+            // literally finds nothing when the guest has a sysroot, which is
+            // how a first attempt carried every page of a 460 MB library it
+            // could have left on disk.
+            fp_ = std::fopen(FileTable::host_path(path).c_str(), "rb");
             path_ = path;
         }
         if (!fp_) return false;
@@ -373,7 +380,21 @@ bool Emulator::save_state(const std::string& path) const {
         std::vector<uint64_t> live = mem.live_pages();
         std::vector<uint64_t> keep, from_file;
         keep.reserve(live.size());
+        // Where the carried pages are, by mapping.  Whether a state is worth
+        // shrinking, and which end to start at, is a question about this table
+        // and not one worth guessing at.
+        std::map<std::string, uint64_t> by_region;
+        uint64_t blank = 0;
         for (uint64_t index : live) {
+            // A page of zeros is not worth carrying: it is already reserved by
+            // the section above, and a reserved page reads as zero.
+            const uint8_t* data = mem.page_data(index);
+            if (data) {
+                bool all_zero = true;
+                for (uint64_t i = 0; i < Memory::kPageSize; i++)
+                    if (data[i]) { all_zero = false; break; }
+                if (all_zero) { blank++; continue; }
+            }
             uint64_t addr = index * Memory::kPageSize;
             const Memory::Region* home = nullptr;
             for (const auto& r : regions)
@@ -391,6 +412,11 @@ bool Emulator::save_state(const std::string& path) const {
                 }
             }
             keep.push_back(index);
+            const Memory::Region* named = home;
+            if (!named)
+                for (const auto& r : regions)
+                    if (addr >= r.base && addr < r.base + r.size) named = &r;
+            by_region[named ? named->name : std::string("(anonymous)")]++;
         }
         w.u64(keep.size());
         for (uint64_t index : keep) {
@@ -404,9 +430,19 @@ bool Emulator::save_state(const std::string& path) const {
         // that are.
         w.u64(from_file.size());
         for (uint64_t index : from_file) w.u64(index);
-        std::fprintf(stderr, "save_state: %llu pages carried, %llu left to the files\n",
+        std::fprintf(stderr,
+                     "save_state: %llu pages carried, %llu left to the files, "
+                     "%llu blank\n",
                      (unsigned long long)keep.size(),
-                     (unsigned long long)from_file.size());
+                     (unsigned long long)from_file.size(),
+                     (unsigned long long)blank);
+        std::vector<std::pair<uint64_t, std::string>> ranked;
+        for (const auto& [name, n] : by_region) ranked.emplace_back(n, name);
+        std::sort(ranked.rbegin(), ranked.rend());
+        for (size_t i = 0; i < ranked.size() && i < 8; i++)
+            std::fprintf(stderr, "save_state:   %8.1f MB  %s\n",
+                         ranked[i].first * Memory::kPageSize / 1048576.0,
+                         ranked[i].second.c_str());
     }
     section(tag("PAGE"));
 
