@@ -1,0 +1,23 @@
+== a large buffer grown by realloc, which is the model's shape
+realloc 65536 -> 131072 keeps the first 65536 bytes  ok
+realloc 131072 -> 262144 keeps the first 131072 bytes ok
+realloc 262144 -> 524288 keeps the first 262144 bytes ok
+realloc 524288 -> 1048576 keeps the first 524288 bytes ok
+realloc 1048576 -> 2097152 keeps the first 1048576 bytes ok
+realloc 2097152 -> 4194304 keeps the first 2097152 bytes ok
+realloc 4194304 -> 8388608 keeps the first 4194304 bytes ok
+realloc 8388608 -> 16777216 keeps the first 8388608 bytes ok
+realloc 16777216 -> 33554432 keeps the first 16777216 bytes ok
+realloc 33554432 -> 67108864 keeps the first 33554432 bytes ok
+the whole 67108864 byte buffer is intact             ok
+
+== one big allocation, written and read back
+58 MB written then read back                         ok
+
+== many mmap-sized chunks alive at once, then freed in a shuffled order
+64 mmap chunks keep their own bytes                  ok
+
+== a large file, read into a buffer grown by realloc
+no file given - skipping (name one as the first argument)
+
+MEMTEST OK
