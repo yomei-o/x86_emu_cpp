@@ -24,7 +24,11 @@ tmp="${TMPDIR:-/tmp}"
 pass=0
 fail=0
 
-for exe in tests/bin/hello_gcc64 tests/bin/fileio_gcc64 tests/bin/thread_gcc64 \
+# The 32-bit guests are here because the claim is about the emulator, not about
+# one word size: a saved state carries the guest's registers and address space,
+# and a 32-bit guest has different ones.
+for exe in tests/bin/hello_elf32 tests/bin/hello_elf64 tests/bin/hello_gcc32 \
+           tests/bin/hello_gcc64 tests/bin/fileio_gcc64 tests/bin/thread_gcc64 \
            tests/bin/isatest_gcc64; do
     [ -f "$exe" ] || continue
     name=$(basename "$exe")

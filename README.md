@@ -47,6 +47,11 @@ Verified by diffing emulated output against real native execution, byte for byte
 | **Alpine `as` and `ld` (musl, dynamically linked) building a binary** | — | ✅ |
 | **C++ exceptions**: throw, unwind through destructors, rethrow, catch-all | ✅ | ✅ |
 | C's `__try`/`__except`/`__finally` (`__C_specific_handler`) | — | ✅ |
+| **saving a running guest and resuming it**, in another process or on another host | ✅ | ✅ |
+
+The last one is checked by cutting a run in three places and requiring the two
+halves' output to join into the whole, byte for byte - eighteen cases, including
+a threaded guest. See [Saving a running guest](#saving-a-running-guest).
 
 Three of those deserve spelling out, because they are the whole point of having
 processes.
@@ -220,6 +225,9 @@ usage: x86emu [options] <program> [guest args...]
   -r, --sysroot DIR    treat DIR as a Linux guest's filesystem root
       --history N      on a fault, print the last N instruction addresses
       --imports        list imports with no implementation, then exit
+      --save-state F   write the guest's state to F and stop
+      --save-at N      ...after N instructions (default: at once)
+      --load-state F   resume the guest from F instead of starting it
 ```
 
 `--sysroot` is what makes an unmodified distribution toolchain usable: every
@@ -252,6 +260,57 @@ hello from the ELF guest!
 ...
 [exit] code 7 after 34 instructions
 ```
+
+## Saving a running guest
+
+`--save-state` writes everything needed to resume the guest later, and
+`--load-state` carries on from it - in another process, another day, or on
+another host:
+
+```sh
+./x86emu --save-state s.bin --save-at 5000000 prog   # run 5M instructions, stop
+./x86emu --load-state s.bin prog                     # and finish the run
+```
+
+Cutting a run in half this way changes nothing: the two halves' output joined is
+the whole run, byte for byte, with the same exit code. That is what
+`tests/run_state.sh` checks, at a quarter, a half and three quarters of four
+programs' length, resuming each time in a separate process.
+
+**Nothing in the file is a host address or sized by a host word.** The guest's
+memory holds guest addresses, its registers hold guest addresses, and how far
+the heap has reached and which descriptors are open are in the same terms - so
+a state written by the native build loads into the WebAssembly build, where a
+pointer is four bytes instead of eight. The voicevox project does exactly that:
+it builds a 250-second inference session natively, saves it, and resumes it in
+a browser tab.
+
+The one thing that would break that is a host address written *into* guest
+memory, which is what an embedder does if it hands the guest its own
+`malloc`'d blocks. `Memory::map_contiguous` exists so it does not have to: it
+gives a guest address range backed by one contiguous host allocation, so a
+caller outside the emulator can keep guest addresses everywhere and turn one
+into a host pointer with a subtraction.
+
+Restoring is not loading. The hook table, the module list and the descriptors
+live on the host and are rebuilt by loading the same program; the saved guest is
+laid over the top:
+
+```cpp
+Emulator e(opt);
+e.load(path, args);        // rebuilds what lives on the host
+e.load_state("s.bin");     // lays the guest back over it
+e.run();                   // carries on from where it was saved
+```
+
+Pages that still match the file they were mapped from are named rather than
+carried, and blank pages are neither - for a guest with a 460 MB library mapped
+that is most of the file. Those files have to still be there, under the same
+paths, when the state is loaded; loading says which one is missing if it is not.
+
+Not yet: directory descriptors (they carry `getdents64` iteration state), pipes
+(the save refuses rather than write something that cannot resume), and more than
+one process.
 
 ## Browser demo
 
@@ -303,6 +362,9 @@ MSVC guests (emulated output vs. native execution)
   ...
 ELF guests (emulated output vs. recorded expectation)
   ok    tests/bin/hello_gcc64 (matches expectation, exit 3)
+Saved state (a run cut in half against the whole run)
+  ok    thread_gcc64 cut at 1328202 of 2656404 (1057145 bytes, exit 0)
+  ...
 
 17 passed, 0 failed
 ```
@@ -382,6 +444,7 @@ emulator built for the current host and prints which host that was.
 | `src/threads.cpp` | guest threads, the scheduler, and waitable objects |
 | `src/guest_printf.cpp` | the printf engine and UTF-16 conversion |
 | `src/syscalls.cpp` | the Linux kernel interface |
+| `src/state.cpp` | writing a running guest down, and reading it back |
 | `web/` | the WebAssembly front end and demo page |
 
 ## Current limits

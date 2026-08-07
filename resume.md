@@ -5,9 +5,10 @@ emulator *is*; this describes what is unfinished and what is known about it.
 
 ## State
 
-Everything below is verified by diffing emulated output against native execution,
-byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
-41 checks):
+Everything below is verified by diffing emulated output against native
+execution, byte for byte, on both a Windows and a Linux host
+(`sh tests/run_tests.sh` — it prints its own count, which is larger on Windows
+because the PE guests can be run natively there for comparison):
 
 - x86-32 and x86-64 integer, SSE/SSE2, x87
 - PE32/PE32+ and ELF32/ELF64 loading; real DLLs with relocation, exports,
@@ -28,6 +29,99 @@ byte for byte, on both a Windows and a Linux host (`sh tests/run_tests.sh`,
   the timestamp (`sh tests/toolchain/run_msvc.sh`)
 - **`/MD` C++ works**: msvcp140/vcruntime140 loaded for real via `-L`, iostreams
   and exceptions matching native output on x86 and x64
+- **a running guest can be saved and resumed**, in another process or on
+  another host: `tests/run_state.sh` cuts a run in three places and requires
+  the halves to join into the whole, byte for byte
+
+## Done 2026-08-07: saving a running guest, and putting it back
+
+`Emulator::save_state` / `load_state` (`src/state.cpp`), and three command-line
+options that reach them:
+
+```sh
+x86emu --save-state F --save-at N prog     # write F after N instructions, stop
+x86emu --load-state F prog                 # carry on from F
+```
+
+`tests/run_state.sh` is the check, rolled into `run_tests.sh`: cut a run at a
+quarter, a half and three quarters of its length, resume in a *separate
+process*, and require that the two halves' output joined is the whole run byte
+for byte and the exit code matches. Twelve cases over four programs, one of
+them threaded.
+
+**Restoring is not loading.** The hook table, the module list and the
+descriptors live on the host; they are rebuilt by `load()`ing the same program
+and the saved guest is laid over the top. That is why there is no serialised
+`std::function` anywhere in the format — and why the sequence is `load()`, then
+`load_state()`, then `run()`.
+
+**Nothing in the file is a host address or sized by a host word.** A state
+written by the native build loads into the WebAssembly one, where a pointer is
+four bytes; the voicevox project does exactly that and gets the same audio out.
+This is the property `map_contiguous` exists to protect: an embedder that keeps
+its device memory in a host allocation and writes those addresses into guest
+memory breaks it, and nothing can find them again to rewrite them.
+
+### What it took, and what was wrong first
+
+Three things, each found by the test rather than by reasoning about it:
+
+- **The running thread's saved context is stale.** A thread's registers are
+  only written back when it is switched away from, so `threads_[current_]` is a
+  slice behind and the live values are in the `Cpu`. Writing the stale one down
+  resumes correctly and then jumps back a slice the first time the scheduler
+  comes round. The current thread's record now comes from the processor.
+- **Checking only between slices was not enough.** A program that finishes
+  inside its first twenty thousand instructions is never asked. The check is
+  now also between instructions — just as safe, since a hook runs entirely
+  within one `step()` — which also means any instruction count can be asked
+  for rather than one the scheduler happens to land on.
+- **Reserved-but-untouched pages were left out along with their contents.**
+  They have no contents but they do have existence: a heap grown by `brk` is
+  pages that are mapped, empty, and inside no named region. Dropping them makes
+  a restored guest fault on the first write into its own heap.
+  `Memory::mapped_pages()` answers which pages exist, separately from
+  `live_pages()`, which answers which have something in them.
+
+A thread blocked on a host-side predicate is written down as **runnable**
+rather than refused. The predicate is a closure and cannot cross, but it does
+not have to: blocking steps the instruction pointer back onto the syscall, so
+resuming performs the operation again and blocks on a predicate built there and
+then. That the operation is idempotent up to the blocking point is what
+`block_syscall_retry` already requires of its callers.
+
+`request_state()` exists because a guest that asks for its own state cannot
+have it taken inside the call that asked: resuming lands back in the same call
+and asks again, forever. It arms the same check `--save-at` uses, so the call
+returns first.
+
+### Size
+
+Pages that still match the file they were mapped from are named rather than
+carried, and blank pages are neither. For a guest with a 460 MB runtime mapped
+that is the difference between 797 MB and 174 MB. Two mistakes on the way:
+
+- the file was looked up under the path the **guest** asked for, which finds
+  nothing when the guest has a sysroot, so every comparison failed;
+- and a first cut restored *every* page of a file-backed region rather than the
+  ones that had been left out, turning a hundred thousand never-touched pages
+  into a hundred thousand real ones.
+
+Saving reports where the weight is, by mapping, and loading names any file
+whose pages could not be read back — a hole in the guest's code surfaces as an
+invalid instruction a long way from the cause, so the file's name *is* the
+diagnosis.
+
+### Known limits
+
+- **Directory descriptors are not restored.** They carry `getdents64`
+  iteration state; a guest holding one across a snapshot loses it.
+- **Pipes refuse the save outright** rather than saving something that cannot
+  resume.
+- **One process.** The `System` process table is not in the format.
+- A resumed guest's instruction counter continues from where the saved one
+  reached, which is correct and reads oddly — a front end reporting a rate
+  should subtract the count it started with.
 
 ## Done 2026-08-05 (processes, threads, compilers)
 

@@ -418,18 +418,31 @@ bool Emulator::save_state(const std::string& path) const {
                     if (addr >= r.base && addr < r.base + r.size) named = &r;
             by_region[named ? named->name : std::string("(anonymous)")]++;
         }
-        w.u64(keep.size());
+        // Streamed rather than built up and then written.  Every other section
+        // is a few kilobytes and framing it in memory costs nothing; this one is
+        // the whole of the guest's memory, and holding a second copy of it while
+        // the first is still live is how a twenty-minute run in a browser fails
+        // at the last step.  The length is arithmetic, so nothing has to be
+        // seeked back to.
+        const uint64_t page_bytes =
+            8 + keep.size() * (8 + Memory::kPageSize) + 8 + from_file.size() * 8;
+        uint32_t page_tag = tag("PAGE");
+        std::fwrite(&page_tag, 1, sizeof page_tag, out);
+        std::fwrite(&page_bytes, 1, sizeof page_bytes, out);
+        uint64_t n = keep.size();
+        std::fwrite(&n, 1, sizeof n, out);
         for (uint64_t index : keep) {
-            w.u64(index);
-            w.raw(mem.page_data(index), Memory::kPageSize);
+            std::fwrite(&index, 1, sizeof index, out);
+            std::fwrite(mem.page_data(index), 1, Memory::kPageSize, out);
         }
         // The ones left to the files are named, not carried.  Naming them
         // matters as much as leaving them out: a region is reserved lazily, and
         // reading the whole of a 460 MB mapping back would turn a hundred
         // thousand pages that were never touched into a hundred thousand pages
         // that are.
-        w.u64(from_file.size());
-        for (uint64_t index : from_file) w.u64(index);
+        n = from_file.size();
+        std::fwrite(&n, 1, sizeof n, out);
+        for (uint64_t index : from_file) std::fwrite(&index, 1, sizeof index, out);
         std::fprintf(stderr,
                      "save_state: %llu pages carried, %llu left to the files, "
                      "%llu blank\n",
@@ -437,14 +450,13 @@ bool Emulator::save_state(const std::string& path) const {
                      (unsigned long long)from_file.size(),
                      (unsigned long long)blank);
         std::vector<std::pair<uint64_t, std::string>> ranked;
-        for (const auto& [name, n] : by_region) ranked.emplace_back(n, name);
+        for (const auto& [name, count] : by_region) ranked.emplace_back(count, name);
         std::sort(ranked.rbegin(), ranked.rend());
         for (size_t i = 0; i < ranked.size() && i < 12; i++)
             std::fprintf(stderr, "save_state:   %8.1f MB  %s\n",
                          ranked[i].first * Memory::kPageSize / 1048576.0,
                          ranked[i].second.c_str());
     }
-    section(tag("PAGE"));
 
     uint32_t end = tag("END ");
     uint64_t zero = 0;
