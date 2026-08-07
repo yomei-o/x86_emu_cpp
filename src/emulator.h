@@ -488,6 +488,20 @@ public:
     bool save_state(const std::string& path) const;
     bool load_state(const std::string& path);
 
+    // Asks for a state at the next instruction boundary, and for the guest to
+    // stop there.
+    //
+    // A guest that wants its own state saved cannot have it taken while the
+    // call asking for it is still running: the processor is in the middle of a
+    // syscall, and resuming from there means either re-running the call - which
+    // asks again, forever - or carrying on past it with no return value.
+    // Arming instead means the call finishes normally, and the state is of a
+    // guest between two instructions like any other.
+    void request_state(std::string path) {
+        opt_.save_state_path = std::move(path);
+        opt_.save_state_at = cpu_ ? cpu_->instructions_executed : 0;
+    }
+
     // ---- files ---------------------------------------------------------------
     FileTable files;
 
