@@ -152,6 +152,47 @@ int FileTable::alloc_slot() {
     return -1;
 }
 
+// Putting a descriptor back where it was, for a restored state.
+//
+// Unlike open() this does not choose the number - the guest already has it
+// written down all over its memory - and it does not create or truncate: the
+// file is being *rejoined*, not made.  A file that has moved or been deleted
+// since the state was saved cannot be rejoined, and saying so is better than
+// handing back a descriptor that reads zeros.
+bool FileTable::restore(int fd, const std::string& path, const OpenFlags& flags,
+                        uint64_t at) {
+    // The three standard streams are the host's own and were never ours to
+    // close; whatever the front end has them pointing at now is what a resumed
+    // guest should write to.
+    if (fd >= 0 && fd <= 2 && files_.count(fd)) return true;
+
+    if (flags.create || flags.truncate) {
+        // Saved as write-created, restored as write-existing: the file is there
+        // now, and remaking it would throw away what the guest wrote before the
+        // snapshot.
+    }
+    std::string mode = flags.append ? (flags.read ? "a+" : "a")
+                     : (flags.write && flags.read) ? "r+"
+                     : flags.write ? "r+"
+                     : "r";
+    if (flags.binary) mode += "b";
+
+    std::FILE* fp = host_fopen(host_path(path), mode.c_str());
+    if (!fp) return false;
+    if (at) std::fseek(fp, (long)at, SEEK_SET);
+
+    Entry e;
+    e.fp = own_stream(fp);
+    e.path = path;
+    e.readable = flags.read;
+    e.writable = flags.write || flags.append;
+    e.append = flags.append;
+    e.text_mode = translate_newlines_ && !flags.binary;
+    e.wide_io = flags.wide_io;
+    files_[fd] = e;
+    return true;
+}
+
 int FileTable::open(const std::string& path, const OpenFlags& flags) {
     if (std::getenv("X86EMU_TRACE_OPEN"))
         std::fprintf(stderr, "x86emu: open(%s)\n", path.c_str());

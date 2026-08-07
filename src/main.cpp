@@ -29,6 +29,9 @@ void usage() {
                  "  -r, --sysroot DIR    treat DIR as a Linux guest's filesystem root\n"
                  "      --history N      on a fault, print the last N instruction addresses\n"
                  "      --imports        list imports with no implementation, then exit\n"
+                 "      --save-state F   write the guest's state to F and stop\n"
+                 "      --save-at N      ...after N instructions (default: at once)\n"
+                 "      --load-state F   resume the guest from F instead of starting it\n"
                  "  -h, --help           this text\n");
 }
 
@@ -74,6 +77,15 @@ int main(int argc, char** argv) {
             opt.max_instructions = std::strtoull(argv[++i], nullptr, 0);
         } else if (a == "--imports") {
             opt.imports_only = true;
+        } else if (a == "--save-state" || a == "--save-at" || a == "--load-state") {
+            if (i + 1 >= argc) {
+                usage();
+                return 2;
+            }
+            const char* v = argv[++i];
+            if (a == "--save-state") opt.save_state_path = v;
+            else if (a == "--load-state") opt.load_state_path = v;
+            else opt.save_state_at = std::strtoull(v, nullptr, 0);
         } else if (a == "-L" || a == "--libpath") {
             if (i + 1 >= argc) {
                 usage();
@@ -148,6 +160,11 @@ int main(int argc, char** argv) {
         for (const auto& name : emu.unimplemented_imports()) std::printf("%s\n", name.c_str());
         return 0;
     }
+
+    // Loading built the host's side of the guest - the hook table, the module
+    // list, the descriptors.  A saved state is laid over that, not instead of
+    // it, which is why this comes after load() rather than replacing it.
+    if (!opt.load_state_path.empty() && !emu.load_state(opt.load_state_path)) return 1;
 
     if (history) emu.cpu().enable_history(history);
 

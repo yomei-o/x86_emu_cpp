@@ -204,6 +204,15 @@ public:
     // directory of unpacked packages.  Empty (the default) means no remapping.
     static void set_sysroot(std::string dir);
 
+    // Every open descriptor, for a caller that has to write the table down and
+    // build it again later.  A host stream cannot cross to another host, but
+    // where it points can: the path, how it was opened, and how far in it is.
+    const std::unordered_map<int, Entry>& entries() const { return files_; }
+    // Puts a descriptor back at a given number, reopening the path and seeking.
+    // Returns false if the file is no longer there.  The standard streams are
+    // recognised by number and left alone rather than reopened.
+    bool restore(int fd, const std::string& path, const OpenFlags& flags, uint64_t at);
+
 private:
     int alloc_slot();
     // A stable inode number for a host path (see Stat::ino).

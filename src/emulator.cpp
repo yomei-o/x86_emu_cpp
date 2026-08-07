@@ -1536,6 +1536,8 @@ int Emulator::run() {
 Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
     if (cpu_->halted) return SliceStatus::Exited;
 
+    if (save_state_due()) return SliceStatus::Exited;
+
     // Wake anything whose wait is satisfied, and choose who runs this slice.
     size_t next = pick_runnable();
     if (next >= threads_.size()) return SliceStatus::Idle;
@@ -1555,8 +1557,30 @@ Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
         }
         if (opt_.max_instructions && cpu_->instructions_executed >= opt_.max_instructions)
             throw CpuError(cpu_->rip, "instruction limit reached (possible infinite loop)");
+        if (save_state_due()) return SliceStatus::Exited;
     }
     return cpu_->halted ? SliceStatus::Exited : SliceStatus::Ran;
+}
+
+// Whether the state was asked for, has come due, and has now been written.
+//
+// Checking only between slices was not enough: a short program finishes inside
+// its first twenty thousand instructions and the boundary never comes around
+// again.  Inside the loop is just as safe a place - a hook runs entirely within
+// one step(), so between two steps nothing is half-done - and it means any
+// instruction count can be asked for, not only one the scheduler happens to
+// land on.
+bool Emulator::save_state_due() {
+    if (opt_.save_state_path.empty() || cpu_->halted) return false;
+    if (cpu_->instructions_executed < opt_.save_state_at) return false;
+    // A hook that asked to be retried, or a thread that just blocked, has left
+    // something behind that lives on the host and not in the guest.  The next
+    // instruction boundary will do.
+    if (reschedule_ || retry_hook_) return false;
+    flush_guest_output();
+    if (!save_state(opt_.save_state_path)) cpu_->exit_code = 1;
+    cpu_->halted = true;
+    return true;
 }
 
 uint64_t Emulator::next_timer_wake() const {

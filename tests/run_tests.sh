@@ -171,6 +171,18 @@ else
     echo "CPython: skipped (no interpreter found; set PYTHON=/path/to/python.exe)"
 fi
 
+# Saving a guest partway and resuming it in another process.  Its own script,
+# because it needs several runs of each program and reports its own counts; the
+# verdict rolls into ours the way the toolchain test's does.
+if [ -f tests/run_state.sh ]; then
+    echo "Saved state (a run cut in half against the whole run)"
+    if EMU="$emu" sh tests/run_state.sh | sed '$d;/^$/d'; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+    fi
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

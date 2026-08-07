@@ -51,6 +51,11 @@ public:
         // 98 MB dictionary is most of what it would otherwise carry.
         std::string file;
         uint64_t file_offset = 0;
+        // Whether this came from map_contiguous.  Anything rebuilding an
+        // address space has to put it back the same way: a caller outside the
+        // emulator is holding a host pointer into it, and ordinary pages cannot
+        // give one.
+        bool contiguous = false;
     };
 
     // Makes [addr, addr+size) readable/writable, zero filled.  Pages that are
@@ -167,6 +172,17 @@ public:
         regions_ = other.regions_;
     }
 
+    // Empties the address space.  Restoring a saved state rebuilds the map from
+    // what was written down rather than merging into whatever loading the
+    // program laid out, so that a restored guest sees its own memory and
+    // nothing left over from the one it displaced.
+    void reset() {
+        pages_.clear();
+        spans_.clear();
+        regions_.clear();
+        tlb_flush();
+    }
+
     const std::vector<Region>& regions() const { return regions_; }
 
     // Records what a mapping was read from.  Separate from map() because the
@@ -198,6 +214,16 @@ public:
     // free.  Sorted, so a capture is reproducible.
     std::vector<uint64_t> live_pages() const;
     const uint8_t* page_data(uint64_t index) const;
+
+    // Every page the guest may touch, whether or not anything is behind it yet.
+    //
+    // Reserved-but-untouched pages read as zero, so a capture can leave their
+    // *contents* out - but not their existence.  A guest whose heap has grown
+    // by another megabyte has a megabyte of pages that are mapped, empty, and
+    // outside any named region; rebuilding the address space from the regions
+    // and the live pages alone loses them, and the first write into the grown
+    // heap faults.
+    std::vector<uint64_t> mapped_pages() const;
 
 private:
     using Page = std::array<uint8_t, kPageSize>;

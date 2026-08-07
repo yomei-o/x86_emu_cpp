@@ -33,3 +33,6 @@ tests/hosted/bin/
 /qemu.seq
 /ours.seq.bin
 /census_filter.txt
+
+# The Linux build, alongside the *.exe rule above.
+x86emu

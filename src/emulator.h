@@ -60,6 +60,15 @@ public:
         // anything.  Bringing up a new guest is mostly a matter of reading this
         // list and implementing what is on it.
         bool imports_only = false;
+        // Write the guest's state after this many instructions and stop.  The
+        // count rather than a signal, because a state has to be taken at a
+        // repeatable point for one run to be checked against another.
+        std::string save_state_path;
+        uint64_t save_state_at = 0;
+        // Resume from a state instead of starting the program from the top.
+        // The program is still loaded first - that is what rebuilds everything
+        // living on the host - and then overwritten.
+        std::string load_state_path;
     };
 
     // No default argument: a nested type's default member initializers are not
@@ -449,6 +458,36 @@ public:
     static constexpr uint64_t kHostCallSyscall = 0x7654321;
     std::function<int64_t(Emulator&, uint64_t id, uint64_t args)> on_host_call;
 
+    // ---- saved state ---------------------------------------------------------
+    // Writes everything needed to resume this process later, and reads it back.
+    //
+    // The file holds guest state only: memory, registers, the allocator's
+    // bookkeeping, the open descriptors.  Nothing in it is a host address or
+    // depends on the host's word size, so a state saved by the native build
+    // restores into the WebAssembly one and the other way round.  That is the
+    // reason device memory for an accelerator shim belongs at a guest address
+    // (see Memory::map_contiguous) rather than in a host allocation.
+    //
+    // Restoring is not loading: the host-side tables - the hook table, the
+    // module list, the syscall dispatch - are rebuilt by running load() on the
+    // same program first, and only then is the guest's own state laid over the
+    // top.  So the sequence is
+    //
+    //     Emulator e(opt);
+    //     e.load(path, args);          // rebuilds what lives on the host
+    //     e.load_state("snapshot");    // lays the guest back over it
+    //     e.run();                     // carries on from where it was saved
+    //
+    // Both return false and explain themselves on stderr rather than throwing;
+    // a snapshot that cannot be written is not a reason to lose the run.
+    //
+    // Pages that still match the file they were mapped from are left out and
+    // read back from it, which for a guest that has mapped a 460 MB library is
+    // most of what the file would otherwise carry.  Those files must still be
+    // there, under the same paths, when the state is loaded.
+    bool save_state(const std::string& path) const;
+    bool load_state(const std::string& path);
+
     // ---- files ---------------------------------------------------------------
     FileTable files;
 
@@ -620,6 +659,7 @@ private:
     void run_pending_module_init();
     // Saves the running thread's context and makes `index` the running one.
     void switch_to_thread(size_t index);
+    bool save_state_due();
     // The next thread that could run, waking anything whose wait is satisfied.
     size_t pick_runnable();
     uint64_t allocate_thread_tls(uint64_t teb);

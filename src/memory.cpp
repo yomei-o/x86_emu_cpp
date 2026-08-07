@@ -76,7 +76,7 @@ void Memory::map_contiguous(uint64_t addr, uint64_t size, const std::string& nam
     s.size = end - base;
     s.data.reset(new uint8_t[s.size]());
     spans_.push_back(std::move(s));
-    if (!name.empty()) regions_.push_back({base, end - base, name, std::string(), 0});
+    if (!name.empty()) regions_.push_back({base, end - base, name, std::string(), 0, true});
 }
 
 uint8_t* Memory::host_span(uint64_t addr, uint64_t size) const {
@@ -170,6 +170,21 @@ std::vector<uint64_t> Memory::live_pages() const {
     // A contiguous mapping is guest memory like any other, and anything
     // capturing this address space has to capture it - otherwise a snapshot
     // silently loses whatever lives there.
+    for (const auto& s : spans_)
+        for (uint64_t a = s.base; a < s.base + s.size; a += kPageSize)
+            out.push_back(a >> kPageBits);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+std::vector<uint64_t> Memory::mapped_pages() const {
+    std::vector<uint64_t> out;
+    out.reserve(pages_.size());
+    for (const auto& [index, page] : pages_) {
+        (void)page;  // reserved and live alike: what is being asked is existence
+        out.push_back(index);
+    }
     for (const auto& s : spans_)
         for (uint64_t a = s.base; a < s.base + s.size; a += kPageSize)
             out.push_back(a >> kPageBits);
