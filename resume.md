@@ -33,6 +33,52 @@ because the PE guests can be run natively there for comparison):
   another host: `tests/run_state.sh` cuts a run in three places and requires
   the halves to join into the whole, byte for byte
 
+## Done 2026-08-08: about 2.6x, without touching how instructions run
+
+    before   838 ms   15.7 M instructions/s   (tests/bin/isatest_gcc64)
+    after    323 ms   40.8 M/s
+
+`sh tools/bench.sh` is the measurement - one guest, the best of several, and it
+refuses to run against a binary older than the sources, because a failed build
+leaves the previous one in place and measuring that reports a change as having
+done nothing. Which happened, and was believed for a few minutes.
+
+Two changes, both removing work from *before* every instruction:
+
+- **The hook check.** `step()` called `on_hook_call` - a `std::function` - for
+  every instruction, and that callback's first act was to compare the address
+  against two numbers and return false. `Cpu::hook_low/hook_high` hold the range
+  now and the callback is reached only when the address is inside it. `add_hook`
+  keeps it current, because hooks are registered while the guest runs; so does
+  `fork_clone`, and the place where the callback is first installed.
+- **Three diagnostics that are always off.** Profiling, the census and the
+  instruction history each cost a load and a branch per instruction to establish
+  they were disabled. `watching_` covers all three.
+
+Neither changes how an instruction is executed, which is why the suite stayed at
+10 passed, 0 failed rather than becoming an argument about whether it should
+have.
+
+### The one that made it slower, which is the useful result
+
+Every instruction without a prefix reads its opcode byte twice - once for the
+prefix loop to discover it is not a prefix, once to use it. Keeping the byte
+instead of re-reading it cost **33%**: the branch needed to say "I already have
+it" was worse than the memory read it saved. Reverted.
+
+So: **an optimisation that adds a branch is likely to lose here**, and the two
+that worked added none - one replaced an indirect call with a comparison that
+was already being made, the other turned three branches into one. That is the
+test to apply to the next idea, including the decoded-instruction cache below:
+it removes decoding but adds a lookup and a branch, and after this its benefit
+is a hypothesis rather than an expectation. Prototype and measure before
+committing to the rewrite.
+
+Not attempted on purpose: a code-page cache for instruction fetch. It would sit
+alongside `Memory`'s TLB and both would need invalidating when a page is
+remapped; forgetting one means executing stale instructions, which looks like
+data corruption a long way from the cause.
+
 ## Done 2026-08-07: saving a running guest, and putting it back
 
 `Emulator::save_state` / `load_state` (`src/state.cpp`), and three command-line
