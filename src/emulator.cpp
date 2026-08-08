@@ -110,6 +110,13 @@ uint64_t Emulator::add_hook(std::string name, int stdcall_bytes,
     uint64_t addr = hook_base_ + hooks_.size() * kHookStride;
     hooks_.push_back(Hook{name, stdcall_bytes, std::move(fn)});
     hook_by_name_[hooks_.back().name] = addr;
+    // The interpreter checks this range before asking whether an address is a
+    // hook, so it has to grow with the table - hooks are added while the guest
+    // runs, when an import is resolved for the first time.
+    if (cpu_) {
+        cpu_->hook_low = hook_base_;
+        cpu_->hook_high = hook_base_ + hooks_.size() * kHookStride - 1;
+    }
     return addr;
 }
 
@@ -1495,6 +1502,10 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     if (opt_.imports_only) return;
 
     cpu_->on_hook_call = [this](uint64_t addr) { return dispatch_hook(addr); };
+    // The hooks registered before the processor existed are in the table
+    // already; add_hook keeps the range current from here on.
+    cpu_->hook_low = hook_base_;
+    cpu_->hook_high = hook_base_ + hooks_.size() * kHookStride - 1;
     install_syscall_handlers();
 
     if (os_kind == Os::Windows)
@@ -1754,6 +1765,9 @@ std::unique_ptr<Emulator> Emulator::fork_clone() {
     child->install_libc_hooks();
     Emulator* raw = child.get();
     child->cpu_->on_hook_call = [raw](uint64_t addr) { return raw->dispatch_hook(addr); };
+    child->cpu_->hook_low = child->hook_base_;
+    child->cpu_->hook_high =
+        child->hook_base_ + child->hooks_.size() * kHookStride - 1;
     child->install_syscall_handlers();
 
     // fork() keeps only the calling thread.

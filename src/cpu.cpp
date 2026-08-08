@@ -1026,24 +1026,42 @@ void Cpu::unsupported(const char* what, uint8_t opcode, uint64_t start_rip) {
     throw CpuError(start_rip, buf);
 }
 
+// The census is decided by the environment before any Cpu exists, so it is
+// folded into `watching_` here rather than tested per instruction.
+Cpu::Cpu(Memory& mem, Mode mode) : mem_(mem), mode_(mode) {
+    if (g_census) watching_ = true;
+}
+
 void Cpu::step() {
     // A hook address is not real code: hand control to the host implementation.
-    if (on_hook_call && on_hook_call(rip)) {
+    // The range check is here rather than inside the callback, because the
+    // callback is a std::function and calling one to be told "not mine" is the
+    // most expensive way to ask.
+    if (rip >= hook_low && rip <= hook_high && on_hook_call && on_hook_call(rip)) {
         ++instructions_executed;
         return;
     }
 
     uint64_t start = rip;
     g_watch_rip = start;
-    if (--profile_countdown_ == 0) {
-        profile_countdown_ = profile_every_ ? profile_every_ : ~0ull;
-        if (profile_every_) profile_samples_.push_back(start);
-    }
-    if (g_census) g_census->record(start);
-    if (!history_.empty()) {
-        history_[history_pos_] = start;
-        history_pos_ = (history_pos_ + 1) % history_.size();
-        if (history_filled_ < history_.size()) ++history_filled_;
+
+    // The diagnostics, behind one test.
+    //
+    // Profiling, the census and the instruction history are all off in an
+    // ordinary run, and each was costing a branch and a load per instruction to
+    // establish that.  `watching_` is set when any of them is turned on, so the
+    // common case is one predictable comparison.
+    if (watching_) {
+        if (--profile_countdown_ == 0) {
+            profile_countdown_ = profile_every_ ? profile_every_ : ~0ull;
+            if (profile_every_) profile_samples_.push_back(start);
+        }
+        if (g_census) g_census->record(start);
+        if (!history_.empty()) {
+            history_[history_pos_] = start;
+            history_pos_ = (history_pos_ + 1) % history_.size();
+            if (history_filled_ < history_.size()) ++history_filled_;
+        }
     }
     pfx_ = Prefixes{};
 

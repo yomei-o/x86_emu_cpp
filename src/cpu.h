@@ -74,7 +74,7 @@ enum : uint64_t {
 
 class Cpu {
 public:
-    Cpu(Memory& mem, Mode mode) : mem_(mem), mode_(mode) {}
+    Cpu(Memory& mem, Mode mode);
 
     // A 128-bit SSE register, viewed as whatever the current instruction needs.
     union Xmm {
@@ -119,6 +119,15 @@ public:
     // hook the callback performs the whole call, including the return, and
     // returns true.
     std::function<bool(uint64_t /*addr*/)> on_hook_call;
+    // The address range on_hook_call answers for, so that step() can decide
+    // whether to call it without calling it.
+    //
+    // This runs before every instruction the guest executes, and the first thing
+    // the callback did was compare the address against these two numbers and
+    // return false - so a std::function's indirect call was being paid, tens of
+    // millions of times a second, to be told no.  Set by whoever installs the
+    // callback; left empty, the callback is asked about everything as before.
+    uint64_t hook_low = 1, hook_high = 0;   // empty: low > high
 
     // `int n` (Linux int 0x80) and the `syscall` instruction.
     std::function<void(uint8_t /*vector*/)> on_interrupt;
@@ -135,6 +144,7 @@ public:
         history_.assign(entries, 0);
         history_pos_ = 0;
         history_filled_ = 0;
+        watching_ = true;
     }
     size_t history_size() const { return history_.size(); }
 
@@ -144,11 +154,12 @@ public:
     // is usually the whole answer - especially now that a file mapping is named
     // after its file.
     //
-    // The cost when it is off is one decrement and a not-taken branch, which is
-    // less than the hook check already sitting in the same path.
+    // Off, it costs nothing at all now: step() tests `watching_` once and skips
+    // this, the census and the history together.
     void enable_profile(uint64_t every) {
         profile_every_ = every;
         profile_countdown_ = every ? every : ~0ull;
+        if (every) watching_ = true;
     }
     bool profiling() const { return profile_every_ != 0; }
     std::string profile_report() const;
@@ -306,6 +317,9 @@ private:
     std::vector<uint64_t> history_;
     size_t history_pos_ = 0;
     size_t history_filled_ = 0;
+    // Whether any of the per-instruction diagnostics is on.  See step(): all of
+    // them together are one branch when they are off, which is always.
+    bool watching_ = false;
     uint64_t profile_every_ = 0;
     uint64_t profile_countdown_ = ~0ull;
     std::vector<uint64_t> profile_samples_;
