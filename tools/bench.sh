@@ -29,7 +29,16 @@ fi
 GUEST=${GUEST:-tests/bin/isatest_gcc64}
 [ -f "$GUEST" ] || { echo "no $GUEST - run tests/linux/build.sh"; exit 1; }
 
-runs=${RUNS:-3}
+# Wall clock, and it is noisy: runs of the same binary spread over twenty per
+# cent here.  The minimum of several is the best estimate of the floor, but the
+# floor still moves, so **this cannot see a change smaller than about ten per
+# cent**.  Anything below that is a guess dressed as a number.
+#
+# CPU time would be steadier.  /usr/bin/time's output could not be captured
+# through the redirections this needs, and `times` is a builtin that reports
+# nothing useful from inside a command substitution.  Not worth more time than
+# it has already had.
+runs=${RUNS:-5}
 best=
 for i in $(seq 1 "$runs"); do
     start=$(date +%s%N)
@@ -37,9 +46,7 @@ for i in $(seq 1 "$runs"); do
     end=$(date +%s%N)
     ms=$(( (end - start) / 1000000 ))
     printf '  run %d: %d ms\n' "$i" "$ms"
-    # The best of several, not the mean: the slow ones are the machine doing
-    # something else, and what is being measured is the emulator.
-    [ -z "$best" ] || [ "$ms" -lt "$best" ] && best=$ms
+    if [ -z "$best" ] || [ "$ms" -lt "$best" ]; then best=$ms; fi
 done
 
 insns=$(./x86emu -m "$GUEST" 2>&1 >/dev/null |

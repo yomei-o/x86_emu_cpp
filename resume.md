@@ -59,6 +59,59 @@ Neither changes how an instruction is executed, which is why the suite stayed at
 10 passed, 0 failed rather than becoming an argument about whether it should
 have.
 
+### Where the time actually goes
+
+`sh tools/profile.sh` (gprof; perf is not installed here), on isatest_gcc64:
+
+    40.7%  Cpu::step()             13,163,198 calls
+    15.3%  Cpu::decode_modrm()     10,815,929   <- 82% of instructions
+     6.8%  rm_write / alu / execute_0f
+     5.1%  set_szp
+     3.4%  Emulator::save_state_due()  13,163,857
+
+**Read that with a caveat: the profile build uses -pg, which stops the compiler
+inlining.** Function-level costs there include call overhead that the real build
+does not pay, so `decode_modrm`'s 15% is an upper bound on what removing those
+calls could buy.
+
+The 3.4% at the bottom was a regression introduced the same day by the snapshot
+work: `save_state_due()` ran once per instruction to look at a `std::string`
+that is almost always empty. The emptiness test moved to the call site. Its
+effect could not be measured - see below - but the profile says it is work
+removed, and it costs nothing to not do.
+
+### What the measurement can and cannot see
+
+Wall clock on this machine spreads twenty per cent over runs of the *same
+binary*: 311 to 402 ms across five runs. So `tools/bench.sh` **cannot resolve a
+change smaller than about ten per cent**, and a smaller number taken from it is
+a guess wearing a measurement's clothes. Two attempts to measure CPU time
+instead came to nothing (`/usr/bin/time`'s output could not be captured through
+the redirections; `times` is a builtin and reports nothing from inside a command
+substitution) and were abandoned rather than pursued.
+
+### Why the decoded-instruction cache was not attempted
+
+It is still the largest prize on paper - `step()` at 40% is prefix scanning,
+opcode dispatch and the switch, and a cache would replace most of that. Three
+things argued against doing it on this particular evening, and they will not all
+have gone away:
+
+- **It cannot be validated here.** The expected gain is 30-40%; the measurement
+  floor is 10%. A result below expectations would be indistinguishable from a
+  result that could not be seen.
+- **The profile overstates its target.** See the -pg caveat above.
+- **Getting invalidation wrong is the worst failure this codebase can have.**
+  Guest code is written to - a loader relocating, a library mapped over an old
+  address - and a stale cached decode means executing an instruction that is no
+  longer there. That surfaces as data corruption a long way from the cause,
+  which is precisely the shape of bug that took a night to find in the voicevox
+  project.
+
+If it is attempted: prototype it behind an environment variable so both paths
+can run the same guest and their outputs be compared, rather than trusting a
+timing. `tools/qemu-diff` exists for exactly that kind of comparison.
+
 ### The one that made it slower, which is the useful result
 
 Every instruction without a prefix reads its opcode byte twice - once for the
