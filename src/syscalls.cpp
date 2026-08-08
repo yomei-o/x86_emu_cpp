@@ -293,8 +293,51 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
             write_stat(e, a[1], st, e.is64());
             return 0;
         }
-        case Sys::Ioctl:
-            return kENOTTY;  // "not a terminal" is a valid answer libc handles
+        case Sys::Ioctl: {
+            // isatty() is ioctl(fd, TCGETS, &termios): it succeeds on a terminal
+            // and fails otherwise, and libc decides how to buffer from the
+            // answer.  Saying "not a terminal" is true of a pipe and was the
+            // answer here - which made musl buffer stdout in full, so a program
+            // printing its progress produced nothing until it had finished or
+            // filled four kilobytes.  In a browser that reads as a hang.
+            //
+            // The standard streams answer as terminals.  A front end that shows
+            // output as it arrives *is* interactive, whatever the descriptor
+            // underneath happens to be, and line buffering is what that wants.
+            constexpr uint64_t kTCGETS = 0x5401;
+            constexpr uint64_t kTIOCGWINSZ = 0x5413;
+            int fd = static_cast<int>(a[0]);
+            if (fd < 0 || fd > 2) return kENOTTY;
+            if (a[1] == kTCGETS) {
+                // The *kernel's* struct termios, which is 36 bytes: four
+                // four-byte flag words, a line discipline byte, and nineteen
+                // control characters.  Not glibc's, which is sixty and is what
+                // the C library keeps for itself - writing that many wrote
+                // twenty-four bytes past the caller's buffer and glibc's stack
+                // guard caught it: `*** stack smashing detected ***`, from a
+                // guest that had done nothing wrong.
+                //
+                // Zeros are a coherent answer; nothing here reads them back.
+                // What matters is that the call succeeds, because that is what
+                // isatty() is asking.
+                if (a[2]) {
+                    uint8_t termios[36] = {};
+                    e.mem.write(a[2], termios, sizeof termios);
+                }
+                return 0;
+            }
+            if (a[1] == kTIOCGWINSZ) {
+                // struct winsize: rows, columns, and two pixel fields.  Eighty
+                // by twenty-four, because a program that asks is about to lay
+                // something out and needs a number that is not zero.
+                if (a[2]) {
+                    uint16_t ws[4] = {24, 80, 0, 0};
+                    e.mem.write(a[2], reinterpret_cast<const uint8_t*>(ws), sizeof ws);
+                }
+                return 0;
+            }
+            return kENOTTY;
+        }
         case Sys::Mmap:
         case Sys::Mmap2: {
             // mmap(addr, len, prot, flags, fd, offset). The host's mmap is never

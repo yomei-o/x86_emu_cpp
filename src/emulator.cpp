@@ -1347,6 +1347,27 @@ void Emulator::setup_linux_stack(const std::vector<std::string>& args) {
 }
 
 void Emulator::load(const std::string& path, const std::vector<std::string>& args) {
+    // Inside the sysroot first, if there is one.
+    //
+    // A sysroot means "this directory is the filesystem", and a program is part
+    // of the filesystem.  Opening it as a host path instead found *this
+    // machine's* /usr/bin/gcc when the guest asked for the Alpine one, and the
+    // failure surfaced two steps later as a missing ld-linux - because the
+    // program had been read from one world and its interpreter looked up in the
+    // other.
+    //
+    // The host path still works, and has to: a front end that hands over
+    // `sysroot/opt/thing/prog` is naming a file that exists, and a guest that
+    // said `/opt/thing/prog` would mean the same one.
+    std::string inside = FileTable::host_path(path);
+    if (inside != path) {
+        std::FILE* f = std::fopen(inside.c_str(), "rb");
+        if (f) {
+            std::fclose(f);
+            load_bytes(read_file(inside), args);
+            return;
+        }
+    }
     load_bytes(read_file(path), args);
 }
 
