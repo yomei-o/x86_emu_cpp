@@ -112,6 +112,35 @@ If it is attempted: prototype it behind an environment variable so both paths
 can run the same guest and their outputs be compared, rather than trusting a
 timing. `tools/qemu-diff` exists for exactly that kind of comparison.
 
+### And then it was designed, and the design says no
+
+Two things came out of working it through, both worth having before anyone tries
+again.
+
+**Only the cheap half is cacheable without restructuring.** For a given address
+the prefixes, the opcode and the ModRM's *shape* never change - but the address a
+ModRM computes depends on register values, and the switch that dispatches on the
+opcode is interleaved with execution. So a cache that leaves `step()`'s structure
+alone can skip the prefix scan and the opcode fetch and nothing else. The switch
+- which is most of `step()`'s 40% - stays.
+
+**Correct invalidation costs more than that saves.** `Memory`'s TLB is not
+flushed on writes: reads and writes go through the same path and a write does not
+disturb it. A decode cache has to be right about a guest that writes to its own
+code, so every guest write would have to be checked against the cached range.
+Adding that to the write path costs more than skipping a prefix scan saves.
+
+An attempt to bound the win empirically also failed, which is worth recording:
+building with the prefix scan removed entirely (wrong, but a valid timing) dies
+after one instruction, because REX-prefixed code is immediately misread. The
+bench script caught it - `!! 1 instructions now, 13163198 then - not the same
+work` - which is why that check is there.
+
+**What is actually left is restructuring execution**: a jump table where each
+handler dispatches directly to the next instruction's, rather than returning to a
+switch. That is days rather than hours, and it is the kind of change that fails
+silently, so it wants the differential harness set up *first*.
+
 ### The one that made it slower, which is the useful result
 
 Every instruction without a prefix reads its opcode byte twice - once for the
