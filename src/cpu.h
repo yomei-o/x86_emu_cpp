@@ -163,6 +163,21 @@ public:
     }
     bool profiling() const { return profile_every_ != 0; }
     std::string profile_report() const;
+
+    // Which instructions, rather than which module.
+    //
+    // The sampling profiler says 83 % of a voicevox run is inside ONNX Runtime
+    // and has said so through three rounds of changes, which is true and does
+    // not name a single thing to make faster.  This counts opcodes, so the
+    // question "what does that 83 % actually execute" has an answer that is not
+    // a guess.  Every opcode is counted, not sampled - it is one increment on a
+    // line that is already hot in cache, and it only happens when asked.
+    void enable_opcount() {
+        opcount_.assign(kOpcountSlots, 0);
+        watching_ = true;
+    }
+    bool counting_opcodes() const { return !opcount_.empty(); }
+    std::string opcount_report() const;
     // The addresses, oldest first.
     std::vector<uint64_t> history() const;
 
@@ -222,22 +237,61 @@ private:
     };
 
     // ---- instruction stream ---------------------------------------------
-    uint8_t fetch8() { return mem_.read8(rip++); }
-    uint16_t fetch16() {
-        uint16_t v = mem_.read16(rip);
-        rip += 2;
+    //
+    // A cursor into the current code page, so that decoding one instruction
+    // resolves that page once instead of once per byte.  `ip_` is the host
+    // address of `rip`; `ip_end_` is where the page runs out.
+    //
+    // It is dropped at the top of every instruction, which is what makes it
+    // safe: `rip` is assigned directly by every jump, call and return, and a
+    // cursor that tried to survive those would have to be invalidated in each
+    // of them.  Paying one page lookup per instruction to not have that
+    // obligation is the trade - the byte-by-byte lookups are the cost worth
+    // removing, not this one.
+    const uint8_t* ip_ = nullptr;
+    const uint8_t* ip_end_ = nullptr;
+
+    void code_drop() { ip_ = ip_end_ = nullptr; }
+
+    // The next byte, without consuming it, and `skip8` to consume one that
+    // `peek8` has already resolved.  The prefix loop needs both: it has to see
+    // a byte before it knows whether the byte is its business.
+    uint8_t peek8() {
+        if (ip_ < ip_end_) return *ip_;
+        ip_ = mem_.code_window(rip, &ip_end_);
+        return *ip_;
+    }
+    void skip8() { ++rip; ++ip_; }
+
+    uint8_t fetch8() {
+        if (ip_ < ip_end_) { ++rip; return *ip_++; }
+        return fetch8_slow();
+    }
+    uint8_t fetch8_slow() {
+        ip_ = mem_.code_window(rip, &ip_end_);
+        ++rip;
+        return *ip_++;
+    }
+    // 2, 4 and 8 byte reads take the cursor only when the whole value is on
+    // this page.  Straddling one is rare enough not to be worth splitting, and
+    // the fallback drops the cursor because `rip` has moved past what it
+    // describes.
+    template <typename T>
+    T fetch_wide() {
+        T v;
+        if (static_cast<uint64_t>(ip_end_ - ip_) >= sizeof(T)) {
+            std::memcpy(&v, ip_, sizeof(T));
+            ip_ += sizeof(T);
+        } else {
+            v = static_cast<T>(mem_.read_sized(rip, sizeof(T)));
+            code_drop();
+        }
+        rip += sizeof(T);
         return v;
     }
-    uint32_t fetch32() {
-        uint32_t v = mem_.read32(rip);
-        rip += 4;
-        return v;
-    }
-    uint64_t fetch64() {
-        uint64_t v = mem_.read64(rip);
-        rip += 8;
-        return v;
-    }
+    uint16_t fetch16() { return fetch_wide<uint16_t>(); }
+    uint32_t fetch32() { return fetch_wide<uint32_t>(); }
+    uint64_t fetch64() { return fetch_wide<uint64_t>(); }
     // Immediate for an operand of `size` bytes.  A 64-bit operand still takes
     // a 32-bit immediate, sign extended (only MOV r64, imm64 differs).
     uint64_t fetch_imm(int size);
@@ -323,6 +377,10 @@ private:
     uint64_t profile_every_ = 0;
     uint64_t profile_countdown_ = ~0ull;
     std::vector<uint64_t> profile_samples_;
+    // 0x000-0x0FF one-byte opcodes, 0x100-0x1FF the 0F escape.  Empty unless
+    // enable_opcount() was called, which is what `counting_opcodes()` asks.
+    static constexpr size_t kOpcountSlots = 512;
+    std::vector<uint64_t> opcount_;
 
     Memory& mem_;
     Mode mode_;

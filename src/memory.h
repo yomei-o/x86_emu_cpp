@@ -102,6 +102,20 @@ public:
     void write(uint64_t addr, const void* src, uint64_t len);
 
     uint8_t read8(uint64_t addr) const { return *host_ptr(addr, false); }
+
+    // The rest of the page holding `addr`, for the instruction fetcher.
+    //
+    // Decoding reads three to eight bytes that are almost always consecutive
+    // and almost always on one page, and resolving the page for each of them
+    // separately is the same lookup repeated.  This hands over the whole run so
+    // the caller can walk it with a pointer.  Read-only, and valid until
+    // something unmaps that page - which is why the caller re-asks once per
+    // instruction rather than holding it.
+    const uint8_t* code_window(uint64_t addr, const uint8_t** end) const {
+        const uint8_t* p = host_ptr(addr, false);
+        *end = p + (kPageSize - (addr & kPageMask));
+        return p;
+    }
     uint16_t read16(uint64_t addr) const { return read_int<uint16_t>(addr); }
     uint32_t read32(uint64_t addr) const { return read_int<uint32_t>(addr); }
     uint64_t read64(uint64_t addr) const { return read_int<uint64_t>(addr); }

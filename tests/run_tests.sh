@@ -8,11 +8,28 @@
 set -e
 cd "$(dirname "$0")/.."
 # EMU lets you point at a different build, e.g. one compiled for another host.
+#
+# build/Release comes first because that is where cmake puts a Windows build,
+# and it used to come last: a three-day-old ./x86emu.exe at the top of the list
+# was picked ahead of the one just compiled, silently.  Two runs were then
+# compared - one with a change, one without - and agreed exactly, because both
+# had run the same stale binary.  A comparison that agrees with itself perfectly
+# and says nothing is the worst result a test can give.
 emu=${EMU:-}
-[ -n "$emu" ] || { emu=./x86emu; [ -x "$emu" ] || emu=./x86emu.exe; }
+[ -n "$emu" ] || { emu=./build/Release/x86emu.exe; [ -x "$emu" ] || emu=./x86emu; }
+[ -x "$emu" ] || emu=./x86emu.exe
 [ -x "$emu" ] || emu=./build/x86emu
 [ -x "$emu" ] || { echo "build the emulator first"; exit 1; }
 echo "emulator: $emu on $(uname -s) $(uname -m)"
+
+# And say so if it is older than the code it claims to be.
+newer=$(find src -newer "$emu" \( -name '*.cpp' -o -name '*.h' \) 2>/dev/null | head -3)
+if [ -n "$newer" ]; then
+    echo "  STALE: newer than $emu -"
+    printf '    %s\n' $newer
+    echo "  rebuild, or set EMU= deliberately."
+    exit 1
+fi
 
 tmp="${TMPDIR:-/tmp}"
 pass=0

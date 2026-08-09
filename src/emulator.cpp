@@ -28,6 +28,10 @@ Emulator::~Emulator() {
         std::string report = cpu_->profile_report();
         if (!report.empty()) std::fputs(report.c_str(), stderr);
     }
+    if (cpu_ && cpu_->counting_opcodes()) {
+        std::string report = cpu_->opcount_report();
+        if (!report.empty()) std::fputs(report.c_str(), stderr);
+    }
 }
 
 Abi Emulator::abi() const {
@@ -1400,6 +1404,10 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     if (const char* pv = std::getenv("X86EMU_PROFILE")) {
         uint64_t every = std::strtoull(pv, nullptr, 0);
         if (every) cpu_->enable_profile(every);
+    }
+    // X86EMU_OPCOUNT=1: count every opcode executed, reported the same way.
+    if (const char* ov = std::getenv("X86EMU_OPCOUNT")) {
+        if (*ov && *ov != '0') cpu_->enable_opcount();
     }
     cpu_->trace = opt_.trace;
     files.set_text_translation(os_kind == Os::Windows);

@@ -643,6 +643,7 @@ void Cpu::do_string_op(uint8_t opcode, int size) {
 void Cpu::execute_0f() {
     uint64_t start = rip - 1;
     uint8_t op = fetch8();
+    if (!opcount_.empty()) ++opcount_[256 + op];
 
     // SSE shares this opcode space, distinguished by a mandatory prefix; it
     // returns false for anything that is a general-purpose instruction.
@@ -1000,6 +1001,46 @@ std::string Cpu::profile_report() const {
     return out;
 }
 
+std::string Cpu::opcount_report() const {
+    if (opcount_.empty()) return {};
+    uint64_t total = 0;
+    for (uint64_t n : opcount_) total += n;
+    if (!total) return {};
+
+    std::vector<std::pair<uint64_t, size_t>> sorted;
+    sorted.reserve(opcount_.size());
+    for (size_t i = 0; i < opcount_.size(); ++i)
+        if (opcount_[i]) sorted.push_back({opcount_[i], i});
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+
+    std::string out = "[opcount] " + std::to_string(total) + " instructions, " +
+                      std::to_string(sorted.size()) + " distinct opcodes\n";
+    char line[128];
+    // The top thirty and then a line for the rest: past that the tail is long
+    // and every entry in it is under a percent, so printing it would bury the
+    // part worth reading.
+    size_t shown = 0;
+    uint64_t rest = 0;
+    for (const auto& [n, i] : sorted) {
+        if (shown++ < 30) {
+            std::snprintf(line, sizeof line, "[opcount] %6.2f %%  %12llu  %s%02X\n",
+                          100.0 * static_cast<double>(n) / static_cast<double>(total),
+                          static_cast<unsigned long long>(n),
+                          i >= 256 ? "0F " : "", static_cast<unsigned>(i & 0xFF));
+            out += line;
+        } else {
+            rest += n;
+        }
+    }
+    if (rest) {
+        std::snprintf(line, sizeof line, "[opcount] %6.2f %%  %12llu  (%zu more)\n",
+                      100.0 * static_cast<double>(rest) / static_cast<double>(total),
+                      static_cast<unsigned long long>(rest), sorted.size() - 30);
+        out += line;
+    }
+    return out;
+}
+
 void Cpu::unsupported(const char* what, uint8_t opcode, uint64_t start_rip) {
     // Show a few raw bytes so an unknown encoding can be looked up quickly.
     char bytes[64] = {};
@@ -1064,6 +1105,11 @@ void Cpu::step() {
         }
     }
     pfx_ = Prefixes{};
+    // The code cursor belongs to one instruction.  Everything that changes rip
+    // without fetching - every jump, call, return and signal return - happens
+    // between instructions, so dropping it here is the whole of keeping it
+    // honest.
+    code_drop();
 
     // Prefix bytes.  Segment overrides other than fs:/gs: are accepted and
     // ignored, because the loaders set up a flat address space.
@@ -1074,7 +1120,7 @@ void Cpu::step() {
     // "no prefix at all" was the tenth.
     bool more_prefixes = true;
     while (more_prefixes) {
-        uint8_t b = mem_.read8(rip);
+        uint8_t b = peek8();
         switch (b) {
             case 0x40: case 0x41: case 0x42: case 0x43:
             case 0x44: case 0x45: case 0x46: case 0x47:
@@ -1090,18 +1136,18 @@ void Cpu::step() {
                 pfx_.rex_r = (b & 4) != 0;
                 pfx_.rex_x = (b & 2) != 0;
                 pfx_.rex_b = (b & 1) != 0;
-                ++rip;
+                skip8();
                 more_prefixes = false;  // REX must be the last prefix
                 break;
-            case 0x66: pfx_.opsize16 = true; ++rip; break;
-            case 0x67: pfx_.addr_override = true; ++rip; break;
-            case 0xF0: pfx_.lock = true; ++rip; break;
-            case 0xF2: pfx_.repne = true; ++rip; break;
-            case 0xF3: pfx_.rep = true; ++rip; break;
-            case 0x64: pfx_.seg_base = fs_base; pfx_.seg_override = true; ++rip; break;
-            case 0x65: pfx_.seg_base = gs_base; pfx_.seg_override = true; ++rip; break;
+            case 0x66: pfx_.opsize16 = true; skip8(); break;
+            case 0x67: pfx_.addr_override = true; skip8(); break;
+            case 0xF0: pfx_.lock = true; skip8(); break;
+            case 0xF2: pfx_.repne = true; skip8(); break;
+            case 0xF3: pfx_.rep = true; skip8(); break;
+            case 0x64: pfx_.seg_base = fs_base; pfx_.seg_override = true; skip8(); break;
+            case 0x65: pfx_.seg_base = gs_base; pfx_.seg_override = true; skip8(); break;
             // cs:/ss:/ds:/es: - all zero based here
-            case 0x2E: case 0x36: case 0x3E: case 0x26: ++rip; break;
+            case 0x2E: case 0x36: case 0x3E: case 0x26: skip8(); break;
             default: more_prefixes = false; break;
         }
     }
@@ -1116,6 +1162,13 @@ void Cpu::step() {
 
     uint8_t op = fetch8();
     ++instructions_executed;
+    // Behind `watching_` like everything else here, so an ordinary run does not
+    // pay for it.  0F is not counted: it is an escape, not an instruction, and
+    // the two-byte handler counts the byte after it - which is the byte that
+    // says what the instruction is.  Counted here as well it appeared as the
+    // fourth commonest "instruction" in the run and inflated the total by its
+    // own six per cent.
+    if (!opcount_.empty() && op != 0x0F) ++opcount_[op];
 
     // 0x00-0x3F: the eight ALU operations, six encodings each.  (0x0F is the
     // escape byte and the x/7 slots are BCD instructions, both excluded.)
