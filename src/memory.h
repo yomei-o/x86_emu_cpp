@@ -73,6 +73,23 @@ public:
         return pages_.find(addr >> kPageBits) != pages_.end() || span_for(addr);
     }
 
+    // Is every page of [addr, addr+size) free?
+    //
+    // For mmap's address hint: a guest that names an address without MAP_FIXED
+    // is asking, not insisting, and Linux gives it that address when the range
+    // is available.  GCC's precompiled headers ask exactly that way and then
+    // dereference pointers that were baked into the file at the address they
+    // asked for, so "asking" is not really optional.
+    bool range_free(uint64_t addr, uint64_t size) const {
+        if (!size) return false;
+        uint64_t first = addr >> kPageBits;
+        uint64_t last = (addr + size - 1) >> kPageBits;
+        if (last < first) return false;                  // wrapped
+        for (uint64_t p = first; p <= last; ++p)
+            if (is_mapped(p << kPageBits)) return false;
+        return true;
+    }
+
     // Drops the pages covering [addr, addr+size), releasing their memory.  A
     // later map() of the same range gets fresh zero-filled pages, which is what
     // munmap() followed by mmap() means.

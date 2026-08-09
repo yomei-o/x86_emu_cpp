@@ -369,6 +369,18 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
                 if (!p.empty()) region = "mmap " + p;
             }
 
+            // X86EMU_MMAP_TRACE=1: what was asked for and what was given.
+            //
+            // A guest that asks for a particular address and is quietly given a
+            // different one is the hardest kind of wrong to see from outside:
+            // the syscall succeeds, and the failure arrives later as a read of
+            // an address nothing ever mapped.  GCC's precompiled headers ask
+            // exactly that way.
+            static const bool trace_mmap = [] {
+                const char* v = std::getenv("X86EMU_MMAP_TRACE");
+                return v && *v && *v != '0';
+            }();
+
             uint64_t target;
             if (flags & kMapFixed) {           // ld.so reserves a span, then drops
                 target = addr;                 // each segment at a fixed sub-address
@@ -381,9 +393,30 @@ int64_t do_syscall(Emulator& e, Sys sys, const uint64_t a[6]) {
                 uint64_t span = (target - page + len + 0xFFF) & ~0xFFFull;
                 e.mem.unmap(page, span);
                 e.mem.map(target, len, region);
+            } else if (addr && (addr & 0xFFF) == 0 &&
+                       e.mem.range_free(addr, len)) {
+                // An address without MAP_FIXED is a hint, and Linux honours it
+                // when the range is free.  Ignoring it is legal for anything
+                // that checks the return value and fatal for anything that does
+                // not: GCC maps a precompiled header at the address it was
+                // built for, then follows pointers stored inside it, so a
+                // mapping placed elsewhere fails as a read of an address
+                // nothing ever mapped - about seventeen megabytes into the
+                // range it asked for, with no mention of PCH anywhere.
+                target = addr;
+                e.mem.map(target, len, region);
             } else {
                 target = e.alloc_pages(len, 0x1000, region);   // a fresh region
                 if (!target) return -12;       // ENOMEM
+            }
+            if (trace_mmap) {
+                std::fprintf(stderr,
+                             "[mmap] want %012llX len %llX flags %X fd %d -> %012llX%s\n",
+                             static_cast<unsigned long long>(addr),
+                             static_cast<unsigned long long>(len),
+                             static_cast<unsigned>(flags), fd,
+                             static_cast<unsigned long long>(target),
+                             (addr && target != addr) ? "   MOVED" : "");
             }
 
             if (!(flags & kMapAnon) && fd >= 0 && e.files.valid(fd)) {
