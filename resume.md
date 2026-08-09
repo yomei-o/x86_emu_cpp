@@ -161,6 +161,72 @@ alongside `Memory`'s TLB and both would need invalidating when a page is
 remapped; forgetting one means executing stale instructions, which looks like
 data corruption a long way from the cause.
 
+*(Since done, and safe: the cursor is dropped at the top of every `step()`
+rather than kept, so there is nothing to invalidate. Worth 3 % - see below.)*
+
+## Done 2026-08-09: four more measurements, three of them negative
+
+Two workloads, and they are not the same shape. `X86EMU_OPCOUNT=1` counts what
+the guest executes:
+
+| | voicevox, building a session | gcc, parsing C++ |
+| --- | --- | --- |
+| MOV | 20 % | 24 % (two encodings) |
+| XOR / AND / shift | 22 % | 4 % |
+| conditional branches | negligible | **16 %** |
+| call / ret | negligible | 6 % |
+
+The first is a varint decoder - ONNX Runtime parsing a model, which everyone
+including this file had been describing as its arithmetic. The second is a
+compiler walking trees. That difference is why the 2.6x above was worth 8 % over
+there: what it removed is a fixed cost per instruction, and voicevox's
+instructions are individually heavier.
+
+**What worked**
+
+- *An instruction-fetch cursor*, `ip_`/`ip_end_` in `cpu.h`. One page lookup per
+  instruction instead of one per byte. **3 %** on voicevox's session build, with
+  the audio bit-identical.
+- *Hoisting two loop-invariant checks out of `run_slice`* - an instruction limit
+  that is off and a save-state path that is empty, both re-read 1.5 G times per
+  C++ compile. **1.7 %**.
+
+**What did not, with numbers, so nobody pays for them again**
+
+- *Inlining `decode_modrm`'s register case.* 62 % of instructions decode a ModRM
+  and about half name a register: no SIB, no displacement, four bit operations
+  reached through a call to a large function. Removing that call is **14 %
+  slower** (56.02 s against 63.86, three interleaved rounds).
+- *Shrinking `step()`.* It compiles to 12.7 KB against a 32 KB instruction
+  cache, so if the above lost to code size, the reverse should win.
+  `__attribute__((optimize("Os")))` on `step()` alone takes it to 5.3 KB and is
+  **32 % slower** (55.9 s against 73.8). Keep the probe - `-DX86EMU_SMALL_STEP`
+  in `cpu.cpp` - it is six guarded lines and it makes the result repeatable.
+  (A first attempt compiled all of `cpu.cpp` at `-Os`, got 77 % slower, and
+  proved nothing: that also degraded `alu`, `shift`, the flag helpers and the
+  memory paths. A confounded experiment answers a question nobody asked.)
+- *Moving the slice loop inside `Cpu`*, so `halted` and the instruction counter
+  stop being reached through a pointer. No gain, slightly worse in two rounds of
+  three.
+- *Lazy flags*, not attempted, and here is why not: every flag setter added
+  together is **4.8 %** of host time, and 16 % of instructions read what 20 %
+  set - so deferring the work would not remove it and would add a test to every
+  read. The guest-side share made this look like a target; the host-side profile
+  says it is not one.
+
+So `step()` is slower if you add to it and slower if you take away from it,
+which reads as a local optimum. Nothing cheap is left inside it. The remaining
+idea of any size is still restructuring dispatch - and after four experiments
+where the intuition was backwards, that one needs the differential harness built
+*first*, not after.
+
+**And the biggest win of the day was not in the emulator at all.** gcc_emu_cpp's
+C++ compile went from 67 s to 24 s by shipping a precompiled header - a feature
+its own notes recorded as "tried, and not the answer". Both reasons in that note
+were wrong, and one of them was wrong because the feature had since broken and
+nobody re-measured. Re-testing what is written off is worth more than the next
+optimisation, at least here.
+
 ## Done 2026-08-07: saving a running guest, and putting it back
 
 `Emulator::save_state` / `load_state` (`src/state.cpp`), and three command-line
