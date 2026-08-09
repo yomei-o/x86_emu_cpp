@@ -1589,6 +1589,17 @@ Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
 
     uint64_t deadline = cpu_->instructions_executed + quantum;
     reschedule_ = false;
+
+    // Neither of these can change while the loop runs, and both were being
+    // evaluated per instruction - a load of opt_.max_instructions, and a
+    // std::string's size, fifteen hundred million times for a C++ compile.
+    //
+    // The comment above the loop already records finding this exact cost, 3.4 %,
+    // for the same string check *before* the loop, and moving that one out left
+    // this one where it was.
+    const bool limited = opt_.max_instructions != 0;
+    const bool saving = !opt_.save_state_path.empty();
+
     while (!cpu_->halted && !reschedule_ && cpu_->instructions_executed < deadline) {
         try {
             cpu_->step();
@@ -1599,9 +1610,9 @@ Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
             // the guest continues from the context the unwinder built.
             apply_unwind_transfer(transfer);
         }
-        if (opt_.max_instructions && cpu_->instructions_executed >= opt_.max_instructions)
+        if (limited && cpu_->instructions_executed >= opt_.max_instructions)
             throw CpuError(cpu_->rip, "instruction limit reached (possible infinite loop)");
-        if (!opt_.save_state_path.empty() && save_state_due())
+        if (saving && save_state_due())
             return SliceStatus::Exited;
     }
     return cpu_->halted ? SliceStatus::Exited : SliceStatus::Ran;

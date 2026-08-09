@@ -1073,6 +1073,17 @@ Cpu::Cpu(Memory& mem, Mode mode) : mem_(mem), mode_(mode) {
     if (g_census) watching_ = true;
 }
 
+// -DX86EMU_SMALL_STEP compiles just this function for size, leaving the rest of
+// the file alone.  It exists to answer one question and is off by default.
+//
+// The question: inlining decode_modrm into step() cost 14 %, and step() is
+// 12.7 KB against a 32 KB instruction cache, so does *shrinking* step() gain?
+// Compiling the whole of cpu.cpp at -Os answered 77 % slower, which sounds
+// decisive and is not: that also made alu(), shift() and the flag helpers worse
+// and cannot say which change did what.  One function at a time can.
+#if defined(X86EMU_SMALL_STEP) && defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("Os")))
+#endif
 void Cpu::step() {
     // A hook address is not real code: hand control to the host implementation.
     // The range check is here rather than inside the callback, because the
