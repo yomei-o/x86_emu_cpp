@@ -188,6 +188,19 @@ public:
         uint64_t size = 0;
         std::unique_ptr<uint8_t[]> data;
     };
+    // ---- verification ------------------------------------------------------
+    //
+    // While a journal is open every page written for the first time is copied
+    // first, and writes bypass the write TLB so that none is missed.  The JIT
+    // uses this to run a block twice - translated, then interpreted - from the
+    // same starting memory.
+    using Journal = std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPageSize>>>;
+    void journal_begin() { journal_.clear(); journal_on_ = true; flush_write_tlb(); }
+    void journal_end() { journal_on_ = false; }
+    Journal& journal() { return journal_; }
+    // Raw access to a page's bytes, for comparing and for rolling back.
+    uint8_t* page_ptr(uint64_t page) const { return host_ptr(page << kPageBits, false); }
+
     // ---- translated code -------------------------------------------------
     void set_code_observer(CodeObserver* o) { code_obs_ = o; }
     // Declares that translations were made from this page.  Writes to it are
@@ -300,6 +313,10 @@ private:
 
     uint8_t* host_ptr_slow(uint64_t addr, bool for_write) const;
 
+    void flush_write_tlb() {
+        for (auto& e : tlbw_) { e.page = kTlbNone; e.host = nullptr; }
+    }
+
     void tlb_flush() {
         for (auto& e : tlb_) {
             e.page = kTlbNone;
@@ -356,6 +373,8 @@ private:
     // fast path to get this.
     mutable TlbEntry tlbw_[kTlbSize];
     CodeObserver* code_obs_ = nullptr;
+    bool journal_on_ = false;
+    mutable Journal journal_;
     mutable std::unordered_set<uint64_t> code_pages_;
     std::vector<Region> regions_;
 };

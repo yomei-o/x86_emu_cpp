@@ -890,6 +890,10 @@ bool translate_x86(Cpu& cpu, const Engine::Slots& slots, uint64_t pc, IrBlock& o
             Op& o = t.emit(OpKind::Interp);
             o.imm = static_cast<int64_t>(cur);
             o.imm2 = static_cast<int64_t>(next);
+            // Instructions whose effects are not just CPU and memory state: running
+            // one twice (for the verifier) would repeat them.
+            if ((d.tb && (d.op == 0x05 || d.op == 0x31)) || (!d.tb && (d.op == 0xCD || d.op == 0xF4)))
+                out.effects = true;
         }
         cur = next;
     }

@@ -495,7 +495,7 @@ uint64_t Emulator::call_guest(uint64_t func, const std::vector<uint64_t>& args) 
     cpu_->rip = func;
     cpu_->halted = false;
 
-    while (!cpu_->halted && cpu_->rip != nested_return_) cpu_->step();
+    while (!cpu_->halted && cpu_->rip != nested_return_) cpu_->step_fast();
     uint64_t result = cpu_->regs[RAX];
     bool guest_exited = cpu_->halted;
     int code = cpu_->exit_code;

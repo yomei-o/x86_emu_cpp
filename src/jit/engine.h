@@ -29,6 +29,8 @@ struct Ctx {
     x86emu::Cpu* cpu;
     x86emu::Memory* mem;
     Engine* eng;
+    uint64_t epoch0;   // Engine::epoch when this block started
+    int partial;       // set by an op that leaves early: native insns finished
 };
 
 struct Uop {
@@ -45,6 +47,8 @@ struct Block {
     uint32_t insns = 0;
     bool valid = true;
     bool stub = false;       // nothing translated here: step the interpreter
+    bool effects = false;    // see IrBlock::effects: cannot be run twice for verification
+    uint32_t guest_bytes = 0;
     uint64_t page = 0;
     std::vector<Uop> code;
 };
@@ -55,6 +59,11 @@ public:
     ~Engine() override;
 
     bool run_block();
+
+    // X86EMU_JIT_VERIFY=1: run every block twice - translated, then through the
+    // interpreter from the same starting state - and stop at the first
+    // difference (verify.cpp).
+    bool verify = false;
 
     // CodeObserver
     void on_code_write(uint64_t page) override;
@@ -68,9 +77,10 @@ public:
         int32_t ntmp;
     } slots;
 
-    bool flushed = false;     // set when code was invalidated while a block ran
-    int partial = -1;         // set by an op that leaves the block early: insns finished
-    bool executing = false;
+    // Counts invalidations.  A running block compares it with the value it
+    // started with, which stays right when blocks nest (a hook that calls back
+    // into the guest runs blocks of its own inside an interpreted instruction).
+    uint64_t epoch = 0;
 
     // Statistics (X86EMU_JIT_STATS=1)
     uint64_t n_translated = 0, n_blocks_run = 0, n_insns_native = 0, n_invalidated = 0;
@@ -81,6 +91,8 @@ public:
 
 private:
     static constexpr uint32_t kTableBits = 13;
+    bool run_plain(Block* b);
+    bool run_verified(Block* b);
     Block* lookup(uint64_t pc);
     Block* translate(uint64_t pc);
     void reclaim();
@@ -92,6 +104,7 @@ private:
     std::unordered_set<uint64_t> banned_;
     std::vector<std::unique_ptr<Block>> all_;
     size_t dead_ = 0;
+    int depth_ = 0;           // blocks running now; nothing is freed while > 0
 };
 
 // Per-guest-ISA translation.  The x86 one is the only implementation so far.

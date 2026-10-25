@@ -222,8 +222,8 @@ const Uop* h_jccfl(Ctx* c, const Uop* u) {
 }
 
 const Uop* h_chkflush(Ctx* c, const Uop* u) {
-    if (c->eng->flushed) {
-        c->eng->partial = u->ni;
+    if (c->eng->epoch != c->epoch0) {
+        c->partial = u->ni;
         c->cpu->rip = static_cast<uint64_t>(u->imm);
         return nullptr;
     }
@@ -237,8 +237,8 @@ const Uop* h_interp(Ctx* c, const Uop* u) {
     Cpu* cpu = c->cpu;
     cpu->rip = static_cast<uint64_t>(u->imm);
     cpu->step();
-    if (cpu->rip != static_cast<uint64_t>(u->imm2) || cpu->halted || c->eng->flushed) {
-        c->eng->partial = u->ni;
+    if (cpu->rip != static_cast<uint64_t>(u->imm2) || cpu->halted || c->eng->epoch != c->epoch0) {
+        c->partial = u->ni;
         return nullptr;
     }
     return u + 1;

@@ -98,6 +98,13 @@ uint8_t* Memory::host_ptr_slow(uint64_t addr, bool for_write) const {
     // difference.
     if (const Span* s = span_for(addr)) {
         uint8_t* base = s->data.get() + ((page << kPageBits) - s->base);
+        if (for_write && journal_on_) {
+            if (!journal_.count(page)) {
+                journal_[page] = std::make_unique<std::array<uint8_t, kPageSize>>();
+                std::memcpy(journal_[page]->data(), base, kPageSize);
+            }
+            return base + (addr & kPageMask);
+        }
         TlbEntry& e = (for_write ? tlbw_ : tlb_)[page & (kTlbSize - 1)];
         e.page = page;
         e.host = base;
@@ -120,6 +127,13 @@ uint8_t* Memory::host_ptr_slow(uint64_t addr, bool for_write) const {
     // stale from here on.  The page stops being watched until something is
     // translated from it again.
     if (for_write && code_obs_ && code_pages_.erase(page)) code_obs_->on_code_write(page);
+    if (for_write && journal_on_) {
+        if (!journal_.count(page)) {
+            journal_[page] = std::make_unique<std::array<uint8_t, kPageSize>>();
+            std::memcpy(journal_[page]->data(), base, kPageSize);
+        }
+        return base + (addr & kPageMask);
+    }
     TlbEntry& e = (for_write ? tlbw_ : tlb_)[page & (kTlbSize - 1)];
     e.page = page;
     e.host = base;

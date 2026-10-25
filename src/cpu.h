@@ -159,6 +159,10 @@ public:
     // Whether translated execution may be used right now: not while tracing,
     // profiling or counting, all of which are per-instruction.
     bool jit_usable() const { return jit_ != nullptr && !watching_ && !trace; }
+    // One instruction, or one translated block when the JIT is on.
+    void step_fast() {
+        if (!(jit_usable() && jit_run_block())) step();
+    }
 
     // A ring buffer of the addresses of the last instructions executed, kept
     // when history_size() > 0.  A fault deep inside a large guest is otherwise

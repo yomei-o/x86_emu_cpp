@@ -87,6 +87,7 @@ struct IrBlock {
     uint64_t start = 0;
     uint32_t guest_bytes = 0;
     uint32_t insns = 0;      // guest instructions run natively (not Interp)
+    bool effects = false;    // an interpreted instruction has effects beyond CPU state and memory
     std::vector<Op> ops;
 };
 

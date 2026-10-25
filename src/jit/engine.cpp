@@ -23,6 +23,7 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
     slots.fs_base = off(&cpu.fs_base);
     slots.gs_base = off(&cpu.gs_base);
     mem.set_code_observer(this);
+    if (const char* v = std::getenv("X86EMU_JIT_VERIFY")) verify = v[0] == '1';
 }
 
 Engine::~Engine() {
@@ -61,6 +62,8 @@ Block* Engine::translate(uint64_t pc) {
         if (translate_x86(cpu, slots, pc, ir)) {
             compile_threaded(*this, ir, *blk);
             blk->insns = ir.insns;
+            blk->effects = ir.effects;
+            blk->guest_bytes = ir.guest_bytes;
             ++n_translated;
         } else {
             blk->stub = true;
@@ -85,7 +88,7 @@ Block* Engine::translate(uint64_t pc) {
 }
 
 void Engine::reclaim() {
-    if (dead_ < 8192) return;
+    if (dead_ < 8192 || depth_ > 0) return;
     for (auto& s : table_)
         if (s && !s->valid) s = nullptr;
     size_t w = 0;
@@ -110,26 +113,27 @@ bool Engine::run_block() {
         ++n_stub_hits;
         return false;
     }
+    return verify ? run_verified(b) : run_plain(b);
+}
 
-    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this};
-    flushed = false;
-    partial = -1;
-    executing = true;
+bool Engine::run_plain(Block* b) {
+    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, epoch, -1};
+    ++depth_;
     const Uop* u = b->code.data();
     try {
         while (u) u = u->fn(&ctx, u);
     } catch (const x86emu::MemoryFault&) {
-        executing = false;
+        --depth_;
         // Report the fault at the start of the instruction that made it, which
         // is where an exception handler would restart it.
         if (u) cpu.rip = b->start + u->pc;
         throw;
     } catch (...) {
-        executing = false;
+        --depth_;
         throw;
     }
-    executing = false;
-    const uint32_t done = partial >= 0 ? static_cast<uint32_t>(partial) : b->insns;
+    --depth_;
+    const uint32_t done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
     cpu.instructions_executed += done;
     ++n_blocks_run;
     n_insns_native += done;
@@ -149,7 +153,7 @@ void Engine::on_code_write(uint64_t page) {
         }
         by_page_.erase(it);
     }
-    if (executing) flushed = true;
+    ++epoch;
     // A page that keeps being written to is data that happens to be executed
     // from, or code that rewrites itself in a loop; translating it again each
     // time costs more than interpreting it.
@@ -169,7 +173,7 @@ void Engine::on_code_flush_all() {
     map_.clear();
     banned_.clear();
     inval_count_.clear();
-    if (executing) flushed = true;
+    ++epoch;
 }
 
 }  // namespace jit
