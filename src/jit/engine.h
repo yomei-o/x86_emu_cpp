@@ -13,12 +13,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "../memory.h"
+#include "glue.h"
 #include "ir.h"
-
-namespace x86emu {
-class Cpu;
-}
 
 namespace jit {
 
@@ -30,8 +26,8 @@ using ChainFn = int (*)(uint8_t* env, Ctx* ctx, uint32_t fn, uint32_t limit);
 
 struct Ctx {
     uint8_t* env;
-    x86emu::Cpu* cpu;
-    x86emu::Memory* mem;
+    GCpu* cpu;
+    GMemory* mem;
     Engine* eng;
     uint64_t epoch0;   // Engine::epoch when this block started
     int partial;       // set by an op that leaves early: native insns finished
@@ -74,9 +70,9 @@ struct Block {
     std::unique_ptr<uint32_t[]> cells;   // wasm tier: one word per static exit, see backend_wasm.cpp
 };
 
-class Engine : public x86emu::CodeObserver {
+class Engine : public GObserver {
 public:
-    Engine(x86emu::Cpu& cpu, x86emu::Memory& mem);
+    Engine(GCpu& cpu, GMemory& mem);
     ~Engine() override;
 
     bool run_block();
@@ -92,13 +88,8 @@ public:
     void on_code_flush_all() override;
     void on_code_unmap(uint64_t page) override;
 
-    // Slots (byte offsets from the CPU's register file) the frontend needs.
-    struct Slots {
-        int32_t zero, rflags, rip, fs_base, gs_base;
-        int32_t tmp0;   // first of the temporaries; tmp0 - 8 * 0 is zero
-        int32_t ntmp;
-        int32_t cc_a, cc_b, cc_kind, cc_sz;   // deferred flags
-    } slots;
+    // Where the cells translated code uses are (see glue.h).
+    GuestSlots slots;
 
     // Counts invalidations.  A running block compares it with the value it
     // started with, which stays right when blocks nest (a hook that calls back
@@ -115,8 +106,8 @@ public:
     uint64_t interp_ops[512] = {};   // which interpreted opcodes ran (0F xx at 256+xx)
     void print_stats();
 
-    x86emu::Cpu& cpu;
-    x86emu::Memory& mem;
+    GCpu& cpu;
+    GMemory& mem;
 
 private:
     static constexpr uint32_t kTableBits = 13;
@@ -157,9 +148,7 @@ private:
 };
 
 // Per-guest-ISA translation.  The x86 one is the only implementation so far.
-bool translate_x86(x86emu::Cpu& cpu, const Engine::Slots& slots, uint64_t pc, IrBlock& out);
-// Settles deferred flags (Cpu::cc_kind) into rflags.
-void materialize_flags(x86emu::Cpu& cpu);
+bool translate_block(GCpu& cpu, const GuestSlots& slots, uint64_t pc, IrBlock& out);
 int32_t jit_generic(Ctx* c, const Uop* u);
 void make_stop_op(Uop& u);
 // Lowers IR to something runnable.

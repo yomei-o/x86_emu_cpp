@@ -105,7 +105,7 @@ struct Env {
     uint32_t epoch_addr;              // &Engine::epoch
     uint32_t read_fn, write_fn, generic_fn;   // table indices of the helpers above
     uint32_t flags_fn;                        // the module's own flags function
-    Engine::Slots slots;
+    GuestSlots slots;
 };
 
 struct Gen {
@@ -495,7 +495,7 @@ EM_JS(int, jitwasm_install, (const uint8_t* p, int len, int n), {
 });
 
 void Engine::wasm_queue(Block* b) {
-    if (std::getenv("X86EMU_JIT_DEBUG")) std::fprintf(stderr, "[jit] queue %llx\n", (unsigned long long)b->start);
+    if (std::getenv(JIT_ENV("JIT_DEBUG"))) std::fprintf(stderr, "[jit] queue %llx\n", (unsigned long long)b->start);
     b->wasm_queued = true;
     wasm_pending_.push_back(b);
     if (wasm_pending_.size() >= wasm_batch) wasm_compile_pending();

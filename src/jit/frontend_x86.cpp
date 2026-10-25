@@ -332,7 +332,7 @@ FlagUse flag_use(const D& d, bool native) {
 
 struct Tr {
     Cpu& cpu;
-    const Engine::Slots& s;
+    const GuestSlots& s;
     bool is64;
     IrBlock& ir;
     int tmp_next = 1;
@@ -342,7 +342,7 @@ struct Tr {
     bool stored = false;    // the current instruction wrote memory
     bool last = false;      // the current instruction ends the block
 
-    Tr(Cpu& c, const Engine::Slots& sl, bool w, IrBlock& b) : cpu(c), s(sl), is64(w), ir(b) {}
+    Tr(Cpu& c, const GuestSlots& sl, bool w, IrBlock& b) : cpu(c), s(sl), is64(w), ir(b) {}
 
     static int R(int i) { return i * 8; }
     int newtmp() { return s.tmp0 + 8 * (tmp_next++); }
@@ -1058,7 +1058,7 @@ void emit_native(Tr& t, const D& d, int fmode, uint64_t next_pc) {
 
 }  // namespace
 
-bool translate_x86(Cpu& cpu, const Engine::Slots& slots, uint64_t pc, IrBlock& out) {
+bool translate_block(Cpu& cpu, const GuestSlots& slots, uint64_t pc, IrBlock& out) {
     const bool is64 = cpu.is64();
     const uint8_t* end = nullptr;
     const uint8_t* p0 = nullptr;

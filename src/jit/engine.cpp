@@ -4,42 +4,26 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "../cpu.h"
-
 namespace jit {
 
-using x86emu::Cpu;
-using x86emu::Memory;
+using Cpu = GCpu;
+using Memory = GMemory;
 
 Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
-    auto off = [&](const void* p) {
-        return static_cast<int32_t>(reinterpret_cast<const uint8_t*>(p) -
-                                    reinterpret_cast<const uint8_t*>(cpu.regs));
-    };
-    slots.zero = off(&cpu.jit_tmp[0]);
-    slots.tmp0 = off(&cpu.jit_tmp[1]);
-    slots.ntmp = static_cast<int32_t>(sizeof(cpu.jit_tmp) / sizeof(cpu.jit_tmp[0])) - 1;
-    slots.rflags = off(&cpu.rflags);
-    slots.rip = off(&cpu.rip);
-    slots.fs_base = off(&cpu.fs_base);
-    slots.gs_base = off(&cpu.gs_base);
-    slots.cc_a = off(&cpu.cc_a);
-    slots.cc_b = off(&cpu.cc_b);
-    slots.cc_kind = off(&cpu.cc_kind);
-    slots.cc_sz = off(&cpu.cc_sz);
+    Glue::fill_slots(slots, cpu);
     mem.set_code_observer(this);
-    if (const char* sv = std::getenv("X86EMU_JIT_STATS")) {
+    if (const char* sv = std::getenv(JIT_ENV("JIT_STATS"))) {
         stats_every_ = std::strtoull(sv, nullptr, 10);
         static Engine* first = this;
         std::atexit([] { first->print_stats(); });
     }
-    if (const char* v = std::getenv("X86EMU_JIT_VERIFY")) verify = v[0] == '1';
-    if (const char* v = std::getenv("X86EMU_JIT_PROFILE")) profile = v[0] == '1';
+    if (const char* v = std::getenv(JIT_ENV("JIT_VERIFY"))) verify = v[0] == '1';
+    if (const char* v = std::getenv(JIT_ENV("JIT_PROFILE"))) profile = v[0] == '1';
 #ifdef __EMSCRIPTEN__
     wasm_on = true;
 #endif
-    if (const char* v = std::getenv("X86EMU_JIT_WASM")) wasm_on = v[0] != '0';
-    if (const char* v = std::getenv("X86EMU_JIT_WASM_HOT")) {
+    if (const char* v = std::getenv(JIT_ENV("JIT_WASM"))) wasm_on = v[0] != '0';
+    if (const char* v = std::getenv(JIT_ENV("JIT_WASM_HOT"))) {
         wasm_hot = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
         if (wasm_hot < 1) wasm_hot = 1;
         wasm_batch = wasm_hot <= 1 ? 1 : wasm_batch;
@@ -48,7 +32,7 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
 
 Engine::~Engine() {
     mem.set_code_observer(nullptr);
-    if (std::getenv("X86EMU_JIT_STATS")) print_stats();
+    if (std::getenv(JIT_ENV("JIT_STATS"))) print_stats();
 }
 
 // Where the time goes, from the blocks' run counts: the ops executed by kind, and
@@ -141,7 +125,7 @@ Block* Engine::translate(uint64_t pc) {
         watch = false;   // never translated, so nothing to invalidate
     } else {
         IrBlock ir;
-        if (translate_x86(cpu, slots, pc, ir)) {
+        if (translate_block(cpu, slots, pc, ir)) {
             compile_threaded(*this, ir, *blk);
             if (wasm_on) blk->ir_ops = ir.ops;
             blk->insns = ir.insns;
@@ -186,7 +170,7 @@ void Engine::reclaim() {
 }
 
 bool Engine::run_block() {
-    const uint64_t pc = cpu.rip;
+    const uint64_t pc = Glue::pc(cpu);
     Block* b = lookup(pc);
     if (!b) {
         reclaim();
@@ -210,20 +194,20 @@ bool Engine::run_block() {
 bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
     if (verify) {
         // One block at a time, each checked against the interpreter.
-        const uint64_t pc = cpu.rip;
-        if (pc == stop_pc || (pc >= cpu.hook_low && pc <= cpu.hook_high)) return false;
+        const uint64_t pc = Glue::pc(cpu);
+        if (pc == stop_pc || Glue::in_hook(cpu, pc)) return false;
         return run_block();
     }
     reclaim();
-    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, 0, -1, false, nullptr, false, -1, nullptr, 0};
+    Ctx ctx{Glue::env(cpu), &cpu, &mem, this, 0, -1, false, nullptr, false, -1, nullptr, 0};
     const Uop* u = nullptr;
     Block* b = nullptr;
     bool any = false;
     ++depth_;
     try {
         for (;;) {
-            const uint64_t pc = cpu.rip;
-            if (pc == stop_pc || (pc >= cpu.hook_low && pc <= cpu.hook_high)) break;
+            const uint64_t pc = Glue::pc(cpu);
+            if (pc == stop_pc || Glue::in_hook(cpu, pc)) break;
             b = lookup(pc);
             if (!b) b = translate(pc);
             if (b->stub) {
@@ -244,13 +228,13 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
                     ctx.pending_cell = nullptr;
                 }
                 ctx.fault_rip = 0;
-                const uint64_t left = deadline > cpu.instructions_executed ? deadline - cpu.instructions_executed : 1;
+                const uint64_t left = deadline > Glue::icount(cpu) ? deadline - Glue::icount(cpu) : 1;
                 done = static_cast<uint32_t>(reinterpret_cast<ChainFn>(static_cast<uintptr_t>(wasm_chain_fn))(
                     ctx.env, &ctx, b->wasm_fn, static_cast<uint32_t>(left > 0x7FFFFFFF ? 0x7FFFFFFF : left)));
-                cpu.instructions_executed += done;
+                Glue::add_icount(cpu, done);
                 n_insns_native += done;
                 any = true;
-                if (cpu.halted || (yield && *yield) || cpu.instructions_executed >= deadline) break;
+                if (Glue::halted(cpu) || (yield && *yield) || Glue::icount(cpu) >= deadline) break;
                 continue;
             } else {
                 ctx.pending_cell = nullptr;
@@ -259,28 +243,28 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
                 while (u) u = u->fn(&ctx, u);
                 done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
             }
-            cpu.instructions_executed += done;
+            Glue::add_icount(cpu, done);
             ++n_blocks_run;
             n_insns_native += done;
             any = true;
             if (stats_every_ && n_blocks_run % stats_every_ == 0) print_stats();
-            if (cpu.halted || (yield && *yield) || cpu.instructions_executed >= deadline) break;
+            if (Glue::halted(cpu) || (yield && *yield) || Glue::icount(cpu) >= deadline) break;
         }
-    } catch (const x86emu::MemoryFault&) {
-        if (cpu.cc_kind) materialize_flags(cpu);
+    } catch (const GFault&) {
+        Glue::settle(cpu);
         --depth_;
         // Report the fault at the start of the instruction that made it, which
         // is where an exception handler would restart it - unless it came out
         // of an interpreted instruction, which has already said where it was.
-        if (ctx.fault_rip) cpu.rip = ctx.fault_rip;
-        else if (ctx.cur && !ctx.in_interp) cpu.rip = b->start + ctx.cur->pc;
+        if (ctx.fault_rip) Glue::set_pc(cpu, ctx.fault_rip);
+        else if (ctx.cur && !ctx.in_interp) Glue::set_pc(cpu, b->start + ctx.cur->pc);
         throw;
     } catch (...) {
-        if (cpu.cc_kind) materialize_flags(cpu);
+        Glue::settle(cpu);
         --depth_;
         throw;
     }
-    if (cpu.cc_kind) materialize_flags(cpu);
+    Glue::settle(cpu);
     --depth_;
     // Blocks that got hot during this stretch are compiled before the next one.
     if (!wasm_pending_.empty() && depth_ == 0) wasm_compile_pending();
@@ -288,7 +272,7 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
 }
 
 bool Engine::run_plain(Block* b) {
-    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, epoch, -1, false, nullptr, false, -1, nullptr, 0};
+    Ctx ctx{Glue::env(cpu), &cpu, &mem, this, epoch, -1, false, nullptr, false, -1, nullptr, 0};
     ++depth_;
     if (!b->wasm_fn && wasm_on && ++b->heat == wasm_hot && !b->wasm_queued) wasm_queue(b);
     const Uop* u = b->code.data();
@@ -299,21 +283,21 @@ bool Engine::run_plain(Block* b) {
         } else {
             while (u) u = u->fn(&ctx, u);
         }
-    } catch (const x86emu::MemoryFault&) {
+    } catch (const GFault&) {
         --depth_;
         // Report the fault at the start of the instruction that made it, which
         // is where an exception handler would restart it.
-        if (ctx.fault_rip) cpu.rip = ctx.fault_rip;
-        else if (ctx.cur) cpu.rip = b->start + ctx.cur->pc;
+        if (ctx.fault_rip) Glue::set_pc(cpu, ctx.fault_rip);
+        else if (ctx.cur) Glue::set_pc(cpu, b->start + ctx.cur->pc);
         throw;
     } catch (...) {
         --depth_;
         throw;
     }
-    if (cpu.cc_kind) materialize_flags(cpu);
+    Glue::settle(cpu);
     --depth_;
     const uint32_t done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
-    cpu.instructions_executed += done;
+    Glue::add_icount(cpu, done);
     ++n_blocks_run;
     if (stats_every_ && n_blocks_run % stats_every_ == 0) print_stats();
     n_insns_native += done;
@@ -360,27 +344,3 @@ void Engine::on_code_flush_all() {
 
 }  // namespace jit
 
-namespace x86emu {
-
-Cpu::~Cpu() { delete jit_; }
-
-void Cpu::enable_jit(bool on) {
-    if (on == (jit_ != nullptr)) return;
-    if (on) {
-        jit_ = new jit::Engine(*this, mem_);
-    } else {
-        delete jit_;
-        jit_ = nullptr;
-    }
-}
-
-bool Cpu::jit_run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
-    return jit_->run(deadline, stop_pc, yield);
-}
-
-bool Cpu::jit_run_block() {
-    if (rip >= hook_low && rip <= hook_high) return false;
-    return jit_->run_block();
-}
-
-}  // namespace x86emu
