@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace x86emu {
@@ -32,6 +33,18 @@ struct MemoryFault : std::runtime_error {
     bool is_write;
     MemoryFault(uint64_t a, bool w, const std::string& what)
         : std::runtime_error(what), addr(a), is_write(w) {}
+};
+
+// Told when translated code may have gone stale.  The JIT registers itself here;
+// see Memory::mark_code_page.
+struct CodeObserver {
+    virtual ~CodeObserver() = default;
+    // A guest write is about to land on a page that holds translated code.
+    virtual void on_code_write(uint64_t page) = 0;
+    // Memory was unmapped or replaced wholesale: drop everything.
+    virtual void on_code_flush_all() = 0;
+    // One page was unmapped.
+    virtual void on_code_unmap(uint64_t page) = 0;
 };
 
 class Memory {
@@ -175,6 +188,20 @@ public:
         uint64_t size = 0;
         std::unique_ptr<uint8_t[]> data;
     };
+    // ---- translated code -------------------------------------------------
+    void set_code_observer(CodeObserver* o) { code_obs_ = o; }
+    // Declares that translations were made from this page.  Writes to it are
+    // reported from now on (until the first one, which also ends the
+    // declaration).  Returns false for a page that cannot be watched - one in a
+    // contiguous span, which outside callers write through raw host pointers.
+    bool mark_code_page(uint64_t page) {
+        if (span_for(page << kPageBits)) return false;
+        code_pages_.insert(page);
+        TlbEntry& e = tlbw_[page & (kTlbSize - 1)];
+        if (e.page == page) { e.page = kTlbNone; e.host = nullptr; }
+        return true;
+    }
+
     const Span* span_for(uint64_t addr) const {
         for (const auto& s : spans_)
             if (addr >= s.base && addr < s.base + s.size) return &s;
@@ -266,7 +293,7 @@ private:
 
     uint8_t* host_ptr(uint64_t addr, bool for_write) const {
         uint64_t page = addr >> kPageBits;
-        const TlbEntry& e = tlb_[page & (kTlbSize - 1)];
+        const TlbEntry& e = (for_write ? tlbw_ : tlb_)[page & (kTlbSize - 1)];
         if (e.page == page) return e.host + (addr & kPageMask);
         return host_ptr_slow(addr, for_write);
     }
@@ -278,6 +305,12 @@ private:
             e.page = kTlbNone;
             e.host = nullptr;
         }
+        for (auto& e : tlbw_) {
+            e.page = kTlbNone;
+            e.host = nullptr;
+        }
+        if (code_obs_) code_obs_->on_code_flush_all();
+        code_pages_.clear();
     }
 
     template <typename T>
@@ -317,6 +350,13 @@ private:
     mutable std::unordered_map<uint64_t, std::unique_ptr<Page>> pages_;
     std::vector<Span> spans_;
     mutable TlbEntry tlb_[kTlbSize];
+    // Writes have a TLB of their own so that a page holding translated code can
+    // be kept out of it: the first write to such a page then takes the slow
+    // path, where the translations are thrown away.  Nothing is added to the
+    // fast path to get this.
+    mutable TlbEntry tlbw_[kTlbSize];
+    CodeObserver* code_obs_ = nullptr;
+    mutable std::unordered_set<uint64_t> code_pages_;
     std::vector<Region> regions_;
 };
 

@@ -16,6 +16,11 @@
 
 #include "memory.h"
 
+namespace jit {
+class Engine;
+struct Access;
+}
+
 namespace x86emu {
 
 // Converting a floating point value to an integer the way x86 does: the value
@@ -75,6 +80,9 @@ enum : uint64_t {
 class Cpu {
 public:
     Cpu(Memory& mem, Mode mode);
+    ~Cpu();
+    Cpu(const Cpu&) = delete;
+    Cpu& operator=(const Cpu&) = delete;
 
     // A 128-bit SSE register, viewed as whatever the current instruction needs.
     union Xmm {
@@ -135,6 +143,22 @@ public:
 
     uint64_t instructions_executed = 0;
     bool trace = false;
+
+    // ---- dynamic translation (src/jit) -------------------------------------
+    //
+    // Temporaries for translated blocks.  They sit in the CPU so that a block
+    // addresses them the way it addresses registers: as an offset from regs[].
+    // Slot 0 is never written and always reads zero.
+    uint64_t jit_tmp[48] = {};
+    // Starts / stops the translator.  Off, nothing changes.
+    void enable_jit(bool on);
+    bool jit_on() const { return jit_ != nullptr; }
+    // Runs the translated block at rip if there is one; false means the caller
+    // should step() instead.
+    bool jit_run_block();
+    // Whether translated execution may be used right now: not while tracing,
+    // profiling or counting, all of which are per-instruction.
+    bool jit_usable() const { return jit_ != nullptr && !watching_ && !trace; }
 
     // A ring buffer of the addresses of the last instructions executed, kept
     // when history_size() > 0.  A fault deep inside a large guest is otherwise
@@ -381,6 +405,10 @@ private:
     // enable_opcount() was called, which is what `counting_opcodes()` asks.
     static constexpr size_t kOpcountSlots = 512;
     std::vector<uint64_t> opcount_;
+
+    friend class jit::Engine;
+    friend struct jit::Access;
+    jit::Engine* jit_ = nullptr;
 
     Memory& mem_;
     Mode mode_;

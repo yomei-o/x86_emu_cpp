@@ -19,6 +19,12 @@ extern "C" char** environ;
 
 namespace x86emu {
 
+// X86EMU_JIT=1 turns on the block translator (src/jit).  Off unless asked for.
+static bool jit_wanted() {
+    const char* v = std::getenv("X86EMU_JIT");
+    return v && v[0] == '1';
+}
+
 Emulator::Emulator(Options opt) : opt_(opt) {}
 Emulator::~Emulator() {
     // The profile is printed here rather than by the caller: every front end
@@ -1399,6 +1405,7 @@ void Emulator::load_bytes(const std::vector<uint8_t>& file, const std::vector<st
     image_.format = format;
 
     cpu_ = std::make_unique<Cpu>(mem, mode);
+    if (jit_wanted()) cpu_->enable_jit(true);
     // X86EMU_PROFILE=N: sample the instruction pointer every N instructions.
     // Reported by mapping at teardown - see Cpu::profile_report.
     if (const char* pv = std::getenv("X86EMU_PROFILE")) {
@@ -1599,10 +1606,15 @@ Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
     // this one where it was.
     const bool limited = opt_.max_instructions != 0;
     const bool saving = !opt_.save_state_path.empty();
+    // Translated blocks run many instructions between looks at the counter, so
+    // anything that needs an exact count - an instruction limit, a state saved
+    // at instruction N - keeps the interpreter.  (The instruction limit is only
+    // a runaway guard, and overshooting it by one block does not matter.)
+    const bool use_jit = cpu_->jit_usable() && !saving;
 
     while (!cpu_->halted && !reschedule_ && cpu_->instructions_executed < deadline) {
         try {
-            cpu_->step();
+            if (!(use_jit && cpu_->jit_run_block())) cpu_->step();
         } catch (const UnwindTransfer& transfer) {
             // An exception found its handler.  The host frames between the throw
             // and here - nested interpreter loops, one per language handler the
@@ -1722,6 +1734,7 @@ std::unique_ptr<Emulator> Emulator::fork_clone() {
 
     child->mem.clone_from(mem);
     child->cpu_ = std::make_unique<Cpu>(child->mem, image_.mode);
+    if (jit_wanted()) child->cpu_->enable_jit(true);
     Cpu& c = *child->cpu_;
     std::memcpy(c.regs, cpu_->regs, sizeof c.regs);
     std::memcpy(c.xmm, cpu_->xmm, sizeof c.xmm);

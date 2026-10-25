@@ -61,6 +61,12 @@ void Memory::unmap(uint64_t addr, uint64_t size) {
             e.page = kTlbNone;
             e.host = nullptr;
         }
+        TlbEntry& w = tlbw_[p & (kTlbSize - 1)];
+        if (w.page == p) {
+            w.page = kTlbNone;
+            w.host = nullptr;
+        }
+        if (code_obs_ && code_pages_.erase(p)) code_obs_->on_code_unmap(p);
     }
 }
 
@@ -92,7 +98,7 @@ uint8_t* Memory::host_ptr_slow(uint64_t addr, bool for_write) const {
     // difference.
     if (const Span* s = span_for(addr)) {
         uint8_t* base = s->data.get() + ((page << kPageBits) - s->base);
-        TlbEntry& e = tlb_[page & (kTlbSize - 1)];
+        TlbEntry& e = (for_write ? tlbw_ : tlb_)[page & (kTlbSize - 1)];
         e.page = page;
         e.host = base;
         return base + (addr & kPageMask);
@@ -110,7 +116,11 @@ uint8_t* Memory::host_ptr_slow(uint64_t addr, bool for_write) const {
     // a reason as writing - a fresh page reads as zero either way.
     if (!it->second) it->second = std::make_unique<Page>();
     uint8_t* base = it->second->data();
-    TlbEntry& e = tlb_[page & (kTlbSize - 1)];
+    // The first write to a page that translations were made from: they are
+    // stale from here on.  The page stops being watched until something is
+    // translated from it again.
+    if (for_write && code_obs_ && code_pages_.erase(page)) code_obs_->on_code_write(page);
+    TlbEntry& e = (for_write ? tlbw_ : tlb_)[page & (kTlbSize - 1)];
     e.page = page;
     e.host = base;
     return base + (addr & kPageMask);

@@ -10,7 +10,7 @@ endif()
 # Every translation unit in src/ (bar none): globbing keeps this from going stale
 # when a source file is added, the same way build.sh does. CONFIGURE_DEPENDS re-runs
 # the glob when the set of files changes.
-file(GLOB X86EMU_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
+file(GLOB X86EMU_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp" "${CMAKE_SOURCE_DIR}/src/jit/*.cpp")
 
 add_executable(x86emu ${X86EMU_SOURCES})
 target_include_directories(x86emu PRIVATE src)

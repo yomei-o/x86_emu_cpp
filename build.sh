@@ -6,7 +6,7 @@ CXX=${CXX:-g++}
 CXXFLAGS=${CXXFLAGS:--std=c++17 -O2 -Wall -Wextra}
 
 echo "== x86emu"
-$CXX $CXXFLAGS -Isrc -o x86emu src/*.cpp
+$CXX $CXXFLAGS -Isrc -o x86emu src/*.cpp src/jit/*.cpp
 echo "== gen_elf_tests"
 $CXX $CXXFLAGS -o gen_elf_tests tools/gen_elf_tests.cpp
 echo "done"
