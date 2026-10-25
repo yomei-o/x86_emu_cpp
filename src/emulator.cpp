@@ -495,7 +495,7 @@ uint64_t Emulator::call_guest(uint64_t func, const std::vector<uint64_t>& args) 
     cpu_->rip = func;
     cpu_->halted = false;
 
-    while (!cpu_->halted && cpu_->rip != nested_return_) cpu_->step_fast();
+    while (!cpu_->halted && cpu_->rip != nested_return_) cpu_->step_fast(nested_return_);
     uint64_t result = cpu_->regs[RAX];
     bool guest_exited = cpu_->halted;
     int code = cpu_->exit_code;
@@ -1614,7 +1614,7 @@ Emulator::SliceStatus Emulator::run_slice(uint64_t quantum) {
 
     while (!cpu_->halted && !reschedule_ && cpu_->instructions_executed < deadline) {
         try {
-            if (!(use_jit && cpu_->jit_run_block())) cpu_->step();
+            if (!(use_jit && cpu_->jit_run(deadline, ~0ull, &reschedule_))) cpu_->step();
         } catch (const UnwindTransfer& transfer) {
             // An exception found its handler.  The host frames between the throw
             // and here - nested interpreter loops, one per language handler the

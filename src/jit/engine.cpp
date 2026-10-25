@@ -132,8 +132,70 @@ bool Engine::run_block() {
     return verify ? run_verified(b) : run_plain(b);
 }
 
+// Runs translated blocks one after another for as long as there are any to run:
+// until the instruction counter reaches `deadline`, rip reaches `stop_pc`, the
+// guest halts, `*yield` is set, or rip is somewhere that is not translated code
+// (a host hook, a stub).  Returns whether at least one block ran.
+//
+// Staying in here between blocks is most of the point.  Blocks average four or
+// five guest instructions, so the work of getting into and out of the engine
+// was as large as the blocks themselves.
+bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
+    if (verify) {
+        // One block at a time, each checked against the interpreter.
+        const uint64_t pc = cpu.rip;
+        if (pc == stop_pc || (pc >= cpu.hook_low && pc <= cpu.hook_high)) return false;
+        return run_block();
+    }
+    reclaim();
+    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, 0, -1, false, nullptr};
+    const Uop* u = nullptr;
+    Block* b = nullptr;
+    bool any = false;
+    ++depth_;
+    try {
+        for (;;) {
+            const uint64_t pc = cpu.rip;
+            if (pc == stop_pc || (pc >= cpu.hook_low && pc <= cpu.hook_high)) break;
+            b = lookup(pc);
+            if (!b) b = translate(pc);
+            if (b->stub) {
+                ++n_stub_hits;
+                break;
+            }
+            ctx.epoch0 = epoch;
+            ctx.partial = -1;
+            ctx.cur = nullptr;
+            u = b->code.data();
+            while (u) u = u->fn(&ctx, u);
+            const uint32_t done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
+            cpu.instructions_executed += done;
+            ++n_blocks_run;
+            n_insns_native += done;
+            any = true;
+            if (stats_every_ && n_blocks_run % stats_every_ == 0) print_stats();
+            if (cpu.halted || (yield && *yield) || cpu.instructions_executed >= deadline) break;
+        }
+    } catch (const x86emu::MemoryFault&) {
+        if (cpu.cc_kind) materialize_flags(cpu);
+        --depth_;
+        // Report the fault at the start of the instruction that made it, which
+        // is where an exception handler would restart it - unless it came out
+        // of an interpreted instruction, which has already said where it was.
+        if (ctx.cur && !ctx.in_interp) cpu.rip = b->start + ctx.cur->pc;
+        throw;
+    } catch (...) {
+        if (cpu.cc_kind) materialize_flags(cpu);
+        --depth_;
+        throw;
+    }
+    if (cpu.cc_kind) materialize_flags(cpu);
+    --depth_;
+    return any;
+}
+
 bool Engine::run_plain(Block* b) {
-    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, epoch, -1};
+    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, epoch, -1, false, nullptr};
     ++depth_;
     const Uop* u = b->code.data();
     try {
@@ -142,12 +204,13 @@ bool Engine::run_plain(Block* b) {
         --depth_;
         // Report the fault at the start of the instruction that made it, which
         // is where an exception handler would restart it.
-        if (u) cpu.rip = b->start + u->pc;
+        if (ctx.cur) cpu.rip = b->start + ctx.cur->pc;
         throw;
     } catch (...) {
         --depth_;
         throw;
     }
+    if (cpu.cc_kind) materialize_flags(cpu);
     --depth_;
     const uint32_t done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
     cpu.instructions_executed += done;
@@ -207,6 +270,10 @@ void Cpu::enable_jit(bool on) {
         delete jit_;
         jit_ = nullptr;
     }
+}
+
+bool Cpu::jit_run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
+    return jit_->run(deadline, stop_pc, yield);
 }
 
 bool Cpu::jit_run_block() {

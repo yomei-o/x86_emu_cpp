@@ -71,6 +71,15 @@ enum class OpKind : uint8_t {
     // MUL / IMUL / DIV / IDIV on rAX (cc = 4..7), through the interpreter's code.
     // The operand is register d, or the memory at slot a with kFlagMem set.
     Group3,
+    // Deferred flags.  CcSet records "the arithmetic flags are those of a OP b"
+    // (cc = kind: 1 ADD 2 SUB 3 AND 4 OR 5 XOR) in the CPU instead of computing
+    // them; CcSetI takes b from imm.  CcMat computes them if recorded.  CcClear
+    // says rflags is current again.
+    CcSet, CcSetI, CcMat, CcClear,
+    // Compare-and-branch in one: records the flags as CcSet does, then
+    // rip = cond(a OP b) ? imm : imm2.  cc = x86 condition, c = kind.
+    // JccCmpI takes b as the 32-bit immediate in d.
+    JccCmp, JccCmpI,
     // Run the guest instruction at (block start + pc) with the interpreter.
     // imm2 = the address the block expects to be at afterwards; anything else
     // ends the block.

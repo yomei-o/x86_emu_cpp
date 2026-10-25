@@ -39,6 +39,17 @@ using x86emu::Cpu;
 
 #define S(o) (*reinterpret_cast<uint64_t*>(c->env + (o)))
 
+// How a handler hands over to the next op.  With tail calls each handler ends in
+// its own indirect jump, which a branch predictor can learn per handler; a loop
+// that calls every handler from one place gives it a single jump to guess for
+// the whole program.  Where the compiler cannot promise the tail call, the
+// handler returns the next op and run() loops.
+#if defined(JIT_NO_MUSTTAIL) || !(defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 15))
+#define NEXT() return u + 1
+#else
+#define NEXT() [[gnu::musttail]] return (u + 1)->fn(c, u + 1)
+#endif
+
 struct ParityTable {
     uint8_t v[256];
     constexpr ParityTable() : v() {
@@ -60,25 +71,25 @@ constexpr uint64_t kArith = 0x8D5;   // CF PF AF ZF SF OF
 
 // ---- moves and plain arithmetic -------------------------------------------
 
-const Uop* h_nop(Ctx*, const Uop* u) { return u + 1; }
-const Uop* h_mov(Ctx* c, const Uop* u) { S(u->d) = S(u->a); return u + 1; }
-const Uop* h_movi(Ctx* c, const Uop* u) { S(u->d) = static_cast<uint64_t>(u->imm); return u + 1; }
-const Uop* h_add(Ctx* c, const Uop* u) { S(u->d) = S(u->a) + S(u->b); return u + 1; }
-const Uop* h_addi(Ctx* c, const Uop* u) { S(u->d) = S(u->a) + static_cast<uint64_t>(u->imm); return u + 1; }
-const Uop* h_sub(Ctx* c, const Uop* u) { S(u->d) = S(u->a) - S(u->b); return u + 1; }
-const Uop* h_subi(Ctx* c, const Uop* u) { S(u->d) = S(u->a) - static_cast<uint64_t>(u->imm); return u + 1; }
-const Uop* h_and(Ctx* c, const Uop* u) { S(u->d) = S(u->a) & S(u->b); return u + 1; }
-const Uop* h_andi(Ctx* c, const Uop* u) { S(u->d) = S(u->a) & static_cast<uint64_t>(u->imm); return u + 1; }
-const Uop* h_or(Ctx* c, const Uop* u) { S(u->d) = S(u->a) | S(u->b); return u + 1; }
-const Uop* h_ori(Ctx* c, const Uop* u) { S(u->d) = S(u->a) | static_cast<uint64_t>(u->imm); return u + 1; }
-const Uop* h_xor(Ctx* c, const Uop* u) { S(u->d) = S(u->a) ^ S(u->b); return u + 1; }
-const Uop* h_xori(Ctx* c, const Uop* u) { S(u->d) = S(u->a) ^ static_cast<uint64_t>(u->imm); return u + 1; }
+const Uop* h_nop(Ctx* c, const Uop* u) { NEXT(); }
+const Uop* h_mov(Ctx* c, const Uop* u) { S(u->d) = S(u->a); NEXT(); }
+const Uop* h_movi(Ctx* c, const Uop* u) { S(u->d) = static_cast<uint64_t>(u->imm); NEXT(); }
+const Uop* h_add(Ctx* c, const Uop* u) { S(u->d) = S(u->a) + S(u->b); NEXT(); }
+const Uop* h_addi(Ctx* c, const Uop* u) { S(u->d) = S(u->a) + static_cast<uint64_t>(u->imm); NEXT(); }
+const Uop* h_sub(Ctx* c, const Uop* u) { S(u->d) = S(u->a) - S(u->b); NEXT(); }
+const Uop* h_subi(Ctx* c, const Uop* u) { S(u->d) = S(u->a) - static_cast<uint64_t>(u->imm); NEXT(); }
+const Uop* h_and(Ctx* c, const Uop* u) { S(u->d) = S(u->a) & S(u->b); NEXT(); }
+const Uop* h_andi(Ctx* c, const Uop* u) { S(u->d) = S(u->a) & static_cast<uint64_t>(u->imm); NEXT(); }
+const Uop* h_or(Ctx* c, const Uop* u) { S(u->d) = S(u->a) | S(u->b); NEXT(); }
+const Uop* h_ori(Ctx* c, const Uop* u) { S(u->d) = S(u->a) | static_cast<uint64_t>(u->imm); NEXT(); }
+const Uop* h_xor(Ctx* c, const Uop* u) { S(u->d) = S(u->a) ^ S(u->b); NEXT(); }
+const Uop* h_xori(Ctx* c, const Uop* u) { S(u->d) = S(u->a) ^ static_cast<uint64_t>(u->imm); NEXT(); }
 
 template <int SZ>
 const Uop* h_lea(Ctx* c, const Uop* u) {
     uint64_t v = S(u->a) + (S(u->c) << u->cc) + static_cast<uint64_t>(u->imm);
     S(u->d) = v & mask_of<SZ>();
-    return u + 1;
+    NEXT();
 }
 
 template <int SRC, bool SIGNED, int DST>
@@ -92,14 +103,14 @@ const Uop* h_ext(Ctx* c, const Uop* u) {
         v &= mask_of<SRC>();
     }
     S(u->d) = v & mask_of<DST>();
-    return u + 1;
+    NEXT();
 }
 
-const Uop* h_put1(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) & ~0xFFull) | (S(u->b) & 0xFF); return u + 1; }
-const Uop* h_put2(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) & ~0xFFFFull) | (S(u->b) & 0xFFFF); return u + 1; }
-const Uop* h_puth(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) & ~0xFF00ull) | ((S(u->b) & 0xFF) << 8); return u + 1; }
-const Uop* h_geth(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) >> 8) & 0xFF; return u + 1; }
-const Uop* h_sel(Ctx* c, const Uop* u) { S(u->d) = S(u->c) ? S(u->a) : S(u->b); return u + 1; }
+const Uop* h_put1(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) & ~0xFFull) | (S(u->b) & 0xFF); NEXT(); }
+const Uop* h_put2(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) & ~0xFFFFull) | (S(u->b) & 0xFFFF); NEXT(); }
+const Uop* h_puth(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) & ~0xFF00ull) | ((S(u->b) & 0xFF) << 8); NEXT(); }
+const Uop* h_geth(Ctx* c, const Uop* u) { S(u->d) = (S(u->a) >> 8) & 0xFF; NEXT(); }
+const Uop* h_sel(Ctx* c, const Uop* u) { S(u->d) = S(u->c) ? S(u->a) : S(u->b); NEXT(); }
 
 // ---- memory ---------------------------------------------------------------
 
@@ -111,6 +122,7 @@ inline uint64_t ea(Ctx* c, const Uop* u) {
 
 template <int SZ, bool A32>
 const Uop* h_ld(Ctx* c, const Uop* u) {
+    c->cur = u;
     uint64_t a = ea<A32>(c, u);
     uint64_t v;
     if (SZ == 1) v = c->mem->read8(a);
@@ -118,51 +130,147 @@ const Uop* h_ld(Ctx* c, const Uop* u) {
     else if (SZ == 4) v = c->mem->read32(a);
     else v = c->mem->read64(a);
     S(u->d) = v;
-    return u + 1;
+    NEXT();
 }
 
 // Sign extending load; b = destination width (4 or 8).
 template <int SZ, bool A32, int DST>
 const Uop* h_lds(Ctx* c, const Uop* u) {
+    c->cur = u;
     uint64_t a = ea<A32>(c, u);
     int64_t v;
     if (SZ == 1) v = static_cast<int8_t>(c->mem->read8(a));
     else if (SZ == 2) v = static_cast<int16_t>(c->mem->read16(a));
     else v = static_cast<int32_t>(c->mem->read32(a));
     S(u->d) = static_cast<uint64_t>(v) & mask_of<DST>();
-    return u + 1;
+    NEXT();
 }
 
 template <int SZ, bool A32>
 const Uop* h_st(Ctx* c, const Uop* u) {
+    c->cur = u;
     uint64_t a = ea<A32>(c, u);
     uint64_t v = S(u->b);
     if (SZ == 1) c->mem->write8(a, static_cast<uint8_t>(v));
     else if (SZ == 2) c->mem->write16(a, static_cast<uint16_t>(v));
     else if (SZ == 4) c->mem->write32(a, static_cast<uint32_t>(v));
     else c->mem->write64(a, v);
-    return u + 1;
+    NEXT();
 }
 
 // ---- flags ----------------------------------------------------------------
 
+// The arithmetic flag bits of `a OP b = r`, as they sit in rflags.
 template <int SZ>
-inline void flags_arith(Ctx* c, const Uop* u, uint64_t a, uint64_t b, uint64_t r, bool sub) {
+inline uint64_t arith_fl(uint64_t a, uint64_t b, uint64_t r, bool sub) {
     constexpr uint64_t SG = sign_of<SZ>();
     uint64_t cf = sub ? (a < b) : (r < a);
     uint64_t of = sub ? (((a ^ b) & (a ^ r) & SG) != 0) : (((a ^ r) & (b ^ r) & SG) != 0);
-    uint64_t fl = cf | kParity.v[r & 0xFF] | ((a ^ b ^ r) & 0x10) | (r == 0 ? 0x40 : 0) |
-                  ((r & SG) ? 0x80 : 0) | (of ? 0x800 : 0);
+    return cf | kParity.v[r & 0xFF] | ((a ^ b ^ r) & 0x10) | (r == 0 ? 0x40 : 0) |
+           ((r & SG) ? 0x80 : 0) | (of ? 0x800 : 0);
+}
+
+template <int SZ>
+inline uint64_t logic_fl(uint64_t r) {
+    constexpr uint64_t SG = sign_of<SZ>();
+    return kParity.v[r & 0xFF] | (r == 0 ? 0x40 : 0) | ((r & SG) ? 0x80 : 0);
+}
+
+template <int SZ>
+inline void flags_arith(Ctx* c, const Uop* u, uint64_t a, uint64_t b, uint64_t r, bool sub) {
     uint64_t& rf = S(c->eng->slots.rflags);
-    rf = (rf & ~kArith) | fl;
+    rf = (rf & ~kArith) | arith_fl<SZ>(a, b, r, sub);
 }
 
 template <int SZ>
 inline void flags_logic(Ctx* c, uint64_t r) {
-    constexpr uint64_t SG = sign_of<SZ>();
-    uint64_t fl = kParity.v[r & 0xFF] | (r == 0 ? 0x40 : 0) | ((r & SG) ? 0x80 : 0);
     uint64_t& rf = S(c->eng->slots.rflags);
-    rf = (rf & ~kArith) | fl;
+    rf = (rf & ~kArith) | logic_fl<SZ>(r);
+}
+
+// ---- deferred flags ----------------------------------------------------------
+
+template <int SZ> inline int64_t sext_sz(uint64_t v);
+template <int CC> inline bool test_cc(uint64_t rf);
+
+template <int SZ>
+void materialize_sz(Cpu& cpu) {
+    constexpr uint64_t M = mask_of<SZ>();
+    const uint64_t a = cpu.cc_a & M, b = cpu.cc_b & M;
+    uint64_t fl;
+    switch (cpu.cc_kind) {
+        case 1: fl = arith_fl<SZ>(a, b, (a + b) & M, false); break;
+        case 2: fl = arith_fl<SZ>(a, b, (a - b) & M, true); break;
+        case 3: fl = logic_fl<SZ>(a & b); break;
+        case 4: fl = logic_fl<SZ>(a | b); break;
+        default: fl = logic_fl<SZ>(a ^ b); break;
+    }
+    cpu.rflags = (cpu.rflags & ~kArith) | fl;
+    cpu.cc_kind = 0;
+}
+
+// Condition `CC` of the flags that `a OP b` would leave, evaluated without
+// leaving them anywhere.  a and b arrive already masked to SZ bytes.
+template <int KIND, int SZ, int CC>
+inline bool eval_cc(uint64_t a, uint64_t b);
+
+template <int SZ, int CC>
+inline bool eval_sub(uint64_t a, uint64_t b) {
+    constexpr uint64_t M = mask_of<SZ>();
+    constexpr uint64_t SG = sign_of<SZ>();
+    const uint64_t r = (a - b) & M;
+    switch (CC) {
+        case 0: return ((a ^ b) & (a ^ r) & SG) != 0;
+        case 1: return ((a ^ b) & (a ^ r) & SG) == 0;
+        case 2: return a < b;
+        case 3: return a >= b;
+        case 4: return a == b;
+        case 5: return a != b;
+        case 6: return a <= b;
+        case 7: return a > b;
+        case 8: return (r & SG) != 0;
+        case 9: return (r & SG) == 0;
+        case 10: return kParity.v[r & 0xFF] != 0;
+        case 11: return kParity.v[r & 0xFF] == 0;
+        case 12: return sext_sz<SZ>(a) < sext_sz<SZ>(b);
+        case 13: return sext_sz<SZ>(a) >= sext_sz<SZ>(b);
+        case 14: return sext_sz<SZ>(a) <= sext_sz<SZ>(b);
+        default: return sext_sz<SZ>(a) > sext_sz<SZ>(b);
+    }
+}
+
+// AND / OR / XOR: CF and OF come out clear.
+template <int SZ, int CC>
+inline bool eval_logic(uint64_t r) {
+    constexpr uint64_t SG = sign_of<SZ>();
+    switch (CC) {
+        case 0: return false;
+        case 1: return true;
+        case 2: return false;
+        case 3: return true;
+        case 4: return r == 0;
+        case 5: return r != 0;
+        case 6: return r == 0;
+        case 7: return r != 0;
+        case 8: return (r & SG) != 0;
+        case 9: return (r & SG) == 0;
+        case 10: return kParity.v[r & 0xFF] != 0;
+        case 11: return kParity.v[r & 0xFF] == 0;
+        case 12: return (r & SG) != 0;
+        case 13: return (r & SG) == 0;
+        case 14: return (r & SG) != 0 || r == 0;
+        default: return (r & SG) == 0 && r != 0;
+    }
+}
+
+template <int KIND, int SZ, int CC>
+inline bool eval_cc(uint64_t a, uint64_t b) {
+    constexpr uint64_t M = mask_of<SZ>();
+    if (KIND == 2) return eval_sub<SZ, CC>(a, b);
+    if (KIND == 3) return eval_logic<SZ, CC>(a & b);
+    if (KIND == 4) return eval_logic<SZ, CC>(a | b);
+    if (KIND == 5) return eval_logic<SZ, CC>(a ^ b);
+    return test_cc<CC>(arith_fl<SZ>(a, b, (a + b) & M, false));   // ADD
 }
 
 // x86 operation numbers: 0 ADD 1 OR 4 AND 5 SUB 6 XOR 7 CMP, 8 TEST
@@ -186,7 +294,7 @@ const Uop* h_alu(Ctx* c, const Uop* u) {
         else if (OP == 5 || OP == 7) flags_arith<SZ>(c, u, a, b, r, true);
         else flags_logic<SZ>(c, r);
     }
-    return u + 1;
+    NEXT();
 }
 
 template <bool DEC, int SZ, bool FL>
@@ -201,14 +309,14 @@ const Uop* h_incdec(Ctx* c, const Uop* u) {
         flags_arith<SZ>(c, u, a, 1, r, DEC);
         rf = (rf & ~1ull) | keep;
     }
-    return u + 1;
+    NEXT();
 }
 
-const Uop* h_shli(Ctx* c, const Uop* u) { S(u->d) = S(u->a) << (u->imm & 63); return u + 1; }
-const Uop* h_shri(Ctx* c, const Uop* u) { S(u->d) = S(u->a) >> (u->imm & 63); return u + 1; }
+const Uop* h_shli(Ctx* c, const Uop* u) { S(u->d) = S(u->a) << (u->imm & 63); NEXT(); }
+const Uop* h_shri(Ctx* c, const Uop* u) { S(u->d) = S(u->a) >> (u->imm & 63); NEXT(); }
 const Uop* h_sari(Ctx* c, const Uop* u) {
     S(u->d) = static_cast<uint64_t>(static_cast<int64_t>(S(u->a)) >> (u->imm & 63));
-    return u + 1;
+    NEXT();
 }
 
 template <int SZ>
@@ -238,7 +346,7 @@ const Uop* h_shift(Ctx* c, const Uop* u) {
     const uint64_t cnt = (IMM ? static_cast<uint64_t>(u->imm) : S(u->b)) & cmask;
     if (cnt == 0) {
         S(u->d) = v;
-        return u + 1;
+        NEXT();
     }
     uint64_t r, cf, of;
     if (OP == 4) {
@@ -258,13 +366,13 @@ const Uop* h_shift(Ctx* c, const Uop* u) {
     }
     S(u->d) = r;
     if (FL) flags_cfof_szp(c, cf, of, r, SG);
-    return u + 1;
+    NEXT();
 }
 
 const Uop* h_shift_slow(Ctx* c, const Uop* u) {
     uint64_t v = S(u->a);
     S(u->d) = Access::shift(*c->cpu, u->cc, v, S(u->b) & 0xFF, u->sz);
-    return u + 1;
+    NEXT();
 }
 
 template <int SZ, bool FL, bool IMM>
@@ -295,14 +403,15 @@ const Uop* h_imul(Ctx* c, const Uop* u) {
     }
     S(u->d) = r;
     if (FL) flags_cfof_szp(c, trunc ? 1 : 0, trunc ? 1 : 0, r, SG);
-    return u + 1;
+    NEXT();
 }
 
 const Uop* h_group3(Ctx* c, const Uop* u) {
+    c->cur = u;
     c->cpu->rip = static_cast<uint64_t>(u->imm);
     bool mem = (u->flags & kFlagMem) != 0;
     Access::group3(*c->cpu, !mem, u->d, mem ? S(u->a) : 0, u->sz, u->cc, (u->flags & kFlagRex) != 0);
-    return u + 1;
+    NEXT();
 }
 
 template <int CC>
@@ -325,7 +434,50 @@ inline bool test_cc(uint64_t rf) {
 template <int CC>
 const Uop* h_setfl(Ctx* c, const Uop* u) {
     S(u->d) = test_cc<CC>(S(c->eng->slots.rflags)) ? 1 : 0;
-    return u + 1;
+    NEXT();
+}
+
+// ---- deferred flag ops ------------------------------------------------------
+
+const Uop* h_ccset(Ctx* c, const Uop* u) {
+    Cpu* cpu = c->cpu;
+    cpu->cc_a = S(u->a);
+    cpu->cc_b = S(u->b);
+    cpu->cc_kind = u->cc;
+    cpu->cc_sz = u->sz;
+    NEXT();
+}
+const Uop* h_ccseti(Ctx* c, const Uop* u) {
+    Cpu* cpu = c->cpu;
+    cpu->cc_a = S(u->a);
+    cpu->cc_b = static_cast<uint64_t>(u->imm);
+    cpu->cc_kind = u->cc;
+    cpu->cc_sz = u->sz;
+    NEXT();
+}
+const Uop* h_ccmat(Ctx* c, const Uop* u) {
+    if (c->cpu->cc_kind) materialize_flags(*c->cpu);
+    NEXT();
+}
+const Uop* h_ccclear(Ctx* c, const Uop* u) {
+    c->cpu->cc_kind = 0;
+    NEXT();
+}
+
+// Compare and branch, leaving the comparison recorded for whoever reads the
+// flags later.
+template <int KIND, int SZ, int CC, bool IMM>
+const Uop* h_jcccmp(Ctx* c, const Uop* u) {
+    constexpr uint64_t M = mask_of<SZ>();
+    const uint64_t a = S(u->a) & M;
+    const uint64_t b = IMM ? (static_cast<uint64_t>(static_cast<int64_t>(u->d)) & M) : (S(u->b) & M);
+    Cpu* cpu = c->cpu;
+    cpu->cc_a = a;
+    cpu->cc_b = b;
+    cpu->cc_kind = KIND;
+    cpu->cc_sz = SZ;
+    cpu->rip = static_cast<uint64_t>(eval_cc<KIND, SZ, CC>(a, b) ? u->imm : u->imm2);
+    return nullptr;
 }
 
 // ---- exits ----------------------------------------------------------------
@@ -345,7 +497,7 @@ const Uop* h_chkflush(Ctx* c, const Uop* u) {
         c->cpu->rip = static_cast<uint64_t>(u->imm);
         return nullptr;
     }
-    return u + 1;
+    NEXT();
 }
 
 // The interpreter, for one instruction.  If it leaves rip anywhere but the
@@ -356,12 +508,14 @@ const Uop* h_interp(Ctx* c, const Uop* u) {
     cpu->rip = static_cast<uint64_t>(u->imm);
     ++c->eng->n_interp;
     ++c->eng->interp_ops[u->c & 0x1FF];
+    c->in_interp = true;
     cpu->step();
+    c->in_interp = false;
     if (cpu->rip != static_cast<uint64_t>(u->imm2) || cpu->halted || c->eng->epoch != c->epoch0) {
         c->partial = u->ni;
         return nullptr;
     }
-    return u + 1;
+    NEXT();
 }
 
 // ---- selection -------------------------------------------------------------
@@ -455,6 +609,31 @@ Fn pick_imul(int sz, bool fl, bool imm) {
     return imm ? pick_imul_fl<false, true>(sz) : pick_imul_fl<false, false>(sz);
 }
 
+template <int KIND, int SZ, bool IMM, int CC = 0>
+Fn pick_jc_cc(int cc) {
+    if (cc == CC) return &h_jcccmp<KIND, SZ, CC, IMM>;
+    if constexpr (CC < 15) return pick_jc_cc<KIND, SZ, IMM, CC + 1>(cc);
+    return nullptr;
+}
+
+template <int KIND, bool IMM>
+Fn pick_jc_sz(int sz, int cc) {
+    switch (sz) {
+        case 1: return pick_jc_cc<KIND, 1, IMM>(cc);
+        case 2: return pick_jc_cc<KIND, 2, IMM>(cc);
+        case 4: return pick_jc_cc<KIND, 4, IMM>(cc);
+        default: return pick_jc_cc<KIND, 8, IMM>(cc);
+    }
+}
+
+Fn pick_jcccmp(int kind, int sz, int cc, bool imm) {
+#define KINDCASE(K) case K: return imm ? pick_jc_sz<K, true>(sz, cc) : pick_jc_sz<K, false>(sz, cc);
+    switch (kind) {
+        KINDCASE(1) KINDCASE(2) KINDCASE(3) KINDCASE(4) default: return imm ? pick_jc_sz<5, true>(sz, cc) : pick_jc_sz<5, false>(sz, cc);
+    }
+#undef KINDCASE
+}
+
 Fn pick_cc(int cc, int which) {
 #define CASE(N) case N: return which == 0 ? &h_setfl<N> : &h_jccfl<N>;
     switch (cc & 15) {
@@ -534,6 +713,12 @@ Fn select(const Op& o) {
         case OpKind::Imul: return pick_imul(o.sz, fl, false);
         case OpKind::ImulI: return pick_imul(o.sz, fl, true);
         case OpKind::Group3: return h_group3;
+        case OpKind::CcSet: return h_ccset;
+        case OpKind::CcSetI: return h_ccseti;
+        case OpKind::CcMat: return h_ccmat;
+        case OpKind::CcClear: return h_ccclear;
+        case OpKind::JccCmp: return pick_jcccmp(o.c, o.sz, o.cc, false);
+        case OpKind::JccCmpI: return pick_jcccmp(o.c, o.sz, o.cc, true);
         case OpKind::Interp: return h_interp;
         case OpKind::ChkFlush: return h_chkflush;
     }
@@ -542,6 +727,15 @@ Fn select(const Op& o) {
 }
 
 }  // namespace
+
+void materialize_flags(x86emu::Cpu& cpu) {
+    switch (cpu.cc_sz) {
+        case 1: materialize_sz<1>(cpu); break;
+        case 2: materialize_sz<2>(cpu); break;
+        case 4: materialize_sz<4>(cpu); break;
+        default: materialize_sz<8>(cpu); break;
+    }
+}
 
 void compile_threaded(Engine&, const IrBlock& ir, Block& out) {
     out.code.clear();

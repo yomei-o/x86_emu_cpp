@@ -273,7 +273,6 @@ FlagUse flag_use(const D& d, bool native) {
                 case 0xC9: case 0x63: case 0x90:
                 case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0x98: case 0x99:
                 case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
-                case 0x69: case 0x6B:   // IMUL writes CF OF SF ZF PF and leaves AF: a partial write
                     f.reads = false; return f;
                 case 0xF6: case 0xF7: {
                     int sub = d.reg & 7;
@@ -291,7 +290,7 @@ FlagUse flag_use(const D& d, bool native) {
             if (d.op >= 0xB0 && d.op <= 0xBF) f.reads = false;
             return f;
         }
-        if (d.op == 0xB6 || d.op == 0xB7 || d.op == 0xBE || d.op == 0xBF || d.op == 0xAF) f.reads = false;
+        if (d.op == 0xB6 || d.op == 0xB7 || d.op == 0xBE || d.op == 0xBF) f.reads = false;
         return f;
     }
     // Interpreted instructions: assume the worst, except the families that are
@@ -337,6 +336,8 @@ struct Tr {
     bool is64;
     IrBlock& ir;
     int tmp_next = 1;
+    // A CMP or TEST whose flags the block's final Jcc will consume directly.
+    struct Pend { bool valid; int kind; int sz; int a; int b; bool imm; int64_t immv; } pend{};
     uint32_t cur_off = 0;   // offset of the current instruction from the block start
     bool stored = false;    // the current instruction wrote memory
     bool last = false;      // the current instruction ends the block
@@ -459,6 +460,27 @@ bool is_term(const D& d) {
     return d.op == 0x05 || (d.op >= 0x80 && d.op <= 0x8F);
 }
 
+bool is_jcc(const D& d) {
+    return d.native && ((!d.tb && d.op >= 0x70 && d.op <= 0x7F) || (d.tb && d.op >= 0x80 && d.op <= 0x8F));
+}
+
+// CMP and TEST: the flag writers that change nothing else, so their operands are
+// still there for a Jcc that follows.
+bool is_compare(const D& d) {
+    if (!d.native) return false;
+    if (!d.tb) {
+        const uint8_t op = d.op;
+        if (op < 0x40 && (op & 7) < 6) return ((op >> 3) & 7) == 7;
+        switch (op) {
+            case 0x80: case 0x81: case 0x83: return (d.reg & 7) == 7;
+            case 0x84: case 0x85: case 0xA8: case 0xA9: return true;
+            case 0xF6: case 0xF7: return (d.reg & 7) < 2;
+            default: return false;
+        }
+    }
+    return false;
+}
+
 // Whether the frontend translates this instruction itself.
 bool is_native(const D& d, bool is64) {
     const int sz = d.opsize;
@@ -534,14 +556,31 @@ bool is_native(const D& d, bool is64) {
 
 // Emits one natively translated instruction.  `flags` says whether anyone can
 // observe the flags this instruction writes.
-void emit_native(Tr& t, const D& d, bool flags, uint64_t next_pc) {
+void emit_native(Tr& t, const D& d, int fmode, uint64_t next_pc) {
     const bool is64 = t.is64;
     const int sz = d.opsize;
-    const uint8_t fl = flags ? kFlagEager : 0;
+    // fmode: 0 nobody sees this instruction's flags; 1 compute them now; 2 record
+    // them for later (CcSet) - nothing in this block reads them; 3 this is the
+    // CMP / TEST in front of the block's closing Jcc, which will do both at once.
+    const uint8_t fl = fmode == 1 ? kFlagEager : 0;
     const int ptr = is64 ? 8 : 4;
     const int rsp = Tr::R(x86emu::RSP);
 
     auto alu_op = [&](int aluop, int osz, int dst, int a, int b, bool imm, int64_t immv) {
+        const bool compare = aluop == 7 || aluop == 8;
+        if (fmode == 0 && compare) return;   // nothing to compute, nothing to write
+        if (fmode >= 2) {
+            const int kind = aluop == 0 ? 1 : (aluop == 5 || aluop == 7) ? 2
+                             : (aluop == 4 || aluop == 8) ? 3 : aluop == 1 ? 4 : 5;
+            if (fmode == 3) {   // the Jcc after this does the work
+                t.pend = {true, kind, osz, a, b, imm, immv};
+                return;
+            }
+            Op& s = t.emit(imm ? OpKind::CcSetI : OpKind::CcSet);
+            s.cc = static_cast<uint8_t>(kind); s.sz = static_cast<uint8_t>(osz);
+            s.a = a; s.b = b; s.imm = immv;
+            if (compare) return;
+        }
         Op& o = t.emit(imm ? OpKind::AluI : OpKind::Alu);
         o.cc = static_cast<uint8_t>(aluop);
         o.sz = static_cast<uint8_t>(osz);
@@ -604,6 +643,19 @@ void emit_native(Tr& t, const D& d, bool flags, uint64_t next_pc) {
         o.imm = static_cast<int64_t>(target);
     };
     auto jcc = [&](int cc, uint64_t taken, uint64_t fall) {
+        if (t.pend.valid) {
+            Op& o = t.emit(t.pend.imm ? OpKind::JccCmpI : OpKind::JccCmp);
+            o.cc = static_cast<uint8_t>(cc);
+            o.c = t.pend.kind;
+            o.sz = static_cast<uint8_t>(t.pend.sz);
+            o.a = t.pend.a;
+            o.b = t.pend.b;
+            o.d = static_cast<int32_t>(t.pend.immv);
+            o.imm = static_cast<int64_t>(taken);
+            o.imm2 = static_cast<int64_t>(fall);
+            t.pend.valid = false;
+            return;
+        }
         Op& o = t.emit(OpKind::JccFl);
         o.cc = static_cast<uint8_t>(cc);
         o.imm = static_cast<int64_t>(taken);
@@ -1023,19 +1075,53 @@ bool translate_x86(Cpu& cpu, const Engine::Slots& slots, uint64_t pc, IrBlock& o
     if (plans.empty()) return false;
 
     // Which flag writes can anyone see?  At the end of the block, everyone can.
-    std::vector<char> live_after(plans.size());
+    const size_t n = plans.size();
+    std::vector<FlagUse> fu(n);
+    for (size_t i = 0; i < n; ++i) fu[i] = flag_use(plans[i], plans[i].native);
+    std::vector<char> live_after(n);
     {
         bool live = true;
-        for (size_t i = plans.size(); i-- > 0;) {
+        for (size_t i = n; i-- > 0;) {
             live_after[i] = live;
-            FlagUse f = flag_use(plans[i], plans[i].native);
-            if (f.writes_all) live = false;
-            if (f.reads) live = true;
+            if (fu[i].writes_all) live = false;
+            if (fu[i].reads) live = true;
         }
+    }
+    // Does the block look at flags it did not itself set?  Then whatever the
+    // previous block left pending has to be settled first.
+    bool live_in = false;
+    for (size_t i = 0; i < n; ++i) {
+        if (fu[i].reads) { live_in = true; break; }
+        if (fu[i].writes_all) break;
+    }
+
+    // How each flag-writing instruction gets its flags to whoever wants them:
+    //   0 nobody does   1 computed now (a later instruction in the block reads them)
+    //   2 recorded, not computed (only whatever runs after this block can read them)
+    //   3 a CMP / TEST directly in front of the closing Jcc, which does both at once
+    std::vector<char> mode(n, 0);
+    int last_full = -1;
+    for (size_t i = 0; i < n; ++i) {
+        if (!live_after[i]) continue;
+        if (!fu[i].writes_all) { mode[i] = 1; continue; }
+        last_full = static_cast<int>(i);
+        size_t j = i + 1;
+        bool reader_later = false;
+        for (; j < n; ++j) {
+            if (fu[j].reads) { reader_later = true; break; }
+            if (fu[j].writes_all) break;
+        }
+        if (!reader_later) mode[i] = 2;
+        else if (j == i + 1 && j == n - 1 && is_jcc(plans[j]) && is_compare(plans[i])) mode[i] = 3;
+        else mode[i] = 1;
     }
 
     out.start = pc;
     Tr t(cpu, slots, is64, out);
+    if (live_in) {
+        t.cur_off = 0;
+        t.emit(OpKind::CcMat);
+    }
     uint64_t cur = pc;
     for (size_t i = 0; i < plans.size(); ++i) {
         const D& d = plans[i];
@@ -1046,7 +1132,10 @@ bool translate_x86(Cpu& cpu, const Engine::Slots& slots, uint64_t pc, IrBlock& o
         t.last = i + 1 == plans.size();
         if (d.native) {
             ++out.insns;
-            emit_native(t, d, live_after[i] != 0, next);
+            emit_native(t, d, mode[i], next);
+            // The flags the block ends with were computed outright, so anything an
+            // earlier block left pending is out of date.
+            if (static_cast<int>(i) == last_full && mode[i] == 1 && !live_in) t.emit(OpKind::CcClear);
         } else {
             Op& o = t.emit(OpKind::Interp);
             o.imm = static_cast<int64_t>(cur);

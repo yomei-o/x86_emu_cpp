@@ -23,6 +23,7 @@ class Cpu;
 namespace jit {
 
 class Engine;
+struct Uop;
 
 struct Ctx {
     uint8_t* env;
@@ -31,6 +32,8 @@ struct Ctx {
     Engine* eng;
     uint64_t epoch0;   // Engine::epoch when this block started
     int partial;       // set by an op that leaves early: native insns finished
+    bool in_interp;    // an interpreted instruction is running
+    const Uop* cur;    // the last op that could fault (memory access): where a fault happened
 };
 
 struct Uop {
@@ -59,6 +62,7 @@ public:
     ~Engine() override;
 
     bool run_block();
+    bool run(uint64_t deadline, uint64_t stop_pc, const bool* yield);
 
     // X86EMU_JIT_VERIFY=1: run every block twice - translated, then through the
     // interpreter from the same starting state - and stop at the first
@@ -113,6 +117,8 @@ private:
 
 // Per-guest-ISA translation.  The x86 one is the only implementation so far.
 bool translate_x86(x86emu::Cpu& cpu, const Engine::Slots& slots, uint64_t pc, IrBlock& out);
+// Settles deferred flags (Cpu::cc_kind) into rflags.
+void materialize_flags(x86emu::Cpu& cpu);
 // Lowers IR to something runnable.
 void compile_threaded(Engine& eng, const IrBlock& ir, Block& out);
 

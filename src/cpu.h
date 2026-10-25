@@ -150,18 +150,29 @@ public:
     // addresses them the way it addresses registers: as an offset from regs[].
     // Slot 0 is never written and always reads zero.
     uint64_t jit_tmp[48] = {};
+    // Arithmetic flags that translated code has decided but not yet computed:
+    // kind 0 means rflags is current; otherwise the flags are those of
+    // `cc_a OP cc_b` at `cc_sz` bytes (kind: 1 ADD, 2 SUB, 3 AND, 4 OR, 5 XOR).
+    // Only the translator sets it, and it is settled (jit::Engine::materialize)
+    // before anything else looks at rflags - so interpreted code never sees it.
+    uint64_t cc_a = 0, cc_b = 0;
+    uint32_t cc_kind = 0, cc_sz = 0;
     // Starts / stops the translator.  Off, nothing changes.
     void enable_jit(bool on);
     bool jit_on() const { return jit_ != nullptr; }
     // Runs the translated block at rip if there is one; false means the caller
     // should step() instead.
     bool jit_run_block();
+    // Runs translated blocks until `deadline` instructions have executed, rip
+    // reaches `stop_pc`, the guest halts, `*yield` becomes true or rip is
+    // somewhere the translator will not go.  False: nothing ran, step().
+    bool jit_run(uint64_t deadline, uint64_t stop_pc, const bool* yield);
     // Whether translated execution may be used right now: not while tracing,
     // profiling or counting, all of which are per-instruction.
     bool jit_usable() const { return jit_ != nullptr && !watching_ && !trace; }
     // One instruction, or one translated block when the JIT is on.
-    void step_fast() {
-        if (!(jit_usable() && jit_run_block())) step();
+    void step_fast(uint64_t stop_pc = ~0ull) {
+        if (!(jit_usable() && jit_run(~0ull, stop_pc, nullptr))) step();
     }
 
     // A ring buffer of the addresses of the last instructions executed, kept
