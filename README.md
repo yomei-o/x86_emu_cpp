@@ -199,6 +199,30 @@ host's environment, because a runtime finds its own installation through it. Mat
 functions go to the host's libm, which is both simpler and more accurate than
 letting the guest compute them on a double-precision x87 stack.
 
+## The JIT
+
+The interpreter is the specification; on top of it sits a block-translating JIT, on by
+default (`X86EMU_JIT=0` turns it off). Straight runs of guest instructions become a small
+register-memory IR (`src/jit/ir.h`); the IR is run by one of three backends:
+
+- **threaded** (always): each op is a handler that tail-calls the next - no decoding, no
+  width switches, flags kept lazily and compare-and-branch fused;
+- **native** (x86-64 and AArch64 hosts): a block that has run 30 times becomes machine code
+  (`backend_native.cpp` / `backend_native_a64.cpp`). Static exits jump straight to the
+  next block's code, the guest page cache is probed inline, and any op the code generator
+  does not know runs through its threaded handler, so every op works from the first day;
+- **WebAssembly** (browser and node): hot blocks are compiled into wasm modules built at run time.
+
+The front end is per guest ISA and the rest is shared, which is how `aarch64_emu_cpp` and
+`arm_emu_cpp` use the same translator. `X86EMU_JIT_VERIFY=1` runs every block twice - translated,
+then through the interpreter from the same state - and stops at the first difference; with
+`X86EMU_JIT_NATIVE_HOT=1` that checks the machine code of every block. Other knobs:
+`X86EMU_JIT_NATIVE=0`, `X86EMU_JIT_STATS=N`, `X86EMU_JIT_PROFILE=1`.
+
+On an ARM64 Windows PC, `bench64` takes 0.78 s interpreted, 0.25 s with the threaded backend and
+0.14 s with native x86-64 code (all x64 builds under Windows' emulation); the same source built
+natively for ARM64 takes 0.39 s interpreted and 0.07 s with the AArch64 backend.
+
 ## Building
 
 ```sh
@@ -445,6 +469,7 @@ emulator built for the current host and prints which host that was.
 | `src/guest_printf.cpp` | the printf engine and UTF-16 conversion |
 | `src/syscalls.cpp` | the Linux kernel interface |
 | `src/state.cpp` | writing a running guest down, and reading it back |
+| `src/jit/` | the JIT: IR, translation cache, threaded / native / WebAssembly backends, x86 front end |
 | `web/` | the WebAssembly front end and demo page |
 
 ## Current limits
