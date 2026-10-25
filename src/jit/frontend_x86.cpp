@@ -271,7 +271,16 @@ FlagUse flag_use(const D& d, bool native) {
                 case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
                 case 0x68: case 0x6A: case 0xE8: case 0xE9: case 0xEB: case 0xC3: case 0xC2:
                 case 0xC9: case 0x63: case 0x90:
+                case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0x98: case 0x99:
+                case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
+                case 0x69: case 0x6B:   // IMUL writes CF OF SF ZF PF and leaves AF: a partial write
                     f.reads = false; return f;
+                case 0xF6: case 0xF7: {
+                    int sub = d.reg & 7;
+                    if (sub < 2 || sub == 3) { f.reads = false; f.writes_all = true; }
+                    else if (sub == 2) f.reads = false;
+                    return f;
+                }
                 case 0xFF: {
                     int sub = d.reg & 7;
                     if (sub >= 2) f.reads = false;
@@ -282,7 +291,7 @@ FlagUse flag_use(const D& d, bool native) {
             if (d.op >= 0xB0 && d.op <= 0xBF) f.reads = false;
             return f;
         }
-        if (d.op == 0xB6 || d.op == 0xB7 || d.op == 0xBE || d.op == 0xBF) f.reads = false;
+        if (d.op == 0xB6 || d.op == 0xB7 || d.op == 0xBE || d.op == 0xBF || d.op == 0xAF) f.reads = false;
         return f;
     }
     // Interpreted instructions: assume the worst, except the families that are
@@ -410,6 +419,7 @@ struct Tr {
     void reg_write(const D& d, int idx, int sz, int val, bool clean) {
         if (sz == 1) { reg8_write(d, idx, val); return; }
         if (sz == 8) { if (val != R(idx)) mov(R(idx), val); return; }
+        if (sz == 2) { Op& o = emit(OpKind::Put); o.sz = 2; o.d = R(idx); o.a = R(idx); o.b = val; return; }
         // sz == 4: zero extends
         if (clean) { if (val != R(idx)) mov(R(idx), val); }
         else ext(R(idx), val, 4, false, 4);
@@ -453,6 +463,7 @@ bool is_term(const D& d) {
 bool is_native(const D& d, bool is64) {
     const int sz = d.opsize;
     const bool wide = sz == 4 || sz == 8;
+    const bool w248 = sz == 2 || sz == 4 || sz == 8;   // operand sizes the generic paths handle
     const bool a_ok = is64 || !d.a67;
     if (d.rep || d.repne) {
         // F3 90 (pause) is a nop; F2/F3 on anything else changes meaning
@@ -464,20 +475,20 @@ bool is_native(const D& d, bool is64) {
             int aluop = (op >> 3) & 7;
             if (aluop == 2 || aluop == 3) return false;
             if ((op & 7) == 0 || (op & 7) == 2 || (op & 7) == 4) return a_ok;
-            return wide && a_ok;
+            return w248 && a_ok;
         }
         switch (op) {
             case 0x80: { int a = d.reg & 7; return a != 2 && a != 3 && a_ok; }
-            case 0x81: case 0x83: { int a = d.reg & 7; return a != 2 && a != 3 && wide && a_ok; }
+            case 0x81: case 0x83: { int a = d.reg & 7; return a != 2 && a != 3 && w248 && a_ok; }
             case 0x84: return a_ok;
-            case 0x85: return wide && a_ok;
+            case 0x85: return w248 && a_ok;
             case 0x88: case 0x8A: return a_ok;
-            case 0x89: case 0x8B: return wide && a_ok;
+            case 0x89: case 0x8B: return w248 && a_ok;
             case 0x8D: return wide && d.mem && a_ok && !d.a67;
             case 0xC6: return (d.reg & 7) == 0 && a_ok;
-            case 0xC7: return (d.reg & 7) == 0 && wide && a_ok;
+            case 0xC7: return (d.reg & 7) == 0 && w248 && a_ok;
             case 0xA8: return true;
-            case 0xA9: return wide;
+            case 0xA9: return w248;
             case 0x90: return true;
             case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
             case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
@@ -486,28 +497,38 @@ bool is_native(const D& d, bool is64) {
             case 0xE8: case 0xE9: case 0xEB: case 0xC3: case 0xC2:
                 return !d.op16;
             case 0xC9: return !d.op16;
+            case 0xC0: case 0xD0: case 0xD2: return a_ok;
+            case 0xC1: case 0xD1: case 0xD3: return w248 && a_ok;
+            case 0xF6: return a_ok;
+            case 0xF7: return w248 && a_ok;
+            case 0x69: case 0x6B: return w248 && a_ok;
+            case 0xA0: case 0xA2: return a_ok && !d.a67;
+            case 0xA1: case 0xA3: return w248 && a_ok && !d.a67;
+            case 0x98: case 0x99: return wide;
+            case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: return w248;
             case 0x63: return is64 && d.rw && a_ok;
             case 0xFE: { int sub = d.reg & 7; return sub < 2 && a_ok; }
             case 0xFF: {
                 int sub = d.reg & 7;
-                if (sub < 2) return wide && a_ok;
+                if (sub < 2) return w248 && a_ok;
                 return (sub == 2 || sub == 4 || sub == 6) && !d.op16 && a_ok;
             }
             default: break;
         }
-        if (op >= 0x40 && op <= 0x4F) return !is64 && wide;
+        if (op >= 0x40 && op <= 0x4F) return !is64 && w248;
         if (op >= 0x70 && op <= 0x7F) return true;
         if (op >= 0xB0 && op <= 0xB7) return true;
-        if (op >= 0xB8 && op <= 0xBF) return wide;
+        if (op >= 0xB8 && op <= 0xBF) return w248;
         return false;
     }
     switch (d.op) {
         case 0xB6: case 0xB7: case 0xBE: case 0xBF: return wide && a_ok;
+        case 0xAF: return w248 && a_ok;
         default: break;
     }
     if (d.op >= 0x80 && d.op <= 0x8F) return true;
     if (d.op >= 0x90 && d.op <= 0x9F) return a_ok;
-    if (d.op >= 0x40 && d.op <= 0x4F) return wide && a_ok;
+    if (d.op >= 0x40 && d.op <= 0x4F) return w248 && a_ok;
     return false;
 }
 
@@ -665,7 +686,9 @@ void emit_native(Tr& t, const D& d, bool flags, uint64_t next_pc) {
             case 0xC6: case 0xC7: {
                 int osz = op == 0xC6 ? 1 : sz;
                 int v = t.newtmp();
-                t.movi(v, osz == 8 ? d.imm : (osz == 4 ? static_cast<uint32_t>(d.imm) : (d.imm & 0xFF)));
+                t.movi(v, osz == 8 ? d.imm
+                          : osz == 4 ? static_cast<int64_t>(static_cast<uint32_t>(d.imm))
+                          : osz == 2 ? (d.imm & 0xFFFF) : (d.imm & 0xFF));
                 if (!d.mem) {
                     t.reg_write(d, d.rm, osz, v, true);
                 } else {
@@ -679,6 +702,133 @@ void emit_native(Tr& t, const D& d, bool flags, uint64_t next_pc) {
             case 0x63: {
                 if (!d.mem) { t.ext(Tr::R(d.reg), Tr::R(d.rm), 4, true, 8); }
                 else { Tr::Addr ad = t.address(d); t.lds(Tr::R(d.reg), ad, 4, 8); }
+                return;
+            }
+            case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3: {   // shifts and rotates
+                const int osz = (op & 1) ? sz : 1;
+                const int sub = d.reg & 7;
+                const bool bycl = op == 0xD2 || op == 0xD3;
+                const int64_t cnt = (op == 0xD0 || op == 0xD1) ? 1 : (d.imm & 0xFF);
+                auto shift_op = [&](int dst, int a) {
+                    if (sub >= 4) {
+                        Op& o = t.emit(bycl ? OpKind::Shift : OpKind::ShiftI);
+                        o.cc = static_cast<uint8_t>(sub == 6 ? 4 : sub);
+                        o.sz = static_cast<uint8_t>(osz);
+                        o.d = dst; o.a = a; o.flags = fl;
+                        if (bycl) o.b = Tr::R(x86emu::RCX); else o.imm = cnt;
+                    } else {
+                        int cs = Tr::R(x86emu::RCX);
+                        if (!bycl) { cs = t.newtmp(); t.movi(cs, cnt); }
+                        Op& o = t.emit(OpKind::ShiftSlow);
+                        o.cc = static_cast<uint8_t>(sub); o.sz = static_cast<uint8_t>(osz);
+                        o.d = dst; o.a = a; o.b = cs;
+                    }
+                };
+                if (!d.mem) {
+                    int a = t.reg_read(d, d.rm, osz);
+                    if (osz >= 4) shift_op(Tr::R(d.rm), a);
+                    else { int r = t.newtmp(); shift_op(r, a); t.reg_write(d, d.rm, osz, r, true); }
+                } else {
+                    Tr::Addr ad = t.address(d);
+                    int v = t.newtmp();
+                    t.ld(v, ad, osz);
+                    shift_op(v, v);
+                    t.st(ad, v, osz);
+                    t.flush_check(next_pc);
+                }
+                return;
+            }
+            case 0xF6: case 0xF7: {   // group 3
+                const int osz = op == 0xF6 ? 1 : sz;
+                const int sub = d.reg & 7;
+                if (sub < 2) { alu_rm(8, osz, 0, true, d.imm); return; }
+                if (sub == 2 || sub == 3) {
+                    auto unary = [&](int dst, int a) {
+                        if (sub == 2) {
+                            Op& o = t.emit(OpKind::AluI);
+                            o.cc = 6; o.sz = static_cast<uint8_t>(osz); o.d = dst; o.a = a; o.imm = -1;
+                        } else {
+                            alu_op(5, osz, dst, t.s.zero, a, false, 0);   // 0 - a
+                        }
+                    };
+                    if (!d.mem) {
+                        int a = t.reg_read(d, d.rm, osz);
+                        if (osz >= 4) unary(Tr::R(d.rm), a);
+                        else { int r = t.newtmp(); unary(r, a); t.reg_write(d, d.rm, osz, r, true); }
+                    } else {
+                        Tr::Addr ad = t.address(d);
+                        int v = t.newtmp();
+                        t.ld(v, ad, osz);
+                        unary(v, v);
+                        t.st(ad, v, osz);
+                        t.flush_check(next_pc);
+                    }
+                    return;
+                }
+                // MUL / IMUL / DIV / IDIV through the interpreter's own code
+                if (!d.mem) {
+                    Op& o = t.emit(OpKind::Group3);
+                    o.cc = static_cast<uint8_t>(sub); o.sz = static_cast<uint8_t>(osz);
+                    o.d = d.rm; o.imm = static_cast<int64_t>(next_pc);
+                    o.flags = d.rex ? kFlagRex : 0;
+                } else {
+                    Tr::Addr ad = t.address(d);
+                    int a = t.newtmp();
+                    Op& l = t.emit(OpKind::Lea);
+                    l.d = a; l.a = ad.a; l.c = ad.c; l.cc = static_cast<uint8_t>(ad.cc); l.imm = ad.imm;
+                    l.sz = ad.a32 ? 4 : 8;
+                    Op& o = t.emit(OpKind::Group3);
+                    o.cc = static_cast<uint8_t>(sub); o.sz = static_cast<uint8_t>(osz);
+                    o.a = a; o.imm = static_cast<int64_t>(next_pc);
+                    o.flags = static_cast<uint8_t>(kFlagMem | (d.rex ? kFlagRex : 0));
+                }
+                return;
+            }
+            case 0x69: case 0x6B: {   // IMUL r, r/m, imm
+                int src = t.rm_read(d, sz);
+                int dst = sz >= 4 ? Tr::R(d.reg) : t.newtmp();
+                Op& o = t.emit(OpKind::ImulI);
+                o.sz = static_cast<uint8_t>(sz); o.d = dst; o.a = src; o.imm = d.imm; o.flags = fl;
+                if (sz == 2) t.reg_write(d, d.reg, 2, dst, true);
+                return;
+            }
+            case 0xA0: case 0xA1: case 0xA2: case 0xA3: {   // MOV AL/eAX, moffs and back
+                const int osz = (op & 1) ? sz : 1;
+                D dd = d;
+                dd.base = -1; dd.idx = -1; dd.scale = 0; dd.riprel = false; dd.mem = true;
+                dd.disp = is64 ? d.imm : static_cast<int64_t>(static_cast<uint32_t>(d.imm));
+                Tr::Addr ad = t.address(dd);
+                if (op < 0xA2) {
+                    if (osz >= 4) t.ld(Tr::R(0), ad, osz);
+                    else { int v = t.newtmp(); t.ld(v, ad, osz); t.reg_write(d, 0, osz, v, true); }
+                } else {
+                    t.st(ad, t.reg_read(d, 0, osz), osz);
+                    t.flush_check(next_pc);
+                }
+                return;
+            }
+            case 0x98:   // CWDE / CDQE
+                if (sz == 8) t.ext(Tr::R(0), Tr::R(0), 4, true, 8);
+                else t.ext(Tr::R(0), Tr::R(0), 2, true, 4);
+                return;
+            case 0x99: {   // CDQ / CQO
+                int tt = t.newtmp();
+                if (sz == 8) {
+                    t.bini(OpKind::SarI, tt, Tr::R(0), 63);
+                    t.mov(Tr::R(2), tt);
+                } else {
+                    t.ext(tt, Tr::R(0), 4, true, 8);
+                    t.bini(OpKind::SarI, tt, tt, 63);
+                    t.ext(Tr::R(2), tt, 4, false, 4);
+                }
+                return;
+            }
+            case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: {   // XCHG eAX, r
+                int r = (d.rb ? 8 : 0) | (op & 7);
+                int old = t.newtmp();
+                t.mov(old, Tr::R(0));
+                t.reg_write(d, 0, sz, Tr::R(r), false);
+                t.reg_write(d, r, sz, old, false);
                 return;
             }
             case 0xC9: {   // LEAVE
@@ -774,8 +924,10 @@ void emit_native(Tr& t, const D& d, bool flags, uint64_t next_pc) {
         }
         if (op >= 0x40 && op <= 0x4F) {   // 32-bit INC/DEC reg
             int r = op & 7;
+            int dst = sz == 2 ? t.newtmp() : Tr::R(r);
             Op& o = t.emit(OpKind::IncDec);
-            o.cc = op >= 0x48; o.sz = static_cast<uint8_t>(sz); o.d = Tr::R(r); o.a = Tr::R(r); o.flags = fl;
+            o.cc = op >= 0x48; o.sz = static_cast<uint8_t>(sz); o.d = dst; o.a = Tr::R(r); o.flags = fl;
+            if (sz == 2) t.reg_write(d, r, 2, dst, true);
             return;
         }
         if (op >= 0x70 && op <= 0x7F) { jcc(op & 15, next_pc + static_cast<uint64_t>(d.imm), next_pc); return; }
@@ -789,6 +941,7 @@ void emit_native(Tr& t, const D& d, bool flags, uint64_t next_pc) {
         if (op >= 0xB8 && op <= 0xBF) {
             int r = (d.rb ? 8 : 0) | (op & 7);
             if (sz == 8) { t.movi(Tr::R(r), d.imm); }
+            else if (sz == 2) { int v = t.newtmp(); t.movi(v, d.imm & 0xFFFF); t.reg_write(d, r, 2, v, true); }
             else t.movi(Tr::R(r), static_cast<uint32_t>(d.imm));
             return;
         }
@@ -803,6 +956,14 @@ void emit_native(Tr& t, const D& d, bool flags, uint64_t next_pc) {
         Op& o = t.emit(OpKind::SetFl); o.d = v; o.cc = op & 15;
         if (!d.mem) { t.reg8_write(d, d.rm, v); }
         else { Tr::Addr ad = t.address(d); t.st(ad, v, 1); t.flush_check(next_pc); }
+        return;
+    }
+    if (op == 0xAF) {   // IMUL r, r/m
+        int src = t.rm_read(d, sz);
+        int dst = sz >= 4 ? Tr::R(d.reg) : t.newtmp();
+        Op& o = t.emit(OpKind::Imul);
+        o.sz = static_cast<uint8_t>(sz); o.d = dst; o.a = Tr::R(d.reg); o.b = src; o.flags = fl;
+        if (sz == 2) t.reg_write(d, d.reg, 2, dst, true);
         return;
     }
     if (op >= 0x40 && op <= 0x4F) {   // CMOVcc

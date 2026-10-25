@@ -16,6 +16,23 @@
 
 namespace jit {
 
+// Friend of Cpu: the few places where translated code calls the interpreter's
+// own private routines rather than re-implement them.
+struct Access {
+    static uint64_t shift(x86emu::Cpu& c, int op, uint64_t v, uint64_t count, int size) {
+        return c.shift(op, v, count, size);
+    }
+    static void group3(x86emu::Cpu& c, bool is_reg, int reg, uint64_t addr, int size, int op,
+                       bool rex) {
+        x86emu::Cpu::RM rm;
+        rm.is_reg = is_reg;
+        rm.reg = static_cast<uint8_t>(reg);
+        rm.addr = addr;
+        c.pfx_.has_rex = rex;
+        c.group3(rm, size, op);
+    }
+};
+
 namespace {
 
 using x86emu::Cpu;
@@ -187,6 +204,107 @@ const Uop* h_incdec(Ctx* c, const Uop* u) {
     return u + 1;
 }
 
+const Uop* h_shli(Ctx* c, const Uop* u) { S(u->d) = S(u->a) << (u->imm & 63); return u + 1; }
+const Uop* h_shri(Ctx* c, const Uop* u) { S(u->d) = S(u->a) >> (u->imm & 63); return u + 1; }
+const Uop* h_sari(Ctx* c, const Uop* u) {
+    S(u->d) = static_cast<uint64_t>(static_cast<int64_t>(S(u->a)) >> (u->imm & 63));
+    return u + 1;
+}
+
+template <int SZ>
+inline int64_t sext_sz(uint64_t v) {
+    if (SZ == 1) return static_cast<int8_t>(v);
+    if (SZ == 2) return static_cast<int16_t>(v);
+    if (SZ == 4) return static_cast<int32_t>(v);
+    return static_cast<int64_t>(v);
+}
+
+// CF OF SF ZF PF written, AF left alone: what the shifts and IMUL do.
+inline void flags_cfof_szp(Ctx* c, uint64_t cf, uint64_t of, uint64_t r, uint64_t sign) {
+    uint64_t fl = cf | (of ? 0x800 : 0) | kParity.v[r & 0xFF] | (r == 0 ? 0x40 : 0) |
+                  ((r & sign) ? 0x80 : 0);
+    uint64_t& rf = S(c->eng->slots.rflags);
+    rf = (rf & ~0x8C5ull) | fl;
+}
+
+// OP: 4 SHL, 5 SHR, 7 SAR
+template <int OP, int SZ, bool FL, bool IMM>
+const Uop* h_shift(Ctx* c, const Uop* u) {
+    constexpr uint64_t M = mask_of<SZ>();
+    constexpr uint64_t SG = sign_of<SZ>();
+    constexpr uint64_t bits = SZ * 8;
+    constexpr uint64_t cmask = SZ == 8 ? 0x3F : 0x1F;
+    const uint64_t v = S(u->a) & M;
+    const uint64_t cnt = (IMM ? static_cast<uint64_t>(u->imm) : S(u->b)) & cmask;
+    if (cnt == 0) {
+        S(u->d) = v;
+        return u + 1;
+    }
+    uint64_t r, cf, of;
+    if (OP == 4) {
+        cf = cnt > bits ? 0 : ((v >> (bits - cnt)) & 1);
+        r = cnt >= bits ? 0 : ((v << cnt) & M);
+        of = cf != ((r & SG) != 0);
+    } else if (OP == 5) {
+        cf = (v >> (cnt - 1)) & 1;
+        r = cnt >= bits ? 0 : (v >> cnt);
+        of = (v & SG) != 0;
+    } else {
+        int64_t sv = sext_sz<SZ>(v);
+        uint64_t sh = cnt >= bits ? bits - 1 : cnt;
+        cf = (static_cast<uint64_t>(sv >> (sh ? sh - 1 : 0))) & 1;
+        r = static_cast<uint64_t>(sv >> sh) & M;
+        of = 0;
+    }
+    S(u->d) = r;
+    if (FL) flags_cfof_szp(c, cf, of, r, SG);
+    return u + 1;
+}
+
+const Uop* h_shift_slow(Ctx* c, const Uop* u) {
+    uint64_t v = S(u->a);
+    S(u->d) = Access::shift(*c->cpu, u->cc, v, S(u->b) & 0xFF, u->sz);
+    return u + 1;
+}
+
+template <int SZ, bool FL, bool IMM>
+const Uop* h_imul(Ctx* c, const Uop* u) {
+    constexpr uint64_t M = mask_of<SZ>();
+    constexpr uint64_t SG = sign_of<SZ>();
+    int64_t a = sext_sz<SZ>(S(u->a) & M);
+    int64_t b = IMM ? sext_sz<SZ>(static_cast<uint64_t>(u->imm) & M) : sext_sz<SZ>(S(u->b) & M);
+    uint64_t r;
+    bool trunc;
+    if (SZ == 8) {
+#ifdef __SIZEOF_INT128__
+        __int128 w = static_cast<__int128>(a) * b;
+        r = static_cast<uint64_t>(w);
+        trunc = w != static_cast<__int128>(static_cast<int64_t>(r));
+#else
+        // |a|, |b| < 2^63: the product overflows 64 bits iff it exceeds it
+        // in magnitude; check through division.
+        r = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+        int64_t sr = static_cast<int64_t>(r);
+        trunc = (a != 0 && ((a == -1 && b == INT64_MIN) || (b == -1 && a == INT64_MIN) ||
+                            (a != -1 && sr / a != b)));
+#endif
+    } else {
+        int64_t res = a * b;
+        r = static_cast<uint64_t>(res) & M;
+        trunc = res != sext_sz<SZ>(r);
+    }
+    S(u->d) = r;
+    if (FL) flags_cfof_szp(c, trunc ? 1 : 0, trunc ? 1 : 0, r, SG);
+    return u + 1;
+}
+
+const Uop* h_group3(Ctx* c, const Uop* u) {
+    c->cpu->rip = static_cast<uint64_t>(u->imm);
+    bool mem = (u->flags & kFlagMem) != 0;
+    Access::group3(*c->cpu, !mem, u->d, mem ? S(u->a) : 0, u->sz, u->cc, (u->flags & kFlagRex) != 0);
+    return u + 1;
+}
+
 template <int CC>
 inline bool test_cc(uint64_t rf) {
     bool cf = rf & 1, pf = rf & 4, zf = rf & 0x40, sf = rf & 0x80, of = rf & 0x800;
@@ -299,6 +417,44 @@ Fn pick_st_a(bool a32) { return a32 ? &h_st<SZ, true> : &h_st<SZ, false>; }
 template <int SZ, int DST>
 Fn pick_lds_a(bool a32) { return a32 ? &h_lds<SZ, true, DST> : &h_lds<SZ, false, DST>; }
 
+template <int OP, bool FL, bool IMM>
+Fn pick_shift_sz(int sz) {
+    switch (sz) {
+        case 1: return &h_shift<OP, 1, FL, IMM>;
+        case 2: return &h_shift<OP, 2, FL, IMM>;
+        case 4: return &h_shift<OP, 4, FL, IMM>;
+        default: return &h_shift<OP, 8, FL, IMM>;
+    }
+}
+
+template <int OP>
+Fn pick_shift_op(int sz, bool fl, bool imm) {
+    if (fl) return imm ? pick_shift_sz<OP, true, true>(sz) : pick_shift_sz<OP, true, false>(sz);
+    return imm ? pick_shift_sz<OP, false, true>(sz) : pick_shift_sz<OP, false, false>(sz);
+}
+
+Fn pick_shift(int op, int sz, bool fl, bool imm) {
+    switch (op) {
+        case 4: return pick_shift_op<4>(sz, fl, imm);
+        case 5: return pick_shift_op<5>(sz, fl, imm);
+        default: return pick_shift_op<7>(sz, fl, imm);
+    }
+}
+
+template <bool FL, bool IMM>
+Fn pick_imul_fl(int sz) {
+    switch (sz) {
+        case 2: return &h_imul<2, FL, IMM>;
+        case 4: return &h_imul<4, FL, IMM>;
+        default: return &h_imul<8, FL, IMM>;
+    }
+}
+
+Fn pick_imul(int sz, bool fl, bool imm) {
+    if (fl) return imm ? pick_imul_fl<true, true>(sz) : pick_imul_fl<true, false>(sz);
+    return imm ? pick_imul_fl<false, true>(sz) : pick_imul_fl<false, false>(sz);
+}
+
 Fn pick_cc(int cc, int which) {
 #define CASE(N) case N: return which == 0 ? &h_setfl<N> : &h_jccfl<N>;
     switch (cc & 15) {
@@ -369,6 +525,15 @@ Fn select(const Op& o) {
         case OpKind::AluI: return pick_alu(o.cc, o.sz, fl, true);
         case OpKind::IncDec: return o.cc ? (fl ? pick_incdec_sz<true, true>(o.sz) : pick_incdec_sz<true, false>(o.sz))
                                           : (fl ? pick_incdec_sz<false, true>(o.sz) : pick_incdec_sz<false, false>(o.sz));
+        case OpKind::ShlI: return h_shli;
+        case OpKind::ShrI: return h_shri;
+        case OpKind::SarI: return h_sari;
+        case OpKind::Shift: return pick_shift(o.cc, o.sz, fl, false);
+        case OpKind::ShiftI: return pick_shift(o.cc, o.sz, fl, true);
+        case OpKind::ShiftSlow: return h_shift_slow;
+        case OpKind::Imul: return pick_imul(o.sz, fl, false);
+        case OpKind::ImulI: return pick_imul(o.sz, fl, true);
+        case OpKind::Group3: return h_group3;
         case OpKind::Interp: return h_interp;
         case OpKind::ChkFlush: return h_chkflush;
     }

@@ -56,6 +56,21 @@ enum class OpKind : uint8_t {
     Alu, AluI,
     // INC/DEC (cc = 0 / 1): CF is preserved
     IncDec,
+    // d = a << imm, a >> imm (logical / arithmetic), 64-bit
+    ShlI, ShrI, SarI,
+    // x86 shifts SHL SHR SAR (cc = 4, 5, 7) of the low `sz` bytes of a by the
+    // count in slot b (Shift) or in imm (ShiftI).  The count is masked as the
+    // hardware does; a count of zero changes no flag.  kFlagEager sets CF OF
+    // SF ZF PF and leaves AF alone.
+    Shift, ShiftI,
+    // Rotates (cc = 0 ROL, 1 ROR, 2 RCL, 3 RCR): the interpreter's own code
+    ShiftSlow,
+    // d = a * b (signed, low sz bytes).  kFlagEager: CF = OF = overflow, SF ZF PF
+    // from the result, AF untouched.  ImulI takes the multiplier in imm.
+    Imul, ImulI,
+    // MUL / IMUL / DIV / IDIV on rAX (cc = 4..7), through the interpreter's code.
+    // The operand is register d, or the memory at slot a with kFlagMem set.
+    Group3,
     // Run the guest instruction at (block start + pc) with the interpreter.
     // imm2 = the address the block expects to be at afterwards; anything else
     // ends the block.
@@ -81,6 +96,8 @@ enum : uint8_t {
     kFlagEager = 1,   // compute the guest flags too
     kFlagA32 = 2,     // addresses wrap at 32 bits
     kFlagSigned = 4,  // Ext: sign extend
+    kFlagMem = 8,     // Group3: the operand is in memory
+    kFlagRex = 16,    // Group3: a REX prefix was present (byte register numbering)
 };
 
 struct IrBlock {
