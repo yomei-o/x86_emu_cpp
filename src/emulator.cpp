@@ -19,10 +19,10 @@ extern "C" char** environ;
 
 namespace x86emu {
 
-// X86EMU_JIT=1 turns on the block translator (src/jit).  Off unless asked for.
+// The block translator (src/jit) is on; X86EMU_JIT=0 turns it off.
 static bool jit_wanted() {
     const char* v = std::getenv("X86EMU_JIT");
-    return v && v[0] == '1';
+    return !(v && v[0] == '0');
 }
 
 Emulator::Emulator(Options opt) : opt_(opt) {}
