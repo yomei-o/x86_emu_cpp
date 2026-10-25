@@ -85,6 +85,10 @@ public:
     // Statistics (X86EMU_JIT_STATS=1)
     uint64_t n_translated = 0, n_blocks_run = 0, n_insns_native = 0, n_invalidated = 0;
     uint64_t n_stub_hits = 0;
+    uint64_t stats_every_ = 0;   // X86EMU_JIT_STATS=N prints every N blocks
+    uint64_t n_interp = 0;
+    uint64_t interp_ops[512] = {};   // which interpreted opcodes ran (0F xx at 256+xx)
+    void print_stats();
 
     x86emu::Cpu& cpu;
     x86emu::Memory& mem;

@@ -23,17 +23,33 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
     slots.fs_base = off(&cpu.fs_base);
     slots.gs_base = off(&cpu.gs_base);
     mem.set_code_observer(this);
+    if (const char* sv = std::getenv("X86EMU_JIT_STATS")) {
+        stats_every_ = std::strtoull(sv, nullptr, 10);
+        static Engine* first = this;
+        std::atexit([] { first->print_stats(); });
+    }
     if (const char* v = std::getenv("X86EMU_JIT_VERIFY")) verify = v[0] == '1';
 }
 
 Engine::~Engine() {
     mem.set_code_observer(nullptr);
-    if (std::getenv("X86EMU_JIT_STATS")) {
-        std::fprintf(stderr,
-                     "[jit] translated %llu blocks, ran %llu (%llu native insns), invalidated %llu, stub hits %llu\n",
-                     (unsigned long long)n_translated, (unsigned long long)n_blocks_run,
-                     (unsigned long long)n_insns_native, (unsigned long long)n_invalidated,
-                     (unsigned long long)n_stub_hits);
+    if (std::getenv("X86EMU_JIT_STATS")) print_stats();
+}
+
+void Engine::print_stats() {
+    std::fprintf(stderr,
+                 "[jit] translated %llu blocks, ran %llu (%llu native insns, %llu interpreted), invalidated %llu, stub hits %llu\n",
+                 (unsigned long long)n_translated, (unsigned long long)n_blocks_run,
+                 (unsigned long long)n_insns_native, (unsigned long long)n_interp,
+                 (unsigned long long)n_invalidated, (unsigned long long)n_stub_hits);
+    for (int k = 0; k < 14; ++k) {
+        int best = -1;
+        for (int i = 0; i < 512; ++i)
+            if (interp_ops[i] && (best < 0 || interp_ops[i] > interp_ops[best])) best = i;
+        if (best < 0) break;
+        std::fprintf(stderr, "[jit]   interp %s%02X  %llu\n", best >= 256 ? "0F " : "", best & 255,
+                     (unsigned long long)interp_ops[best]);
+        interp_ops[best] = 0;
     }
 }
 
@@ -136,6 +152,7 @@ bool Engine::run_plain(Block* b) {
     const uint32_t done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
     cpu.instructions_executed += done;
     ++n_blocks_run;
+    if (stats_every_ && n_blocks_run % stats_every_ == 0) print_stats();
     n_insns_native += done;
     return true;
 }

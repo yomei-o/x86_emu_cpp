@@ -236,6 +236,8 @@ const Uop* h_chkflush(Ctx* c, const Uop* u) {
 const Uop* h_interp(Ctx* c, const Uop* u) {
     Cpu* cpu = c->cpu;
     cpu->rip = static_cast<uint64_t>(u->imm);
+    ++c->eng->n_interp;
+    ++c->eng->interp_ops[u->c & 0x1FF];
     cpu->step();
     if (cpu->rip != static_cast<uint64_t>(u->imm2) || cpu->halted || c->eng->epoch != c->epoch0) {
         c->partial = u->ni;
