@@ -38,12 +38,6 @@ Engine::~Engine() {
 // Where the time goes, from the blocks' run counts: the ops executed by kind, and
 // the hottest blocks with the ops they are made of.
 void Engine::print_profile() {
-    static const char* names[] = {"Nop", "Mov", "MovI", "Add", "AddI", "Sub", "SubI", "And", "AndI", "Or",
-        "OrI", "Xor", "XorI", "Lea", "Ext", "Put", "GetH", "Ld", "LdS", "St", "Sel", "SetFl", "Exit",
-        "ExitInd", "JccFl", "Alu", "AluI", "IncDec", "ShlI", "ShrI", "SarI", "Shift", "ShiftI", "ShiftSlow",
-        "Imul", "ImulI", "Group3", "CcSet", "CcSetI", "CcMat", "CcClear", "JccCmp", "JccCmpI", "Push", "PushI", "Pop", "Ret", "Call", "Interp",
-        "ChkFlush"};
-    constexpr size_t kNames = sizeof names / sizeof names[0];
     std::vector<uint64_t> by_kind(256, 0);
     uint64_t total_ops = 0, total_hits = 0;
     std::vector<Block*> blocks;
@@ -59,7 +53,7 @@ void Engine::print_profile() {
     for (int k = 0; k < 256; ++k) if (by_kind[k]) order.push_back(k);
     std::sort(order.begin(), order.end(), [&](int a, int b) { return by_kind[a] > by_kind[b]; });
     for (size_t i = 0; i < order.size() && i < 24; ++i)
-        std::fprintf(stderr, "[prof]   %-10s %5.1f%%\n", order[i] < (int)kNames ? names[order[i]] : "?",
+        std::fprintf(stderr, "[prof]   %-10s %5.1f%%\n", op_name(static_cast<OpKind>(order[i])),
                      100.0 * double(by_kind[order[i]]) / double(total_ops));
     std::sort(blocks.begin(), blocks.end(), [](Block* a, Block* b) {
         return a->hits * a->code.size() > b->hits * b->code.size();
@@ -69,7 +63,7 @@ void Engine::print_profile() {
         std::fprintf(stderr, "[prof] block %llX  runs %llu  insns %u  ops:", (unsigned long long)b->start,
                      (unsigned long long)b->hits, b->insns);
         for (const Uop& u : b->code)
-            std::fprintf(stderr, " %s", u.kind < kNames ? names[u.kind] : "?");
+            std::fprintf(stderr, " %s", op_name(static_cast<OpKind>(u.kind)));
         std::fprintf(stderr, "\n");
     }
 }
@@ -80,10 +74,10 @@ void Engine::print_stats() {
     {
         std::fprintf(stderr, "[jit] wasm tier: %llu blocks in %llu modules; ops left to the threaded handlers:",
                      (unsigned long long)n_wasm_blocks, (unsigned long long)n_wasm_modules);
-        for (size_t k = 0; k < 64; ++k)
+        for (size_t k = 0; k < 128; ++k)
             if (wasm_fallbacks[k]) std::fprintf(stderr, " #%zu x%llu", k, (unsigned long long)wasm_fallbacks[k]);
         std::fprintf(stderr, "\n[jit] fallback runs:");
-        for (size_t k = 0; k < 64; ++k)
+        for (size_t k = 0; k < 128; ++k)
             if (generic_calls[k]) std::fprintf(stderr, " #%zu x%llu", k, (unsigned long long)generic_calls[k]);
         std::fprintf(stderr, "\n");
     }
@@ -114,7 +108,7 @@ Block* Engine::lookup(uint64_t pc) {
 }
 
 Block* Engine::translate(uint64_t pc) {
-    const uint64_t page = pc >> Memory::kPageBits;
+    const uint64_t page = pc >> kCodeBits;
     auto blk = std::make_unique<Block>();
     blk->start = pc;
     blk->page = page;

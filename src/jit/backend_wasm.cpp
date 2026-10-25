@@ -42,19 +42,19 @@ using Memory = GMemory;
 
 uint64_t wr_read(Memory* m, uint64_t addr, uint32_t size) {
     switch (size) {
-        case 1: return m->read8(addr);
-        case 2: return m->read16(addr);
-        case 4: return m->read32(addr);
-        default: return m->read64(addr);
+        case 1: return Glue::rd8(*m, addr);
+        case 2: return Glue::rd16(*m, addr);
+        case 4: return Glue::rd32(*m, addr);
+        default: return Glue::rd64(*m, addr);
     }
 }
 
 void wr_write(Memory* m, uint64_t addr, uint32_t size, uint64_t v) {
     switch (size) {
-        case 1: m->write8(addr, static_cast<uint8_t>(v)); break;
-        case 2: m->write16(addr, static_cast<uint16_t>(v)); break;
-        case 4: m->write32(addr, static_cast<uint32_t>(v)); break;
-        default: m->write64(addr, v); break;
+        case 1: Glue::wr8(*m, addr, static_cast<uint8_t>(v)); break;
+        case 2: Glue::wr16(*m, addr, static_cast<uint16_t>(v)); break;
+        case 4: Glue::wr32(*m, addr, static_cast<uint32_t>(v)); break;
+        default: Glue::wr64(*m, addr, v); break;
     }
 }
 
@@ -122,8 +122,8 @@ void Engine::wasm_compile_pending() {
     blocks.swap(wasm_pending_);
 
     Env env;
-    env.tlb_read = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mem.tlb_read_base()));
-    env.tlb_write = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mem.tlb_write_base()));
+    env.tlb_read = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Glue::tlb_read_base(mem)));
+    env.tlb_write = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Glue::tlb_write_base(mem)));
     env.mem_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
     env.epoch_addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&epoch));
     env.read_fn = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&wr_read));

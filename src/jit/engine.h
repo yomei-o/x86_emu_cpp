@@ -127,8 +127,8 @@ public:
     uint32_t wasm_batch = 32;
     std::vector<Block*> wasm_pending_;
     uint64_t n_wasm_blocks = 0, n_wasm_modules = 0;
-    uint64_t wasm_fallbacks[64] = {};   // ops the wasm tier runs through their threaded handler, by kind
-    uint64_t generic_calls[64] = {};    // ...and how many times each was actually run that way
+    uint64_t wasm_fallbacks[128] = {};   // ops the wasm tier runs through their threaded handler, by kind
+    uint64_t generic_calls[128] = {};    // ...and how many times each was actually run that way
 
 private:
     bool run_plain(Block* b);

@@ -83,10 +83,10 @@ const Uop* h_ld(Ctx* c, const Uop* u) {
     c->cur = u;
     uint64_t a = ea<A32>(c, u);
     uint64_t v;
-    if (SZ == 1) v = c->mem->read8(a);
-    else if (SZ == 2) v = c->mem->read16(a);
-    else if (SZ == 4) v = c->mem->read32(a);
-    else v = c->mem->read64(a);
+    if (SZ == 1) v = Glue::rd8(*c->mem, a);
+    else if (SZ == 2) v = Glue::rd16(*c->mem, a);
+    else if (SZ == 4) v = Glue::rd32(*c->mem, a);
+    else v = Glue::rd64(*c->mem, a);
     S(u->d) = v;
     NEXT();
 }
@@ -97,9 +97,9 @@ const Uop* h_lds(Ctx* c, const Uop* u) {
     c->cur = u;
     uint64_t a = ea<A32>(c, u);
     int64_t v;
-    if (SZ == 1) v = static_cast<int8_t>(c->mem->read8(a));
-    else if (SZ == 2) v = static_cast<int16_t>(c->mem->read16(a));
-    else v = static_cast<int32_t>(c->mem->read32(a));
+    if (SZ == 1) v = static_cast<int8_t>(Glue::rd8(*c->mem, a));
+    else if (SZ == 2) v = static_cast<int16_t>(Glue::rd16(*c->mem, a));
+    else v = static_cast<int32_t>(Glue::rd32(*c->mem, a));
     S(u->d) = static_cast<uint64_t>(v) & mask_of<DST>();
     NEXT();
 }
@@ -109,12 +109,41 @@ const Uop* h_st(Ctx* c, const Uop* u) {
     c->cur = u;
     uint64_t a = ea<A32>(c, u);
     uint64_t v = S(u->b);
-    if (SZ == 1) c->mem->write8(a, static_cast<uint8_t>(v));
-    else if (SZ == 2) c->mem->write16(a, static_cast<uint16_t>(v));
-    else if (SZ == 4) c->mem->write32(a, static_cast<uint32_t>(v));
-    else c->mem->write64(a, v);
+    if (SZ == 1) Glue::wr8(*c->mem, a, static_cast<uint8_t>(v));
+    else if (SZ == 2) Glue::wr16(*c->mem, a, static_cast<uint16_t>(v));
+    else if (SZ == 4) Glue::wr32(*c->mem, a, static_cast<uint32_t>(v));
+    else Glue::wr64(*c->mem, a, v);
     CHK_FLUSH();
     NEXT();
+}
+
+// ---- generic integer operations ----------------------------------------------
+
+template <BinOp OP, int SZ>
+const Uop* h_bin(Ctx* c, const Uop* u) {
+    S(u->d) = bin_eval<OP, SZ>(S(u->a), S(u->b));
+    NEXT();
+}
+template <BinOp OP, int SZ>
+const Uop* h_bini(Ctx* c, const Uop* u) {
+    S(u->d) = bin_eval<OP, SZ>(S(u->a), static_cast<uint64_t>(u->imm));
+    NEXT();
+}
+template <UnOp OP, int SZ>
+const Uop* h_un(Ctx* c, const Uop* u) {
+    S(u->d) = un_eval<OP, SZ>(S(u->a));
+    NEXT();
+}
+template <Cond C, int SZ>
+const Uop* h_jccgen(Ctx* c, const Uop* u) {
+    Glue::set_pc(*c->cpu, static_cast<uint64_t>(cond_eval<C, SZ>(S(u->a), S(u->b)) ? u->imm : u->imm2));
+    return nullptr;
+}
+template <Cond C, int SZ>
+const Uop* h_jccgeni(Ctx* c, const Uop* u) {
+    Glue::set_pc(*c->cpu, static_cast<uint64_t>(
+        cond_eval<C, SZ>(S(u->a), static_cast<uint64_t>(static_cast<int64_t>(u->d))) ? u->imm : u->imm2));
+    return nullptr;
 }
 
 // ---- exits ----------------------------------------------------------------
@@ -150,6 +179,49 @@ const Uop* h_interp(Ctx* c, const Uop* u) {
 }
 
 // ---- selection -------------------------------------------------------------
+
+template <BinOp OP>
+Fn pick_bin_sz(int sz, bool imm) {
+    if (sz == 4) return imm ? &h_bini<OP, 4> : &h_bin<OP, 4>;
+    return imm ? &h_bini<OP, 8> : &h_bin<OP, 8>;
+}
+Fn pick_bin(int op, int sz, bool imm) {
+#define BCASE(O) case BinOp::O: return pick_bin_sz<BinOp::O>(sz, imm);
+    switch (static_cast<BinOp>(op)) {
+        BCASE(Add) BCASE(Sub) BCASE(And) BCASE(Or) BCASE(Xor) BCASE(Andn) BCASE(Orn) BCASE(Eon)
+        BCASE(Mul) BCASE(Shl) BCASE(Shr) BCASE(Sar) BCASE(Ror) BCASE(UDiv0) BCASE(SDiv0)
+    }
+#undef BCASE
+    return nullptr;
+}
+
+template <UnOp OP>
+Fn pick_un_sz(int sz) { return sz == 4 ? &h_un<OP, 4> : &h_un<OP, 8>; }
+Fn pick_un(int op, int sz) {
+    switch (static_cast<UnOp>(op)) {
+        case UnOp::Clz: return pick_un_sz<UnOp::Clz>(sz);
+        case UnOp::Rbit: return pick_un_sz<UnOp::Rbit>(sz);
+        case UnOp::Rev: return pick_un_sz<UnOp::Rev>(sz);
+        case UnOp::Rev16: return pick_un_sz<UnOp::Rev16>(sz);
+        case UnOp::Rev32: return pick_un_sz<UnOp::Rev32>(sz);
+    }
+    return nullptr;
+}
+
+template <Cond C>
+Fn pick_jcc_sz(int sz, bool imm) {
+    if (sz == 4) return imm ? &h_jccgeni<C, 4> : &h_jccgen<C, 4>;
+    return imm ? &h_jccgeni<C, 8> : &h_jccgen<C, 8>;
+}
+Fn pick_jccgen(int cc, int sz, bool imm) {
+#define JCASE(C) case Cond::C: return pick_jcc_sz<Cond::C>(sz, imm);
+    switch (static_cast<Cond>(cc)) {
+        JCASE(Eq) JCASE(Ne) JCASE(Ltu) JCASE(Geu) JCASE(Leu) JCASE(Gtu)
+        JCASE(Lts) JCASE(Ges) JCASE(Les) JCASE(Gts) JCASE(Tst) JCASE(Ntst)
+    }
+#undef JCASE
+    return nullptr;
+}
 
 template <int SZ>
 Fn pick_ld_a(bool a32) { return a32 ? &h_ld<SZ, true> : &h_ld<SZ, false>; }
@@ -211,6 +283,11 @@ Fn select_generic(const Op& o) {
                 default: return pick_st_a<8>(a32);
             }
         case OpKind::Sel: return h_sel;
+        case OpKind::Bin: return pick_bin(o.cc, o.sz, false);
+        case OpKind::BinI: return pick_bin(o.cc, o.sz, true);
+        case OpKind::Un: return pick_un(o.cc, o.sz);
+        case OpKind::JccGen: return pick_jccgen(o.cc, o.sz, false);
+        case OpKind::JccGenI: return pick_jccgen(o.cc, o.sz, true);
         case OpKind::Exit: return h_exit;
         case OpKind::ExitInd: return h_exit_ind;
         case OpKind::Interp: return h_interp;
@@ -225,7 +302,7 @@ Fn select_generic(const Op& o) {
 // translate itself).  `u` is followed by a stop op.  Returns 1 if the block goes
 // on, 0 if that op ended it.
 int32_t jit_generic(Ctx* c, const Uop* u) {
-    ++c->eng->generic_calls[u->kind & 63];
+    ++c->eng->generic_calls[u->kind & 127];
     c->cont = false;
     c->cur = u;
     u->fn(c, u);

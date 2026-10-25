@@ -82,7 +82,7 @@ bool Engine::run_verified(Block* b) {
     if (!diff.empty()) {
         std::string bytes;
         for (uint32_t i = 0; i < b->guest_bytes && i < 96; ++i) {
-            std::snprintf(buf, sizeof buf, "%02X ", mem.read8(b->start + i));
+            std::snprintf(buf, sizeof buf, "%02X ", Glue::rd8(mem, b->start + i));
             bytes += buf;
         }
         std::fprintf(stderr, "jit verify: block at %016llX (%u native insns) differs\n%s  bytes: %s\n",

@@ -24,6 +24,14 @@ using GFault = x86emu::MemoryFault;
 // Names of the environment variables that control the translator.
 #define JIT_ENV(n) "X86EMU_" n
 
+// Translations are tracked, and invalidated, in units of 2^kCodeBits bytes.
+constexpr int kCodeBits = 12;
+// The page cache layout the wasm tier's inline probe assumes: 2^kTlbBits direct
+// mapped entries of {page number (8 bytes), host address (4 bytes), padding},
+// indexed by (addr >> kTlbPageBits) & mask.
+constexpr int kTlbPageBits = 12;
+constexpr int kTlbBits = 10;
+
 // Byte offsets, from the start of the guest register file, of the cells translated
 // code uses.  The first four are needed by every guest; the rest are x86's.
 struct GuestSlots {
@@ -68,6 +76,20 @@ struct Glue {
     // Make the architectural state exact: settle anything translated code deferred.
     static void settle(GCpu& c) { if (c.cc_kind) materialize_flags(c); }
     static bool is64(const GCpu& c) { return c.is64(); }
+
+    // Guest memory accesses, as the translated code makes them.
+    static uint8_t rd8(GMemory& m, uint64_t a) { return m.read8(a); }
+    static uint16_t rd16(GMemory& m, uint64_t a) { return m.read16(a); }
+    static uint32_t rd32(GMemory& m, uint64_t a) { return m.read32(a); }
+    static uint64_t rd64(GMemory& m, uint64_t a) { return m.read64(a); }
+    static void wr8(GMemory& m, uint64_t a, uint8_t v) { m.write8(a, v); }
+    static void wr16(GMemory& m, uint64_t a, uint16_t v) { m.write16(a, v); }
+    static void wr32(GMemory& m, uint64_t a, uint32_t v) { m.write32(a, v); }
+    static void wr64(GMemory& m, uint64_t a, uint64_t v) { m.write64(a, v); }
+
+    // The page cache the wasm tier probes inline; null where the guest has none.
+    static const void* tlb_read_base(const GMemory& m) { return m.tlb_read_base(); }
+    static const void* tlb_write_base(const GMemory& m) { return m.tlb_write_base(); }
 
     // The verifier.
     static void take(const GCpu& c, GuestState& s);

@@ -168,11 +168,16 @@ struct Gen {
     // code in `hit` runs; on a miss, `miss` does.  Both leave the same stack.
     template <typename Hit, typename Miss>
     void probe(uint32_t tlb, int size, int result_type, Hit hit, Miss miss) {
-        get(L_A); i64c(12); op(I64_SHR_U); set(L_PG);
-        get(L_PG); op(I32_WRAP); i32c(1023); op(I32_AND); i32c(4); op(I32_SHL);
+        if (!tlb) {   // the guest has no page cache we can probe: always ask C++
+            miss();
+            return;
+        }
+        get(L_A); i64c(kTlbPageBits); op(I64_SHR_U); set(L_PG);
+        get(L_PG); op(I32_WRAP); i32c((1 << kTlbBits) - 1); op(I32_AND); i32c(4); op(I32_SHL);
         i32c(static_cast<int32_t>(tlb)); op(I32_ADD); set(L_E);
         get(L_E); ld64(0); get(L_PG); op(I64_EQ);
-        get(L_A); op(I32_WRAP); i32c(4095); op(I32_AND); tee(L_O); i32c(size); op(I32_ADD); i32c(4096); op(I32_LE_U);
+        get(L_A); op(I32_WRAP); i32c((1 << kTlbPageBits) - 1); op(I32_AND); tee(L_O); i32c(size); op(I32_ADD);
+        i32c(1 << kTlbPageBits); op(I32_LE_U);
         op(I32_AND);
         w.u8(0x04); w.u8(static_cast<uint8_t>(result_type));   // if
         hit();
