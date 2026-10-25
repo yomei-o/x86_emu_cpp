@@ -94,7 +94,15 @@ struct WriteScope {   // Apple silicon: JIT memory is writable or executable per
     }
 };
 
-constexpr size_t kArena = 64u << 20;
+// The size of the code arena: 64 MiB, or JIT_NATIVE_ARENA_KB (for testing the path that starts
+// over when the arena fills up).
+size_t arena_size() {
+    if (const char* v = std::getenv(JIT_ENV("JIT_NATIVE_ARENA_KB"))) {
+        const size_t kb = static_cast<size_t>(std::strtoull(v, nullptr, 10));
+        if (kb >= 2048) return kb << 10;
+    }
+    return size_t(64) << 20;
+}
 
 }  // namespace
 
@@ -227,11 +235,11 @@ void NativeGenA::mem_write(int size, uint64_t rip) {
 
 bool Engine::native_init() {
     if (nat_) return true;
-    uint8_t* mem_base = alloc_exec(kArena);
+    uint8_t* mem_base = alloc_exec(arena_size());
     if (!mem_base) return false;
     nat_ = new NativeState;
     nat_->base = mem_base;
-    nat_->cap = kArena;
+    nat_->cap = arena_size();
     Asm a(mem_base);
     a.stp_pre(FP, LR, SP, -96);
     a.stp(19, 20, SP, 16);
@@ -277,6 +285,7 @@ void Engine::native_shutdown() {
 
 void Engine::native_reset() {
     if (!nat_) return;
+    ++native_gen;
     unlink_all();
     for (auto& b : all_) {
         b->nat = nullptr;

@@ -136,7 +136,15 @@ void free_exec(uint8_t* p, size_t n) {
 #endif
 }
 
-constexpr size_t kArena = 64u << 20;
+// The size of the code arena: 64 MiB, or JIT_NATIVE_ARENA_KB (for testing the path that starts
+// over when the arena fills up).
+size_t arena_size() {
+    if (const char* v = std::getenv(JIT_ENV("JIT_NATIVE_ARENA_KB"))) {
+        const size_t kb = static_cast<size_t>(std::strtoull(v, nullptr, 10));
+        if (kb >= 2048) return kb << 10;
+    }
+    return size_t(64) << 20;
+}
 
 }  // namespace
 
@@ -235,12 +243,12 @@ void NativeGen::mem_write(int size, uint64_t rip) {
 //   leave: returns the instruction count.
 bool Engine::native_init() {
     if (nat_) return true;
-    uint8_t* mem = alloc_exec(kArena);
+    uint8_t* mem = alloc_exec(arena_size());
     if (!mem) return false;
     GMemory& mem_ = this->mem;
     nat_ = new NativeState;
     nat_->base = mem;
-    nat_->cap = kArena;
+    nat_->cap = arena_size();
     Asm a(mem);
     a.push(RBX); a.push(R12); a.push(R13); a.push(R14); a.push(R15); a.push(RBP);
     a.alu_ri(SUB, true, RSP, 40);
@@ -274,6 +282,7 @@ void Engine::native_shutdown() {
 
 void Engine::native_reset() {
     if (!nat_) return;
+    ++native_gen;
     unlink_all();
     for (auto& b : all_) {
         b->nat = nullptr;
