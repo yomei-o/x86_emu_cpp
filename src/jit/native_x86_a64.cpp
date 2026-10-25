@@ -333,7 +333,7 @@ bool guest_native_emit(NativeGenA& g, const Op& o) {
             g.st(o.d, 0);   // after the increment: POP ESP keeps the loaded value
         } else {
             g.st(s.rip, 0);
-            g.leave_with(insns);
+            g.leave_indirect(insns);
         }
         return true;
     }
