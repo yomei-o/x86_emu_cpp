@@ -874,6 +874,7 @@ void Engine::wasm_compile_pending() {
     wasm_chain_fn = static_cast<uint32_t>(base) + static_cast<uint32_t>(used.size());
     for (size_t i = 0; i < used.size(); ++i) used[i]->wasm_fn = static_cast<uint32_t>(base) + static_cast<uint32_t>(i);
     n_wasm_blocks += used.size();
+    if (stats_every_ && n_wasm_modules % 20 == 0) print_stats();
 }
 
 }  // namespace jit

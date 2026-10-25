@@ -24,7 +24,7 @@ SOURCES=$(ls src/*.cpp src/jit/*.cpp | grep -v '/main\.cpp$')
     -sSINGLE_FILE=1 \
     -sALLOW_MEMORY_GROWTH=1 \
     -sEXPORTED_FUNCTIONS='["_emu_run","_emu_run_path","_emu_error","_emu_format","_emu_instructions","_malloc","_free"]' \
-    -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPU8","FS"]' \
+    -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPU8","FS","wasmTable","wasmMemory"]' -sALLOW_TABLE_GROWTH=1 \
     -sFORCE_FILESYSTEM=1 \
     -sDISABLE_EXCEPTION_CATCHING=0 \
     -sENVIRONMENT=web,worker,node \

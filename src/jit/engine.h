@@ -132,7 +132,7 @@ public:
     void wasm_queue(Block* b);
     void wasm_compile_pending();
     bool wasm_on = false;
-    uint32_t wasm_hot = 50;
+    uint32_t wasm_hot = 20000;   // below this, V8 runs the new code in its baseline tier, which loses to the threaded handlers
     uint32_t wasm_batch = 32;
     std::vector<Block*> wasm_pending_;
     uint64_t n_wasm_blocks = 0, n_wasm_modules = 0;
