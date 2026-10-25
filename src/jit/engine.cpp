@@ -9,13 +9,21 @@ namespace jit {
 using Cpu = GCpu;
 using Memory = GMemory;
 
+namespace {
+Engine* g_stats_engine = nullptr;
+}
+
 Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
     Glue::fill_slots(slots, cpu);
     mem.set_code_observer(this);
     if (const char* sv = std::getenv(JIT_ENV("JIT_STATS"))) {
         stats_every_ = std::strtoull(sv, nullptr, 10);
-        static Engine* first = this;
-        std::atexit([] { first->print_stats(); });
+        // Report at exit for an engine that is still alive then (the emulator is a
+        // static in some hosts); one that was destroyed has already reported.
+        if (!g_stats_engine) {
+            g_stats_engine = this;
+            std::atexit([] { if (g_stats_engine) g_stats_engine->print_stats(); });
+        }
     }
     if (const char* v = std::getenv(JIT_ENV("JIT_VERIFY"))) verify = v[0] == '1';
     if (const char* v = std::getenv(JIT_ENV("JIT_PROFILE"))) profile = v[0] == '1';
@@ -33,6 +41,7 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
 Engine::~Engine() {
     mem.set_code_observer(nullptr);
     if (std::getenv(JIT_ENV("JIT_STATS"))) print_stats();
+    if (g_stats_engine == this) g_stats_engine = nullptr;
 }
 
 // Where the time goes, from the blocks' run counts: the ops executed by kind, and
