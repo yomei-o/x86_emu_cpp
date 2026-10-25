@@ -11,11 +11,12 @@
 #include <functional>
 
 #include "engine.h"
+#include "native_host.h"
 #include "native_x64.h"
 
 namespace jit {
 
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
+#ifdef JIT_NATIVE_X64
 #define JIT_HAVE_NATIVE 1
 #endif
 

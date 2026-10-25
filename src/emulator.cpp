@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <limits>
+#include <cstdlib>
 #include <cstring>
 
 #include "processes.h"

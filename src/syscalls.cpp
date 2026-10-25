@@ -4,6 +4,7 @@
 // hook by name: the emulator instead implements the syscalls themselves.  The
 // two entry points are `syscall` (x86-64) and `int 0x80` (i386), which differ in
 // both their register conventions and their syscall numbers.
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>

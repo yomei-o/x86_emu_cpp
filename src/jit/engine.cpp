@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "native_host.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -30,7 +31,7 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
 #ifdef __EMSCRIPTEN__
     wasm_on = true;
 #endif
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
+#if defined(JIT_NATIVE_X64) || defined(JIT_NATIVE_A64)
     native_on = true;
 #endif
     if (const char* v = std::getenv(JIT_ENV("JIT_NATIVE"))) native_on = native_on && v[0] != '0';

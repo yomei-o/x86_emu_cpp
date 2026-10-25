@@ -17,8 +17,9 @@
 // Exceptions never cross generated frames: the helpers catch whatever the guest raises,
 // remember it, and the generated code checks a flag and leaves; the engine rethrows.
 #include "engine.h"
+#include "native_host.h"
 
-#ifdef __EMSCRIPTEN__
+#if !defined(JIT_NATIVE_X64) && !defined(JIT_NATIVE_A64)
 
 namespace jit {
 bool Engine::native_init() { return false; }
@@ -28,7 +29,7 @@ bool Engine::native_run(Block*, Ctx&, uint64_t, uint32_t*) { return true; }
 void Engine::native_shutdown() {}
 }  // namespace jit
 
-#else
+#elif defined(JIT_NATIVE_X64)
 
 #include "native_gen.h"
 
@@ -587,15 +588,5 @@ void Engine::native_compile(Block* b) {
 
 }  // namespace jit
 
-#else   // no native backend for this host
-
-namespace jit {
-bool Engine::native_init() { return false; }
-void Engine::native_compile(Block*) {}
-void Engine::native_reset() {}
-bool Engine::native_run(Block*, Ctx&, uint64_t, uint32_t*) { return true; }
-void Engine::native_shutdown() {}
-}  // namespace jit
-
 #endif  // JIT_HAVE_NATIVE
-#endif  // __EMSCRIPTEN__
+#endif  // the host
