@@ -43,6 +43,7 @@ struct Uop {
     uint32_t pc;
     uint16_t ni;
     uint8_t sz, cc, flags;
+    uint8_t kind;   // OpKind, for the profile
 };
 
 struct Block {
@@ -54,6 +55,7 @@ struct Block {
     uint32_t guest_bytes = 0;
     uint64_t page = 0;
     std::vector<Uop> code;
+    uint64_t hits = 0;       // X86EMU_JIT_PROFILE: times this block ran
 };
 
 class Engine : public x86emu::CodeObserver {
@@ -90,6 +92,8 @@ public:
     uint64_t n_translated = 0, n_blocks_run = 0, n_insns_native = 0, n_invalidated = 0;
     uint64_t n_stub_hits = 0;
     uint64_t stats_every_ = 0;   // X86EMU_JIT_STATS=N prints every N blocks
+    bool profile = false;        // X86EMU_JIT_PROFILE=1: count block runs, report the hot ones
+    void print_profile();
     uint64_t n_interp = 0;
     uint64_t interp_ops[512] = {};   // which interpreted opcodes ran (0F xx at 256+xx)
     void print_stats();

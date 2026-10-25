@@ -1,5 +1,6 @@
 #include "engine.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -29,6 +30,7 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
         std::atexit([] { first->print_stats(); });
     }
     if (const char* v = std::getenv("X86EMU_JIT_VERIFY")) verify = v[0] == '1';
+    if (const char* v = std::getenv("X86EMU_JIT_PROFILE")) profile = v[0] == '1';
 }
 
 Engine::~Engine() {
@@ -36,7 +38,47 @@ Engine::~Engine() {
     if (std::getenv("X86EMU_JIT_STATS")) print_stats();
 }
 
+// Where the time goes, from the blocks' run counts: the ops executed by kind, and
+// the hottest blocks with the ops they are made of.
+void Engine::print_profile() {
+    static const char* names[] = {"Nop", "Mov", "MovI", "Add", "AddI", "Sub", "SubI", "And", "AndI", "Or",
+        "OrI", "Xor", "XorI", "Lea", "Ext", "Put", "GetH", "Ld", "LdS", "St", "Sel", "SetFl", "Exit",
+        "ExitInd", "JccFl", "Alu", "AluI", "IncDec", "ShlI", "ShrI", "SarI", "Shift", "ShiftI", "ShiftSlow",
+        "Imul", "ImulI", "Group3", "CcSet", "CcSetI", "CcMat", "CcClear", "JccCmp", "JccCmpI", "Push", "PushI", "Pop", "Ret", "Call", "Interp",
+        "ChkFlush"};
+    constexpr size_t kNames = sizeof names / sizeof names[0];
+    std::vector<uint64_t> by_kind(256, 0);
+    uint64_t total_ops = 0, total_hits = 0;
+    std::vector<Block*> blocks;
+    for (auto& b : all_) {
+        if (!b->hits) continue;
+        blocks.push_back(b.get());
+        total_hits += b->hits;
+        for (const Uop& u : b->code) { by_kind[u.kind] += b->hits; total_ops += b->hits; }
+    }
+    std::fprintf(stderr, "[prof] %llu block runs, %llu ops (%.2f per block)\n", (unsigned long long)total_hits,
+                 (unsigned long long)total_ops, total_hits ? double(total_ops) / double(total_hits) : 0.0);
+    std::vector<int> order;
+    for (int k = 0; k < 256; ++k) if (by_kind[k]) order.push_back(k);
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return by_kind[a] > by_kind[b]; });
+    for (size_t i = 0; i < order.size() && i < 24; ++i)
+        std::fprintf(stderr, "[prof]   %-10s %5.1f%%\n", order[i] < (int)kNames ? names[order[i]] : "?",
+                     100.0 * double(by_kind[order[i]]) / double(total_ops));
+    std::sort(blocks.begin(), blocks.end(), [](Block* a, Block* b) {
+        return a->hits * a->code.size() > b->hits * b->code.size();
+    });
+    for (size_t i = 0; i < blocks.size() && i < 12; ++i) {
+        Block* b = blocks[i];
+        std::fprintf(stderr, "[prof] block %llX  runs %llu  insns %u  ops:", (unsigned long long)b->start,
+                     (unsigned long long)b->hits, b->insns);
+        for (const Uop& u : b->code)
+            std::fprintf(stderr, " %s", u.kind < kNames ? names[u.kind] : "?");
+        std::fprintf(stderr, "\n");
+    }
+}
+
 void Engine::print_stats() {
+    if (profile) print_profile();
     std::fprintf(stderr,
                  "[jit] translated %llu blocks, ran %llu (%llu native insns, %llu interpreted), invalidated %llu, stub hits %llu\n",
                  (unsigned long long)n_translated, (unsigned long long)n_blocks_run,
@@ -166,6 +208,7 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
             ctx.epoch0 = epoch;
             ctx.partial = -1;
             ctx.cur = nullptr;
+            if (profile) ++b->hits;
             u = b->code.data();
             while (u) u = u->fn(&ctx, u);
             const uint32_t done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;

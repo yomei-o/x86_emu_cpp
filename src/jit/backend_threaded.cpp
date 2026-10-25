@@ -44,6 +44,17 @@ using x86emu::Cpu;
 // that calls every handler from one place gives it a single jump to guess for
 // the whole program.  Where the compiler cannot promise the tail call, the
 // handler returns the next op and run() loops.
+// After a store that asked for it: leave the block if the store invalidated
+// translated code, at the next instruction (imm2).
+#define CHK_FLUSH()                                                  \
+    do {                                                             \
+        if ((u->flags & kFlagChk) && c->eng->epoch != c->epoch0) {   \
+            c->partial = u->ni;                                      \
+            c->cpu->rip = static_cast<uint64_t>(u->imm2);            \
+            return nullptr;                                          \
+        }                                                            \
+    } while (0)
+
 #if defined(JIT_NO_MUSTTAIL) || !(defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 15))
 #define NEXT() return u + 1
 #else
@@ -155,7 +166,67 @@ const Uop* h_st(Ctx* c, const Uop* u) {
     else if (SZ == 2) c->mem->write16(a, static_cast<uint16_t>(v));
     else if (SZ == 4) c->mem->write32(a, static_cast<uint32_t>(v));
     else c->mem->write64(a, v);
+    CHK_FLUSH();
     NEXT();
+}
+
+// ---- stack ------------------------------------------------------------------
+
+constexpr int kRsp = 4 * 8;   // rsp is register 4, and registers are slots 0, 8, 16...
+
+template <int W>
+const Uop* h_push(Ctx* c, const Uop* u) {
+    c->cur = u;
+    const uint64_t sp = S(kRsp) - W;
+    S(kRsp) = sp;
+    const uint64_t v = S(u->a);
+    if (W == 4) c->mem->write32(sp, static_cast<uint32_t>(v));
+    else c->mem->write64(sp, v);
+    CHK_FLUSH();
+    NEXT();
+}
+
+template <int W>
+const Uop* h_pushi(Ctx* c, const Uop* u) {
+    c->cur = u;
+    const uint64_t sp = S(kRsp) - W;
+    S(kRsp) = sp;
+    const uint64_t v = static_cast<uint64_t>(u->imm);
+    if (W == 4) c->mem->write32(sp, static_cast<uint32_t>(v));
+    else c->mem->write64(sp, v);
+    CHK_FLUSH();
+    NEXT();
+}
+
+template <int W>
+const Uop* h_pop(Ctx* c, const Uop* u) {
+    c->cur = u;
+    const uint64_t sp = S(kRsp);
+    const uint64_t v = W == 4 ? c->mem->read32(sp) : c->mem->read64(sp);
+    S(kRsp) = sp + W;
+    S(u->d) = v;   // after the increment: POP ESP keeps the loaded value
+    NEXT();
+}
+
+template <int W>
+const Uop* h_ret(Ctx* c, const Uop* u) {
+    c->cur = u;
+    const uint64_t sp = S(kRsp);
+    const uint64_t v = W == 4 ? c->mem->read32(sp) : c->mem->read64(sp);
+    S(kRsp) = sp + W + static_cast<uint64_t>(u->imm);
+    c->cpu->rip = v;
+    return nullptr;
+}
+
+template <int W>
+const Uop* h_call(Ctx* c, const Uop* u) {
+    c->cur = u;
+    const uint64_t sp = S(kRsp) - W;
+    S(kRsp) = sp;
+    if (W == 4) c->mem->write32(sp, static_cast<uint32_t>(u->imm2));
+    else c->mem->write64(sp, static_cast<uint64_t>(u->imm2));
+    c->cpu->rip = static_cast<uint64_t>(u->imm);
+    return nullptr;
 }
 
 // ---- flags ----------------------------------------------------------------
@@ -719,6 +790,11 @@ Fn select(const Op& o) {
         case OpKind::CcClear: return h_ccclear;
         case OpKind::JccCmp: return pick_jcccmp(o.c, o.sz, o.cc, false);
         case OpKind::JccCmpI: return pick_jcccmp(o.c, o.sz, o.cc, true);
+        case OpKind::Push: return o.sz == 4 ? &h_push<4> : &h_push<8>;
+        case OpKind::PushI: return o.sz == 4 ? &h_pushi<4> : &h_pushi<8>;
+        case OpKind::Pop: return o.sz == 4 ? &h_pop<4> : &h_pop<8>;
+        case OpKind::Ret: return o.sz == 4 ? &h_ret<4> : &h_ret<8>;
+        case OpKind::Call: return o.sz == 4 ? &h_call<4> : &h_call<8>;
         case OpKind::Interp: return h_interp;
         case OpKind::ChkFlush: return h_chkflush;
     }
@@ -746,6 +822,7 @@ void compile_threaded(Engine&, const IrBlock& ir, Block& out) {
         u.d = o.d; u.a = o.a; u.b = o.b; u.c = o.c;
         u.imm = o.imm; u.imm2 = o.imm2;
         u.pc = o.pc; u.ni = o.ni; u.sz = o.sz; u.cc = o.cc; u.flags = o.flags;
+        u.kind = static_cast<uint8_t>(o.kind);
         out.code.push_back(u);
     }
 }

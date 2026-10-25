@@ -437,6 +437,15 @@ struct Tr {
 
     void flush_check(uint64_t next_pc) {
         if (!stored || last) return;
+        // Stores check for themselves, which saves an op after every one of them.
+        if (!ir.ops.empty()) {
+            Op& s = ir.ops.back();
+            if (s.kind == OpKind::St || s.kind == OpKind::Push || s.kind == OpKind::PushI) {
+                s.flags |= kFlagChk;
+                s.imm2 = static_cast<int64_t>(next_pc);
+                return;
+            }
+        }
         Op& o = emit(OpKind::ChkFlush);
         o.imm = static_cast<int64_t>(next_pc);
     }
@@ -627,15 +636,22 @@ void emit_native(Tr& t, const D& d, int fmode, uint64_t next_pc) {
     };
 
     auto push_val = [&](int val) {
-        t.bini(OpKind::SubI, rsp, rsp, ptr);
-        Tr::Addr ad{rsp, t.s.zero, 0, 0, false};
-        t.st(ad, val, ptr);
+        Op& o = t.emit(OpKind::Push);
+        o.a = val; o.sz = static_cast<uint8_t>(ptr);
+        t.stored = true;
+    };
+    auto push_imm = [&](int64_t v) {
+        Op& o = t.emit(OpKind::PushI);
+        o.imm = v; o.sz = static_cast<uint8_t>(ptr);
+        t.stored = true;
+    };
+    auto pop_to = [&](int dst) {
+        Op& o = t.emit(OpKind::Pop);
+        o.d = dst; o.sz = static_cast<uint8_t>(ptr);
     };
     auto pop_to_tmp = [&]() {
         int v = t.newtmp();
-        Tr::Addr ad{rsp, t.s.zero, 0, 0, false};
-        t.ld(v, ad, ptr);
-        t.bini(OpKind::AddI, rsp, rsp, ptr);
+        pop_to(v);
         return v;
     };
     auto exit_to = [&](uint64_t target) {
@@ -885,28 +901,26 @@ void emit_native(Tr& t, const D& d, int fmode, uint64_t next_pc) {
             }
             case 0xC9: {   // LEAVE
                 t.mov(rsp, Tr::R(x86emu::RBP));
-                int v = pop_to_tmp();
-                t.mov(Tr::R(x86emu::RBP), v);
+                pop_to(Tr::R(x86emu::RBP));
                 return;
             }
             case 0xE8: {   // CALL rel32
-                int v = t.newtmp();
-                t.movi(v, static_cast<int64_t>(next_pc));
-                push_val(v);
-                t.flush_check(next_pc);
-                exit_to(next_pc + static_cast<uint64_t>(d.imm));
+                Op& o = t.emit(OpKind::Call);
+                o.sz = static_cast<uint8_t>(ptr);
+                o.imm = static_cast<int64_t>(next_pc + static_cast<uint64_t>(d.imm));
+                o.imm2 = static_cast<int64_t>(next_pc);
                 return;
             }
             case 0xE9: case 0xEB: exit_to(next_pc + static_cast<uint64_t>(d.imm)); return;
             case 0xC3: {
-                int v = pop_to_tmp();
-                Op& o = t.emit(OpKind::ExitInd); o.a = v;
+                Op& o = t.emit(OpKind::Ret);
+                o.sz = static_cast<uint8_t>(ptr);
                 return;
             }
             case 0xC2: {
-                int v = pop_to_tmp();
-                t.bini(OpKind::AddI, rsp, rsp, static_cast<uint16_t>(d.imm));
-                Op& o = t.emit(OpKind::ExitInd); o.a = v;
+                Op& o = t.emit(OpKind::Ret);
+                o.sz = static_cast<uint8_t>(ptr);
+                o.imm = static_cast<uint16_t>(d.imm);
                 return;
             }
             case 0xFE: case 0xFF: {
@@ -963,14 +977,11 @@ void emit_native(Tr& t, const D& d, int fmode, uint64_t next_pc) {
         }
         if (op >= 0x58 && op <= 0x5F) {
             int r = (d.rb ? 8 : 0) | (op & 7);
-            int v = pop_to_tmp();
-            t.reg_write(d, r, ptr, v, true);
+            pop_to(Tr::R(r));
             return;
         }
         if (op == 0x68 || op == 0x6A) {
-            int v = t.newtmp();
-            t.movi(v, d.imm);
-            push_val(v);
+            push_imm(d.imm);
             t.flush_check(next_pc);
             return;
         }

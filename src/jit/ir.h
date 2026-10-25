@@ -80,6 +80,14 @@ enum class OpKind : uint8_t {
     // rip = cond(a OP b) ? imm : imm2.  cc = x86 condition, c = kind.
     // JccCmpI takes b as the 32-bit immediate in d.
     JccCmp, JccCmpI,
+    // Stack operations on the pointer-width stack (sz = 4 or 8; rsp is slot 32).
+    //   Push: rsp -= sz, store slot a.  PushI: the same with the value in imm.
+    //   Pop: load into slot d, rsp += sz.  Ret: pop into rip, then rsp += imm.
+    //   Call: push imm2 (the return address), rip = imm.
+    // A store carrying kFlagChk leaves the block, with rip = imm2, if translated
+    // code was invalidated by it (PushI / Push keep the next pc in imm2 then;
+    // Call does not use the check - it ends the block anyway).
+    Push, PushI, Pop, Ret, Call,
     // Run the guest instruction at (block start + pc) with the interpreter.
     // imm2 = the address the block expects to be at afterwards; anything else
     // ends the block.
@@ -107,6 +115,7 @@ enum : uint8_t {
     kFlagSigned = 4,  // Ext: sign extend
     kFlagMem = 8,     // Group3: the operand is in memory
     kFlagRex = 16,    // Group3: a REX prefix was present (byte register numbering)
+    kFlagChk = 32,    // a store: check for invalidated code afterwards; next pc in imm2
 };
 
 struct IrBlock {
