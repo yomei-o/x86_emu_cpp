@@ -83,6 +83,13 @@ constexpr uint64_t kArith = 0x8D5;   // CF PF AF ZF SF OF
 // ---- moves and plain arithmetic -------------------------------------------
 
 const Uop* h_nop(Ctx* c, const Uop* u) { NEXT(); }
+
+// The op that follows a single op the wasm tier runs through its threaded
+// handler: it says "that one did not end the block".
+const Uop* h_stop(Ctx* c, const Uop*) {
+    c->cont = true;
+    return nullptr;
+}
 const Uop* h_mov(Ctx* c, const Uop* u) { S(u->d) = S(u->a); NEXT(); }
 const Uop* h_movi(Ctx* c, const Uop* u) { S(u->d) = static_cast<uint64_t>(u->imm); NEXT(); }
 const Uop* h_add(Ctx* c, const Uop* u) { S(u->d) = S(u->a) + S(u->b); NEXT(); }
@@ -803,6 +810,22 @@ Fn select(const Op& o) {
 }
 
 }  // namespace
+
+// Runs one op through its handler (the wasm tier's way of doing what it does not
+// translate itself).  `u` is followed by a stop op.  Returns 1 if the block goes
+// on, 0 if that op ended it.
+int32_t jit_generic(Ctx* c, const Uop* u) {
+    ++c->eng->generic_calls[u->kind & 63];
+    c->cont = false;
+    c->cur = u;
+    u->fn(c, u);
+    return c->cont ? 1 : 0;
+}
+
+void make_stop_op(Uop& u) {
+    u = Uop{};
+    u.fn = h_stop;
+}
 
 void materialize_flags(x86emu::Cpu& cpu) {
     switch (cpu.cc_sz) {

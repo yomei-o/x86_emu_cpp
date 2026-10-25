@@ -24,6 +24,9 @@ namespace jit {
 
 class Engine;
 struct Uop;
+struct Ctx;
+using WasmFn = int64_t (*)(uint8_t* env, Ctx* ctx);
+using ChainFn = int (*)(uint8_t* env, Ctx* ctx, uint32_t fn, uint32_t limit);
 
 struct Ctx {
     uint8_t* env;
@@ -34,6 +37,10 @@ struct Ctx {
     int partial;       // set by an op that leaves early: native insns finished
     bool in_interp;    // an interpreted instruction is running
     const Uop* cur;    // the last op that could fault (memory access): where a fault happened
+    bool cont;         // set by the "stop" op: a single op run by the wasm tier did not end the block
+    int32_t cur_pc;    // (unused)
+    uint32_t* pending_cell;   // wasm tier: a static exit that found no successor ready; C++ fills it in
+    uint64_t fault_rip;       // wasm tier: guest address of the instruction in a slow memory access, or 0
 };
 
 struct Uop {
@@ -56,6 +63,15 @@ struct Block {
     uint64_t page = 0;
     std::vector<Uop> code;
     uint64_t hits = 0;       // X86EMU_JIT_PROFILE: times this block ran
+    uint32_t heat = 0;       // runs so far, for deciding when to compile it for the wasm tier
+    // The wasm tier (backend_wasm.cpp): the IR, kept to compile from later; the
+    // one-op programs that run the ops it does not translate itself; and the
+    // function once it exists (a table index, 0 = none).
+    std::vector<Op> ir_ops;
+    std::vector<std::unique_ptr<Uop[]>> single;
+    uint32_t wasm_fn = 0;
+    bool wasm_queued = false;
+    std::unique_ptr<uint32_t[]> cells;   // wasm tier: one word per static exit, see backend_wasm.cpp
 };
 
 class Engine : public x86emu::CodeObserver {
@@ -81,6 +97,7 @@ public:
         int32_t zero, rflags, rip, fs_base, gs_base;
         int32_t tmp0;   // first of the temporaries; tmp0 - 8 * 0 is zero
         int32_t ntmp;
+        int32_t cc_a, cc_b, cc_kind, cc_sz;   // deferred flags
     } slots;
 
     // Counts invalidations.  A running block compares it with the value it
@@ -103,6 +120,26 @@ public:
 
 private:
     static constexpr uint32_t kTableBits = 13;
+public:
+    // The wasm tier.  Blocks that have run `wasm_hot` times are compiled, in
+    uint32_t wasm_chain_fn = 0;              // table index of the function that runs a chain of blocks
+    std::vector<uint32_t*> linked_cells_;    // exits that have been pointed at a successor
+    void unlink_all() {
+        for (uint32_t* c : linked_cells_) *c = 0;
+        linked_cells_.clear();
+    }
+    // batches, into WebAssembly modules built at run time.
+    void wasm_queue(Block* b);
+    void wasm_compile_pending();
+    bool wasm_on = false;
+    uint32_t wasm_hot = 50;
+    uint32_t wasm_batch = 32;
+    std::vector<Block*> wasm_pending_;
+    uint64_t n_wasm_blocks = 0, n_wasm_modules = 0;
+    uint64_t wasm_fallbacks[64] = {};   // ops the wasm tier runs through their threaded handler, by kind
+    uint64_t generic_calls[64] = {};    // ...and how many times each was actually run that way
+
+private:
     bool run_plain(Block* b);
     bool run_verified(Block* b);
     Block* lookup(uint64_t pc);
@@ -123,6 +160,8 @@ private:
 bool translate_x86(x86emu::Cpu& cpu, const Engine::Slots& slots, uint64_t pc, IrBlock& out);
 // Settles deferred flags (Cpu::cc_kind) into rflags.
 void materialize_flags(x86emu::Cpu& cpu);
+int32_t jit_generic(Ctx* c, const Uop* u);
+void make_stop_op(Uop& u);
 // Lowers IR to something runnable.
 void compile_threaded(Engine& eng, const IrBlock& ir, Block& out);
 

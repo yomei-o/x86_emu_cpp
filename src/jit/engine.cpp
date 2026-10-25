@@ -23,6 +23,10 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
     slots.rip = off(&cpu.rip);
     slots.fs_base = off(&cpu.fs_base);
     slots.gs_base = off(&cpu.gs_base);
+    slots.cc_a = off(&cpu.cc_a);
+    slots.cc_b = off(&cpu.cc_b);
+    slots.cc_kind = off(&cpu.cc_kind);
+    slots.cc_sz = off(&cpu.cc_sz);
     mem.set_code_observer(this);
     if (const char* sv = std::getenv("X86EMU_JIT_STATS")) {
         stats_every_ = std::strtoull(sv, nullptr, 10);
@@ -31,6 +35,15 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
     }
     if (const char* v = std::getenv("X86EMU_JIT_VERIFY")) verify = v[0] == '1';
     if (const char* v = std::getenv("X86EMU_JIT_PROFILE")) profile = v[0] == '1';
+#ifdef __EMSCRIPTEN__
+    wasm_on = true;
+#endif
+    if (const char* v = std::getenv("X86EMU_JIT_WASM")) wasm_on = v[0] != '0';
+    if (const char* v = std::getenv("X86EMU_JIT_WASM_HOT")) {
+        wasm_hot = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+        if (wasm_hot < 1) wasm_hot = 1;
+        wasm_batch = wasm_hot <= 1 ? 1 : wasm_batch;
+    }
 }
 
 Engine::~Engine() {
@@ -79,6 +92,17 @@ void Engine::print_profile() {
 
 void Engine::print_stats() {
     if (profile) print_profile();
+    if (wasm_on || n_wasm_blocks)
+    {
+        std::fprintf(stderr, "[jit] wasm tier: %llu blocks in %llu modules; ops left to the threaded handlers:",
+                     (unsigned long long)n_wasm_blocks, (unsigned long long)n_wasm_modules);
+        for (size_t k = 0; k < 64; ++k)
+            if (wasm_fallbacks[k]) std::fprintf(stderr, " #%zu x%llu", k, (unsigned long long)wasm_fallbacks[k]);
+        std::fprintf(stderr, "\n[jit] fallback runs:");
+        for (size_t k = 0; k < 64; ++k)
+            if (generic_calls[k]) std::fprintf(stderr, " #%zu x%llu", k, (unsigned long long)generic_calls[k]);
+        std::fprintf(stderr, "\n");
+    }
     std::fprintf(stderr,
                  "[jit] translated %llu blocks, ran %llu (%llu native insns, %llu interpreted), invalidated %llu, stub hits %llu\n",
                  (unsigned long long)n_translated, (unsigned long long)n_blocks_run,
@@ -119,6 +143,7 @@ Block* Engine::translate(uint64_t pc) {
         IrBlock ir;
         if (translate_x86(cpu, slots, pc, ir)) {
             compile_threaded(*this, ir, *blk);
+            if (wasm_on) blk->ir_ops = ir.ops;
             blk->insns = ir.insns;
             blk->effects = ir.effects;
             blk->guest_bytes = ir.guest_bytes;
@@ -190,7 +215,7 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
         return run_block();
     }
     reclaim();
-    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, 0, -1, false, nullptr};
+    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, 0, -1, false, nullptr, false, -1, nullptr, 0};
     const Uop* u = nullptr;
     Block* b = nullptr;
     bool any = false;
@@ -209,9 +234,31 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
             ctx.partial = -1;
             ctx.cur = nullptr;
             if (profile) ++b->hits;
-            u = b->code.data();
-            while (u) u = u->fn(&ctx, u);
-            const uint32_t done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
+            uint32_t done;
+            if (b->wasm_fn) {
+                // The block a static exit was heading for has now been found: next time
+                // that exit goes straight there.
+                if (ctx.pending_cell) {
+                    *ctx.pending_cell = b->wasm_fn;
+                    linked_cells_.push_back(ctx.pending_cell);
+                    ctx.pending_cell = nullptr;
+                }
+                ctx.fault_rip = 0;
+                const uint64_t left = deadline > cpu.instructions_executed ? deadline - cpu.instructions_executed : 1;
+                done = static_cast<uint32_t>(reinterpret_cast<ChainFn>(static_cast<uintptr_t>(wasm_chain_fn))(
+                    ctx.env, &ctx, b->wasm_fn, static_cast<uint32_t>(left > 0x7FFFFFFF ? 0x7FFFFFFF : left)));
+                cpu.instructions_executed += done;
+                n_insns_native += done;
+                any = true;
+                if (cpu.halted || (yield && *yield) || cpu.instructions_executed >= deadline) break;
+                continue;
+            } else {
+                ctx.pending_cell = nullptr;
+                if (wasm_on && ++b->heat == wasm_hot && !b->wasm_queued) wasm_queue(b);
+                u = b->code.data();
+                while (u) u = u->fn(&ctx, u);
+                done = ctx.partial >= 0 ? static_cast<uint32_t>(ctx.partial) : b->insns;
+            }
             cpu.instructions_executed += done;
             ++n_blocks_run;
             n_insns_native += done;
@@ -225,7 +272,8 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
         // Report the fault at the start of the instruction that made it, which
         // is where an exception handler would restart it - unless it came out
         // of an interpreted instruction, which has already said where it was.
-        if (ctx.cur && !ctx.in_interp) cpu.rip = b->start + ctx.cur->pc;
+        if (ctx.fault_rip) cpu.rip = ctx.fault_rip;
+        else if (ctx.cur && !ctx.in_interp) cpu.rip = b->start + ctx.cur->pc;
         throw;
     } catch (...) {
         if (cpu.cc_kind) materialize_flags(cpu);
@@ -234,20 +282,29 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
     }
     if (cpu.cc_kind) materialize_flags(cpu);
     --depth_;
+    // Blocks that got hot during this stretch are compiled before the next one.
+    if (!wasm_pending_.empty() && depth_ == 0) wasm_compile_pending();
     return any;
 }
 
 bool Engine::run_plain(Block* b) {
-    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, epoch, -1, false, nullptr};
+    Ctx ctx{reinterpret_cast<uint8_t*>(cpu.regs), &cpu, &mem, this, epoch, -1, false, nullptr, false, -1, nullptr, 0};
     ++depth_;
+    if (!b->wasm_fn && wasm_on && ++b->heat == wasm_hot && !b->wasm_queued) wasm_queue(b);
     const Uop* u = b->code.data();
     try {
-        while (u) u = u->fn(&ctx, u);
+        if (b->wasm_fn) {
+            // limit 1: run this block, and not whatever it would chain to.
+            ctx.partial = reinterpret_cast<ChainFn>(static_cast<uintptr_t>(wasm_chain_fn))(ctx.env, &ctx, b->wasm_fn, 1);
+        } else {
+            while (u) u = u->fn(&ctx, u);
+        }
     } catch (const x86emu::MemoryFault&) {
         --depth_;
         // Report the fault at the start of the instruction that made it, which
         // is where an exception handler would restart it.
-        if (ctx.cur) cpu.rip = b->start + ctx.cur->pc;
+        if (ctx.fault_rip) cpu.rip = ctx.fault_rip;
+        else if (ctx.cur) cpu.rip = b->start + ctx.cur->pc;
         throw;
     } catch (...) {
         --depth_;
@@ -265,6 +322,7 @@ bool Engine::run_plain(Block* b) {
 
 void Engine::on_code_write(uint64_t page) {
     ++n_invalidated;
+    unlink_all();   // a block that was invalidated may be the successor some exit points at
     auto it = by_page_.find(page);
     if (it != by_page_.end()) {
         for (Block* b : it->second) {
@@ -286,6 +344,7 @@ void Engine::on_code_write(uint64_t page) {
 void Engine::on_code_unmap(uint64_t page) { on_code_write(page); }
 
 void Engine::on_code_flush_all() {
+    unlink_all();
     for (auto& kv : by_page_)
         for (Block* b : kv.second)
             if (b->valid) { b->valid = false; ++dead_; }

@@ -202,6 +202,13 @@ public:
     uint8_t* page_ptr(uint64_t page) const { return host_ptr(page << kPageBits, false); }
 
     // ---- translated code -------------------------------------------------
+    //
+    // Where the translation caches live, for code generated at run time that
+    // probes them itself (jit/backend_wasm.cpp).  Entries are 16 bytes: the page
+    // number as 8 bytes, then the host address of the page.
+    const void* tlb_read_base() const { return tlb_; }
+    const void* tlb_write_base() const { return tlbw_; }
+    static constexpr uint64_t kTlbEntrySize = 16;
     void set_code_observer(CodeObserver* o) { code_obs_ = o; }
     // Declares that translations were made from this page.  Writes to it are
     // reported from now on (until the first one, which also ends the
